@@ -1,0 +1,43 @@
+#This is a template for sampler description files
+name: "test"
+version: "1.0"
+parallel: serial
+purpose: "Evaluate a single parameter set"
+url: "https://bitbucket.org/joezuntz/cosmosis"
+attribution: [CosmoSIS Team]
+cite: []
+explanation: >
+    This is the most trivial possible 'sampler' - it just runs on a single
+    parameter sample. It is mainly useful for testing and for generating 
+    cosmology results for plotting.
+
+    The test sampler uses the starting position defined in the value ini file,
+    and runs the pipeline just on that.
+
+    At the end of the run it will print out the prior and likelihood (if there
+    is one), and can optionally also save all the data saved along the pipeline,
+    so that you can make plots of the useful cosmological quantities.
+
+    Experimental: we have a new test feature where you can plot your pipeline
+    and the data flow through it as a graphical diagram.  This requires pygraphviz
+    and the graphviz suite to make an image - use a command like:
+    dot -Tpng -o graph.png graph.dot
+
+
+installation: >
+    No special installation required; everything is packaged with CosmoSIS.
+    If you want to make a graphical diagram of your pipeline you need to have
+    pygraphviz installed.  You can get this with:
+
+    pip install pygraphviz  #to install centrally, may require sudo
+
+    pip install pygraphviz --user #to install just for you
+    
+    You also need graphviz to turn the result into an image.
+
+
+# List of configuration options for this sampler
+params:
+    fatal_errors:  (bool; default=N)Any errors in the pipeline trigger an immediate failure so you can diagnose errors
+    save_dir: (string; default='') Save all the data computed in the pipeline to this directory (can also end with .tgz to get a zipped form)
+    graph: (string; default='') Requires pygraphviz.  Save a dot file describing the pipeline

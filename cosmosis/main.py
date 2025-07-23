@@ -317,8 +317,7 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         # give the module a new name to avoid name clashes if people
         # just call their thing by the same name
         import_by_path('additional_samplers_{}'.format(i), sampler_file)
-
-
+    
 
     # determine the type(s) of sampling we want.
     sample_methods = ini.get(RUNTIME_INI_SECTION, "sampler", fallback="test").split()

@@ -1,0 +1,28 @@
+#This is a template for sampler description files
+name: "latin_hypercube"
+version: "1.0"
+parallel: embarrassing
+purpose: "Latin Hypercube sampler"
+url: "https://bitbucket.org/joezuntz/cosmosis"
+attribution: [CosmoSIS Team]
+cite: []
+
+
+explanation: >
+    Latin hypercube sampling (LHS).
+    A Latin hypercube sample [1] generates n points in [0, 1)^d.
+    Each univariate marginal distribution is stratified, placing exactly one point in 
+    [j/n, (j+1)/n) for j = 0,1,...,n-1.
+    They are still applicable when n<<d.
+
+    The latin hypercube is scaled to the prior ranges of each parameters and the resulting samples are used in sampling.
+    The main parameter for the latin hypercube sampler is the number of sample points.
+    
+installation: >
+    No special installation required; everything is packaged with CosmoSIS
+
+# List of configuration options for this sampler
+params:
+    nsample_dimension: (integer) The number of latin hypercube points
+    save: "(string; default='') If set, a base directory or .tgz name for saving the cosmology output for every point in the latin hypercube"
+    nstep: "(int, default=-1) Number of evaluations between saving output, defaults to nsample_dimension"
