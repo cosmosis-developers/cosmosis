@@ -774,7 +774,7 @@ class LikelihoodPipeline(Pipeline):
                                                               override,
                                                               ) 
         # This seems like a hack...       
-        if self.options.has_option("latinhypercube", "training"):
+        if self.options.has_option("runtime,", "latinhypercube"):
             if self.options.getboolean("latinhypercube", "training", fallback=False):
                 zmin = self.options.getfloat("latinhypercube", "zmin", fallback=0.0)
                 zmax = self.options.getfloat("latinhypercube", "zmax", fallback=3.01)
