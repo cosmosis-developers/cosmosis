@@ -17,75 +17,59 @@ class CosmoPowerTrainingSampler(Sampler):
     parallel_output = False
     needs_output = False
 
-    def load_from_file(self, filename):
-        """Loads and decompresses a .tgz file, extracting its contents into memory.
-
-        Args:
-            filename (str): The name of the .tgz file to be read.
-
-        Returns:
-            dict: A dictionary containing the extracted data.
-        """
-        if not filename.endswith('.tgz'):
-            raise ValueError("The file must have a .tgz extension.")
-
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"The file {filename} does not exist.")
-
-        i = os.path.basename(filename).split('_')[-1].split('.')[0]
-        data = defaultdict(dict)
-
-        with tarfile.open(filename, "r:gz") as tar:
-            for member in tar.getmembers():
-                file = tar.extractfile(member)
-                content = file.read().decode('utf-8')
-                lines = content.splitlines()
-
-                # Determine if it's a scalar or vector file
-                if member.name.endswith('values.txt'):
-                    # Handle scalar outputs
-                    for line in lines:
-                        if line.startswith('#'):
-                            continue  # Skip comments or metadata for now
-                        if '=' in line:
-                            key, value = line.split(' = ')
-                        try:
-                            data[member.name.split('/')[-2]][key] = float(value)
-                        except:
-                            data[member.name.split('/')[-2]][key] = str(value)
-                else:
-                    # Handle vector outputs
-                    header = lines[0]
-                    header_lines = [line for line in lines if line.startswith(header) or '=' in line]
-                    header_info = {}
-                    for line in header_lines[1:]:
-                        if '=' in line:
-                            key, value = line.split(' = ')
-                            header_info[key] = value
-                    # Extract data
-                    data_values = [line for line in lines if not line.startswith(header) and '=' not in line]
-                    if data_values:
-                        vector_data = np.loadtxt(io.StringIO('\n'.join(data_values)))
-                        data[member.name.split('/')[-2]][member.name.split('/')[-1].split('.')[0]] = vector_data
-        return i, data
-
-    def pack_to_dictionaries(self, params, files):
-        # Consider combining the two functions together!
+    def load_data(self, params, filenames):
         index_list = []
         params_dict = defaultdict(list)
         out_dict = defaultdict(lambda: defaultdict(list))
         runs = set()
-       
-        for tar_file in files:
-            i, data = self.load_from_file(tar_file)
-            # Add a cleaning step here if any are nan!
+
+        for filename in filenames:
+            if not filename.endswith('.tgz'):
+                raise ValueError("The file must have a .tgz extension.")
+            if not os.path.exists(filename):
+                raise FileNotFoundError(f"The file {filename} does not exist.")
+
+            i = os.path.basename(filename).split('_')[-1].split('.')[0]
+            data = defaultdict(dict)
+
+            with tarfile.open(filename, "r:gz") as tar:
+                for member in tar.getmembers():
+                    file = tar.extractfile(member)
+                    content = file.read().decode('utf-8')
+                    lines = content.splitlines()
+
+                    if member.name.endswith('values.txt'):
+                        for line in lines:
+                            if line.startswith('#'):
+                                continue
+                            if '=' in line:
+                                key, value = line.split(' = ')
+                                try:
+                                    data[member.name.split('/')[-2]][key] = float(value)
+                                except ValueError:
+                                    data[member.name.split('/')[-2]][key] = str(value)
+                    else:
+                        header = lines[0]
+                        header_lines = [line for line in lines if line.startswith(header) or '=' in line]
+                        header_info = {}
+                        for line in header_lines[1:]:
+                            if '=' in line:
+                                key, value = line.split(' = ')
+                                header_info[key] = value
+
+                        data_values = [line for line in lines if not line.startswith(header) and '=' not in line]
+                        if data_values:
+                            vector_data = np.loadtxt(io.StringIO('\n'.join(data_values)))
+                            data[member.name.split('/')[-2]][member.name.split('/')[-1].split('.')[0]] = vector_data
+
             index_list.append(i)
+
             for param in params:
                 p = param.name
-                if p in data.get('cosmological_parameters'):
-                    params_dict[p].append(data['cosmological_parameters'][p])
-                if p in data.get('halo_model_parameters'):
-                    params_dict[p].append(data['halo_model_parameters'][p])
+                # Extend the option where the parameters can be and which spectra we have!
+                for key in ['cosmological_parameters', 'halo_model_parameters', 'redshift_as_parameter']:
+                    if p in data.get(key):
+                        params_dict[p].append(data[key][p])
 
             for key in ['matter_power_lin', 'matter_power_nl', 'cmb_cl']:
                 if data.get(key):
@@ -102,7 +86,6 @@ class CosmoPowerTrainingSampler(Sampler):
 
         return index_list, list(runs), params_dict, dict(out_dict)
 
-
     def config(self):
         import tensorflow as tf     
         self.converged = False
@@ -116,9 +99,10 @@ class CosmoPowerTrainingSampler(Sampler):
 
 
     def execute(self):
+        import pickle
         import matplotlib.pyplot as plt
         import tensorflow as tf    
-        from cosmopower import cosmopower_NN
+        from cosmopower import cosmopower_NN, cosmopower_PCAplusNN
         # setting the seed for reproducibility
         tf.random.set_seed(2)
 
@@ -140,9 +124,23 @@ class CosmoPowerTrainingSampler(Sampler):
         tar_files_test  = glob.glob(f"{self.tests_name}_*.tgz")
         tar_files_train = [f for f in tar_files_train if f not in tar_files_test]
 
-        index_list_train, training_runs, params_dict_train, runs_dict = self.pack_to_dictionaries(params, tar_files_train)
-        index_list_test, test_runs, params_dict_test, test_dict = self.pack_to_dictionaries(params, tar_files_test)
+        index_list_train, training_runs, params_dict_train, runs_dict = self.load_data(params, tar_files_train)
+        index_list_test, test_runs, params_dict_test, test_dict = self.load_data(params, tar_files_test)
             
+        # Save fixed parameters to file that were used to generate power spectra.
+        # This is useful later when we need to check if the input parameters are the same when using the emulator.đ
+        fixed_params = {}
+        for p in self.pipeline.fixed_params:
+            fixed_params[p.name] = p.limits[0]
+        with open(f'{self.save_dir}_fixed_params.pkl', 'wb') as f:
+            pickle.dump(fixed_params, f)
+
+        limits = {}
+        for p in params:
+            fixed_params[p.name] = p.limits
+        with open(f'{self.save_dir}_param_limits.pkl', 'wb') as f:
+            pickle.dump(limits, f)
+
         # outputs are either Plin, Pnl, CMB spectra
         for i, run in enumerate(training_runs):
             print(f'CosmoPower run {i+1}: training on {run}!')
@@ -153,7 +151,9 @@ class CosmoPowerTrainingSampler(Sampler):
             mean_params = [np.mean(params_dict_train[key]) for key in list(params_dict_train.keys())]
             mean_run = self.pipeline.run_results(mean_params)
             reference_prediction = np.squeeze(mean_run.block[run, 'p_k'])
-            # TO-DO: save reference prediction for later use!
+            # Save reference prediction to file
+            with open(f'{self.save_dir}_{run}_reference.pkl', 'wb') as f:
+                pickle.dump(reference_prediction, f)
             
             # Initiate and train the neural network
             cp_nn = cosmopower_NN(parameters=list(params_dict_train.keys()),

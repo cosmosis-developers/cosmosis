@@ -772,7 +772,18 @@ class LikelihoodPipeline(Pipeline):
         self.parameters = parameter.Parameter.load_parameters(self.values_file,
                                                               self.priors_files,
                                                               override,
-                                                              )
+                                                              ) 
+        # This seems like a hack...       
+        if self.options.has_option("latinhypercube", "training"):
+            if self.options.getboolean("latinhypercube", "training", fallback=False):
+                zmin = self.options.getfloat("latinhypercube", "zmin", fallback=0.0)
+                zmax = self.options.getfloat("latinhypercube", "zmax", fallback=3.01)
+                z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
+                print("Latin hypercube sampler created new parameter {}".format(z_param))
+                print("    with start:", z_param.start)
+                print("    with limits:", z_param.limits)
+                print("    with prior:", z_param.prior)
+                self.parameters.append(z_param)
         # We set up the modules first, so that if they want to e.g.
         # add parameters then they can.
         self.setup()
