@@ -125,50 +125,7 @@ class CosmoPowerSampler(Sampler):
         # setting the seed for reproducibility
         tf.random.set_seed(2)
 
-        # If our pipeline allows it we arrange it so that the
-        # fast parameters change fastest in the sequence.
-        # This is still not optimal for the multiprocessing case
-        if self.pipeline.do_fast_slow:
-            params = self.pipeline.slow_params + self.pipeline.fast_params
-        else:
-            params = self.pipeline.varied_params
-
-        # We load the generated power spectra but interpolate them over specific k-range as defined here.
-        # This makes sure our training has more features where power spectra change faster ...
-        # How to deal with redshifts?? Ideally as done by Pierre, we train at specific z's that are also in latin hypercube
-        # CAMB by default returns power spectra at an vector. 
-
-        # Load your data
-        tar_files_train = glob.glob(f"{self.samples_name}_*.tgz")
-        tar_files_test  = glob.glob(f"{self.tests_name}_*.tgz")
-        tar_files_train = [f for f in tar_files_train if f not in tar_files_test]
-
-        index_list_train, training_runs, params_dict_train, runs_dict = self.load_data(params, tar_files_train)
-        index_list_test, test_runs, params_dict_test, test_dict = self.load_data(params, tar_files_test)
-            
-        # Save fixed parameters to file that were used to generate power spectra.
-        # This is useful later when we need to check if the input parameters are the same when using the emulator.đ
-        fixed_params = {}
-        for p in self.pipeline.fixed_params:
-            fixed_params[p.name] = p.limits[0]
-        with open(f'{self.save_dir}_fixed_params.pkl', 'wb') as f:
-            pickle.dump(fixed_params, f)
-
-        limits = {}
-        for p in params:
-            limits[p.name] = p.limits
-        with open(f'{self.save_dir}_param_limits.pkl', 'wb') as f:
-            pickle.dump(limits, f)
-
-        # outputs are either Plin, Pnl, CMB spectra
-        for i, run in enumerate(training_runs):
-            print(f'CosmoPower run {i+1}: training on {run}!')
-            if run == 'cmb_cl':
-                print('Skipping CMB training, not yet implemented!')
-                continue
-                
-            mean_params = [np.mean(params_dict_train[key]) for key in list(params_dict_train.keys())]
-            mean_run = self.pipeline.run_results(mean_params)
+        def run_training_pk(run, params_dict_train, runs_dict, mean_run):
             reference_prediction = np.squeeze(mean_run.block[run, 'p_k'])
             # Save reference prediction to file
             with open(f'{self.save_dir}_{run}_reference.pkl', 'wb') as f:
@@ -176,9 +133,9 @@ class CosmoPowerSampler(Sampler):
             
             # Initiate and train the neural network
             cp_nn = cosmopower_NN(parameters=list(params_dict_train.keys()),
-                                  modes=runs_dict[run]['k_h'][0],
-                                  n_hidden=[1048, 1048, 1048, 1048],
-                                  verbose=True)
+                                modes=runs_dict[run]['k_h'][0],
+                                n_hidden=[1048, 1048, 1048, 1048],
+                                verbose=True)
             
             training_features = np.log10(runs_dict[run]['p_k']) - np.log10(reference_prediction)
             with tf.device(self.device):
@@ -193,6 +150,8 @@ class CosmoPowerSampler(Sampler):
                             patience_values=[100, 100, 100, 100, 100, 100],
                             max_epochs=[1000, 1000, 1000, 1000, 1000, 1000])
         
+        def run_testing_pk(run, params_dict_test, test_dict, mean_run):
+            reference_prediction = np.squeeze(mean_run.block[run, 'p_k'])
             # Enter testing phase
             cp_nn_test = cosmopower_NN(restore=True, restore_filename=f'{self.save_dir}_{run}')
             emulated_test_spectra = 10.0**(cp_nn_test.predictions_np(params_dict_test) + np.log10(reference_prediction))
@@ -221,6 +180,64 @@ class CosmoPowerSampler(Sampler):
             # Save the plot
             plt.savefig(f'{self.save_dir}_{run}_test.jpg', dpi=200, bbox_inches='tight')
             plt.close()
+
+        def run_training_cmb():
+            raise NotImplementedError
+
+        def run_testing_cmb():
+            raise NotImplementedError
+
+        # If our pipeline allows it we arrange it so that the
+        # fast parameters change fastest in the sequence.
+        # This is still not optimal for the multiprocessing case
+        if self.pipeline.do_fast_slow:
+            params = self.pipeline.slow_params + self.pipeline.fast_params
+        else:
+            params = self.pipeline.varied_params
+
+        # We load the generated power spectra but interpolate them over specific k-range as defined here.
+        # This makes sure our training has more features where power spectra change faster ...
+        # How to deal with redshifts?? Ideally as done by Pierre, we train at specific z's that are also in latin hypercube
+        # CAMB by default returns power spectra at an vector. 
+
+        # Load your data
+        tar_files_train = glob.glob(f"{self.samples_name}_*.tgz")
+        tar_files_test  = glob.glob(f"{self.tests_name}_*.tgz")
+        tar_files_train = [f for f in tar_files_train if f not in tar_files_test]
+
+        index_list_train, training_runs, params_dict_train, runs_dict = self.load_data(params, tar_files_train)
+        index_list_test, test_runs, params_dict_test, test_dict = self.load_data(params, tar_files_test)
+
+        assert set(training_runs) == set(test_runs), "The training and testing runs do not contain the same elements!"
+            
+        # Save fixed parameters to file that were used to generate power spectra.
+        # This is useful later when we need to check if the input parameters are the same when using the emulator.đ
+        fixed_params = {}
+        for p in self.pipeline.fixed_params:
+            fixed_params[p.name] = p.limits[0]
+        with open(f'{self.save_dir}_fixed_params.pkl', 'wb') as f:
+            pickle.dump(fixed_params, f)
+
+        limits = {}
+        for p in params:
+            limits[p.name] = p.limits
+        with open(f'{self.save_dir}_param_limits.pkl', 'wb') as f:
+            pickle.dump(limits, f)
+
+        mean_params = [np.mean(params_dict_train[key]) for key in list(params_dict_train.keys())]
+        mean_run = self.pipeline.run_results(mean_params)
+
+        # outputs are either Plin, Pnl, CMB spectra
+        for i, run in enumerate(training_runs):
+            print(f'CosmoPower run {i+1}: training on {run}!')
+            if run == 'cmb_cl':
+                #run_training_cmb()
+                #run_testing_cmb()
+                print('Skipping CMB training, not yet implemented!')
+                continue
+            else:    
+                run_training_pk(run, params_dict_train, runs_dict, mean_run)
+                run_testing_pk(run, params_dict_test, test_dict, mean_run)
 
         self.converged = True
 
