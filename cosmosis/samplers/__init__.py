@@ -25,4 +25,4 @@ from .zeus.zeus_sampler import ZeusSampler
 from .poco.poco_sampler import PocoMCSampler
 from .nautilus.nautilus_sampler import NautilusSampler
 from .latin_hypercube.latin_hypercube import LatinHypercubeSampler
-from .cosmopower_train.cosmopower_train import CosmoPowerTrainingSampler
+from .cosmopower_train.cosmopower_train import CosmoPowerSampler

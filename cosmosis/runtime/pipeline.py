@@ -46,6 +46,7 @@ class PipelineResults(object):
 
 PIPELINE_INI_SECTION = "pipeline"
 NO_LIKELIHOOD_NAMES = "no_likelihood_names_sentinel"
+TRAINING_INI_SECITON = "training"
 
 class MissingLikelihoodError(Exception):
 
@@ -336,7 +337,7 @@ class Pipeline(object):
 
     """
 
-    def __init__(self, arg=None, load=True, modules=None):
+    def __init__(self, arg=None, load=True, modules=None, training=False):
 
         u"""Pipeline constructor.
 
@@ -349,6 +350,8 @@ class Pipeline(object):
         configuration will be loaded into memory and initialized.
 
         """
+        self.training = training
+
         if arg is None:
             arg = list()
 
@@ -384,13 +387,21 @@ class Pipeline(object):
         elif load and PIPELINE_INI_SECTION in self.options.sections():
             module_list = self.options.get(PIPELINE_INI_SECTION,
                                            "modules", fallback="").split()
+            if self.training:
+                train_on_module = self.options.get(TRAINING_INI_SECITON, "train_on_module", fallback="camb")
+                if train_on_module != "camb":
+                    raise ValueError("Currently we only support training the CosmoPower on CAMB!")
+                try:
+                    index = module_list.index(train_on_module)
+                    module_list = module_list[:index + 1].copy()
+                except ValueError as e:
+                    raise Exception(f"In order to train the CosmoPower on {train_on_module}, {train_on_module} module needs to be in the specified modules.") from e
             self.modules = [
                 module.Module.from_options(module_name,self.options,self.root_directory)
                 for module_name in module_list
             ]
         else:
             self.modules = []
-
 
         self.shortcut_module=0
         self.shortcut_data=None
@@ -735,7 +746,7 @@ class LikelihoodPipeline(Pipeline):
     pipeline_being_set_up = []
     module_being_set_up = []
 
-    def __init__(self, arg=None, id="", override=None, modules=None, load=True, values=None, priors=None, only=None):
+    def __init__(self, arg=None, id="", override=None, modules=None, load=True, values=None, priors=None, only=None, training=False):
         u"""Construct a :class:`LikelihoodPipeline`.
 
         The arguments `arg` and `load` are used in the base-class
@@ -745,7 +756,7 @@ class LikelihoodPipeline(Pipeline):
         settings for those parametersʼ values in the initialization files.
         
         """
-        super().__init__(arg=arg, load=load, modules=modules)
+        super().__init__(arg=arg, load=load, modules=modules, training=training)
 
         if id:
             self.id_code = "[%s] " % str(id)
@@ -774,16 +785,15 @@ class LikelihoodPipeline(Pipeline):
                                                               override,
                                                               ) 
         # This seems like a hack...       
-        if self.options.has_option("runtime,", "latinhypercube"):
-            if self.options.getboolean("latinhypercube", "training", fallback=False):
-                zmin = self.options.getfloat("latinhypercube", "zmin", fallback=0.0)
-                zmax = self.options.getfloat("latinhypercube", "zmax", fallback=3.01)
-                z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
-                print("Latin hypercube sampler created new parameter {}".format(z_param))
-                print("    with start:", z_param.start)
-                print("    with limits:", z_param.limits)
-                print("    with prior:", z_param.prior)
-                self.parameters.append(z_param)
+        if self.training:
+            zmin = self.options.getfloat(TRAINING_INI_SECITON, "zmin")
+            zmax = self.options.getfloat(TRAINING_INI_SECITON, "zmax")
+            z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
+            print("Created new parameter {} used for CosmoPower training".format(z_param))
+            print("    with start:", z_param.start)
+            print("    with limits:", z_param.limits)
+            print("    with prior:", z_param.prior)
+            self.parameters.append(z_param)
         # We set up the modules first, so that if they want to e.g.
         # add parameters then they can.
         self.setup()

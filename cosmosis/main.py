@@ -187,7 +187,8 @@ def setup_output(sampler_class, sampler_number, ini, pool, sample_methods, sampl
 
 
 def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, override=None,
-                 profile_mem=0, profile_cpu="", variables=None, only=None, output=None):
+                 profile_mem=0, profile_cpu="", variables=None, only=None, output=None,
+                 train_cosmopower=False, train_cosmopower_force=False):
     """
     Execute cosmosis.
 
@@ -236,6 +237,14 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
     output: None or cosmosis.Output
         If set, use this output object to save the results. If not set, create
         an output object from the ini file.
+
+    train_cosmopower: bool
+        If set, it will run a specific set of samplers and modules up to and including CAMB to 
+        train the CosmoPower emulator, which can then be used as a drop-in replacement to CAMB.
+        Will refuse to re-train if emulator exists.
+
+    train_cosmopower_force: bool
+        Force re-train even if emulator exists.
     """
     no_subprocesses = os.environ.get("COSMOSIS_NO_SUBPROCESS", "") not in ["", "0"]
 
@@ -285,6 +294,20 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         profile = cProfile.Profile()
         profile.enable()
 
+    training = False
+    if train_cosmopower:
+        root_dir_name = ini.get("training", "save_dir")
+        save_name = f'{root_dir_name}/cosmopower_emulator_fixed_params.pkl'
+        if train_cosmopower:
+            if os.path.exists(save_name) and not train_cosmopower_force:
+                if is_root:
+                    print("Tried to train the CosmoPower emulator, but emulator already exists. If you want to really re-train the emulator, add option --force. Quitting.")
+                raise SystemExit
+            else:
+                training = True
+                if is_root:
+                    print("Training the CosmoPower emulator!" if not train_cosmopower_force else "Re-training the CosmoPower emulator!")
+
     # Create pipeline.
     if pipeline is None:
         cleanup_pipeline = True
@@ -296,14 +319,14 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
                 print(underline(f"Setting up pipeline from pre-constructed configuration"))
 
         if is_root or pool_stdout:
-            pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors)
+            pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors, training=training)
         else:
             if pool_stdout:
-                pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors)
+                pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors, training=training)
             else:
                 # Suppress output on everything except the root process
                 with stdout_redirected():
-                    pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors)
+                    pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors, training=training)
 
         if pipeline.do_fast_slow:
             pipeline.setup_fast_subspaces()
@@ -321,6 +344,10 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
 
     # determine the type(s) of sampling we want.
     sample_methods = ini.get(RUNTIME_INI_SECTION, "sampler", fallback="test").split()
+
+    # if we run the training option, we override the selected samplers, as they need to be fixed!
+    if training:
+        sample_methods = ["latinhypercube", "cosmopower"]
 
     for sample_method in sample_methods:
         if sample_method not in Sampler.registry:
@@ -545,6 +572,8 @@ parser.add_argument("--only", nargs="*", help="Fix all parameters except the one
 parser.add_argument("--graph", type=str, default='', help="Do not run a sampler; instead make a graphviz dot file of the pipeline")
 parser.add_argument('--version', action='version', version=__version__, help="Print out a version number")
 parser.add_argument('--profile' , help="Save profiling (timing) information to this named file")
+parser.add_argument('--train', action='store_true', help="Train the CosmoPower emulator")
+parser.add_argument('-f', '--force', action='store_true', help="Force train the CosmoPower emulator (will overwrite existing emulator)")
 
 
 @contextlib.contextmanager
@@ -573,15 +602,15 @@ def main():
         # initialize parallel workers
         if args.mpi:
             with mpi_pool.MPIPool() as pool:
-                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
+                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, train_cosmopower_force=args.force)
         elif args.smp:
             with process_pool.Pool(args.smp) as pool:
-                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
+                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, train_cosmopower_force=args.force)
         elif args.pdb:
             with run_under_debugger():
-                return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
+                return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, train_cosmopower_force=args.force)
         else:
-            return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
+            return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, train_cosmopower_force=args.force)
 
     except CosmosisConfigurationError as e:
         print(e)

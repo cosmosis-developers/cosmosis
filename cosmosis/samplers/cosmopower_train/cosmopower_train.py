@@ -13,7 +13,22 @@ os.environ["CUDA_VISIBLE_DEVICES"]= '0'
 # setting the seed for reproducibility
 np.random.seed(1)
 
-class CosmoPowerTrainingSampler(Sampler):
+matter_power_section_names = [
+    'dark_matter_power',
+    'baryon_power',
+    'photon_power',
+    'massless_neutrino_power',
+    'massive_neutrino_power',
+    'matter_power',
+    'cdm_baryon_power',
+    'matter_de_power',
+    'weyl_curvature_power',
+    'cdm_velocity_power',
+    'baryon_velocity_power',
+    'baryon_cdm_relative_velocity_power',
+]
+
+class CosmoPowerSampler(Sampler):
     parallel_output = False
     needs_output = False
 
@@ -71,13 +86,16 @@ class CosmoPowerTrainingSampler(Sampler):
                     if p in data.get(key):
                         params_dict[p].append(data[key][p])
 
-            for key in ['matter_power_lin', 'matter_power_nl', 'cmb_cl']:
+            suffixes = ['lin', 'nl']
+            all_keys = [f'{key}_{suffix}' for key in matter_power_section_names for suffix in suffixes]
+            all_keys.append('cmb_cl')
+            for key in all_keys:
                 if data.get(key):
                     runs.add(key)
-                    if key in ['matter_power_lin', 'matter_power_nl']:
+                    if key != 'cmb_cl':
                         out_dict[key]['k_h'].append(list(data[key]['k_h']))
                         out_dict[key]['p_k'].append(list(data[key]['p_k']))
-                    elif key in ['cmb_cl']:
+                    elif key == 'cmb_cl':
                         for cl in ['ell', 'tt', 'ee', 'bb', 'te']:
                             out_dict[key][cl].append(list(data[key][cl]))
                         for cl in ['pp', 'pt', 'pe']:
@@ -90,13 +108,14 @@ class CosmoPowerTrainingSampler(Sampler):
         import tensorflow as tf     
         self.converged = False
         self.fatal_errors = self.read_ini("fatal_errors", bool, False)
-        self.save_dir = self.read_ini("save_dir", str, "")
         self.print_log = self.read_ini("print_log", bool, False)
 
         self.device = 'gpu:0' if tf.config.list_physical_devices('GPU') else 'cpu'
-        self.samples_name = self.read_ini("samples_file_name", str, "")
-        self.tests_name = self.read_ini("tests_file_name", str, "")
 
+        root_dir_name = self.ini.get("training", "save_dir")
+        self.save_dir = f'{root_dir_name}/cosmopower_emulator'
+        self.samples_name = f'{root_dir_name}/cosmopower_inputs'
+        self.tests_name =  f'{root_dir_name}/cosmopower_inputs_test'
 
     def execute(self):
         import pickle
@@ -137,7 +156,7 @@ class CosmoPowerTrainingSampler(Sampler):
 
         limits = {}
         for p in params:
-            fixed_params[p.name] = p.limits
+            limits[p.name] = p.limits
         with open(f'{self.save_dir}_param_limits.pkl', 'wb') as f:
             pickle.dump(limits, f)
 

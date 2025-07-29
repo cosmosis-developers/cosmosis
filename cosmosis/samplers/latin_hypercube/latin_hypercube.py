@@ -25,9 +25,14 @@ class LatinHypercubeSampler(ParallelSampler):
 
         self.converged = False
         self.nsample = self.read_ini("nsample", int, 1)
-        self.nsample_test = self.read_ini("nsample_test", int, 0)
         self.save_name = self.read_ini("save", str, "")
-        self.training = self.read_ini("training", bool, False)
+        if self.pipeline.training:
+            self.nsample = self.ini.getint("training", "nsample")
+            self.nsample_test = self.ini.getint("training", "ntest")
+            root_dir_name = self.ini.get("training", "save_dir")
+            self.save_name = f'{root_dir_name}/cosmopower_inputs'
+        else:
+            self.nsample_test = 0
         self.nstep = self.read_ini("nstep", int, -1)
         self.sample_points = None
         self.sample_points_test = None
@@ -74,7 +79,7 @@ class LatinHypercubeSampler(ParallelSampler):
         # ML and / or CosmoPower training
         #if self.training and self.nsample_test == 0:
         #    raise ValueError("nsample_test needs to be greater than 0!")
-        if self.training and self.nsample_test > 0:
+        if self.pipeline.training and self.nsample_test > 0:
             # Create a Latin Hypercube sampler
             sampler_test = qmc.LatinHypercube(d=len(param_order))
 
@@ -96,7 +101,7 @@ class LatinHypercubeSampler(ParallelSampler):
         #This advances the self.sample_points forward so it knows
         #that these samples have been done
         samples = list(itertools.islice(self.sample_points, self.nstep))
-        if self.training and self.nsample_test > 0:
+        if self.pipeline.training and self.nsample_test > 0:
             samples_test = list(itertools.islice(self.sample_points_test, self.nstep))
         else:
             samples_test = []
@@ -119,7 +124,7 @@ class LatinHypercubeSampler(ParallelSampler):
         else:
             results = list(map(task, jobs))
 
-        if self.training and self.nsample_test > 0:
+        if self.pipeline.training and self.nsample_test > 0:
             sample_test_index = np.arange(len(samples_test)) + self.ndone_test
             sample_name_test = ["_test" for i in sample_test_index]
             jobs_test = list(zip(sample_test_index, samples_test, sample_name_test))
@@ -130,7 +135,7 @@ class LatinHypercubeSampler(ParallelSampler):
 
         #Update the count
         self.ndone1 += len(results)
-        if self.training and self.nsample_test > 0:
+        if self.pipeline.training and self.nsample_test > 0:
             self.ndone_test += len(results_test)
         self.ndone = self.ndone1 + self.ndone_test
 
