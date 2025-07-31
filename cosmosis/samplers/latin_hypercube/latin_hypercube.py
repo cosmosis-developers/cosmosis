@@ -10,7 +10,7 @@ def task(p):
     results = lh_sampler.pipeline.run_results(p)
     #If requested, save the data to file
     if lh_sampler.save_name and results.block is not None:
-        results.block.to_yaml(f"{lh_sampler.save_name}{name}_{i}.yaml")
+        results.block.save_to_file(f"{lh_sampler.save_name}{name}_{i}", clobber=True)
     return (results.post, results.prior, results.extra)
 
 
