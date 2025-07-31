@@ -1361,6 +1361,33 @@ class DataBlock(object):
 		yaml.dump(data, stream)
 
 	@classmethod
+	def from_pickle(cls, filename):
+		import pickle
+
+		block = cls()
+		with open(filename + ".pkl", 'rb') as f:
+			data = pickle.load(f)
+		for section, values in data.items():
+			for key, value in values.items():
+				block[section, key] = value
+		return block
+
+	def to_pickle(self, filename):
+		import pickle
+
+		data = {}
+		for section in self.sections():
+			data[section] = {}
+			for (_, key) in self.keys(section):
+				value = self[section, key]
+				if isinstance(value, np.ndarray):
+					value = value.tolist()
+				data[section][key] = value
+
+		with open(filename + ".pkl", 'wb') as f:
+			pickle.dump(data, f)
+
+	@classmethod
 	def from_dict(cls, d):
 		b = cls()
 		for section, values in d.items():

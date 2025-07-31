@@ -6,11 +6,14 @@ from .. import ParallelSampler
 
 
 def task(p):
-    i,p,name = p
+    i,p,name,training = p
     results = lh_sampler.pipeline.run_results(p)
     #If requested, save the data to file
     if lh_sampler.save_name and results.block is not None:
-        results.block.save_to_file(f"{lh_sampler.save_name}{name}_{i}", clobber=True)
+        if training:
+            results.block.to_pickle(f"{lh_sampler.save_name}{name}_{i}")
+        else:
+            results.block.save_to_file(f"{lh_sampler.save_name}{name}_{i}", clobber=True)
     return (results.post, results.prior, results.extra)
 
 
@@ -116,7 +119,8 @@ class LatinHypercubeSampler(ParallelSampler):
         #the output results from each one
         sample_index = np.arange(len(samples)) + self.ndone1
         sample_name = ["" for i in sample_index]
-        jobs = list(zip(sample_index, samples, sample_name))
+        training_flag = [self.pipeline.training for i in sample_index]
+        jobs = list(zip(sample_index, samples, sample_name, training_flag))
 
         #Actually compute the likelihood results
         if self.pool:
@@ -127,7 +131,8 @@ class LatinHypercubeSampler(ParallelSampler):
         if self.pipeline.training and self.nsample_test > 0:
             sample_test_index = np.arange(len(samples_test)) + self.ndone_test
             sample_name_test = ["_test" for i in sample_test_index]
-            jobs_test = list(zip(sample_test_index, samples_test, sample_name_test))
+            training_flag_test = [self.pipeline.training for i in sample_index]
+            jobs_test = list(zip(sample_test_index, samples_test, sample_name_test, training_flag_test))
             if self.pool:
                 results_test = self.pool.map(task, jobs_test)
             else:

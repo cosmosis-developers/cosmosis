@@ -5,7 +5,7 @@ import sys
 import os
 import io
 import glob
-import tarfile
+import pickle
 from collections import defaultdict
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ["CUDA_VISIBLE_DEVICES"]= '0'
@@ -32,53 +32,19 @@ class CosmoPowerSampler(Sampler):
     parallel_output = False
     needs_output = False
 
-    def load_data(self, params, filenames):
+    def load_pickles(self, params, filenames):
         index_list = []
         params_dict = defaultdict(list)
         out_dict = defaultdict(lambda: defaultdict(list))
         runs = set()
 
         for filename in filenames:
-            if not filename.endswith('.tgz'):
-                raise ValueError("The file must have a .tgz extension.")
-            if not os.path.exists(filename):
-                raise FileNotFoundError(f"The file {filename} does not exist.")
-
-            i = os.path.basename(filename).split('_')[-1].split('.')[0]
-            data = defaultdict(dict)
-
-            with tarfile.open(filename, "r:gz") as tar:
-                for member in tar.getmembers():
-                    file = tar.extractfile(member)
-                    content = file.read().decode('utf-8')
-                    lines = content.splitlines()
-
-                    if member.name.endswith('values.txt'):
-                        for line in lines:
-                            if line.startswith('#'):
-                                continue
-                            if '=' in line:
-                                key, value = line.split(' = ')
-                                try:
-                                    data[member.name.split('/')[-2]][key] = float(value)
-                                except ValueError:
-                                    data[member.name.split('/')[-2]][key] = str(value)
-                    else:
-                        header = lines[0]
-                        header_lines = [line for line in lines if line.startswith(header) or '=' in line]
-                        header_info = {}
-                        for line in header_lines[1:]:
-                            if '=' in line:
-                                key, value = line.split(' = ')
-                                header_info[key] = value
-
-                        data_values = [line for line in lines if not line.startswith(header) and '=' not in line]
-                        if data_values:
-                            vector_data = np.loadtxt(io.StringIO('\n'.join(data_values)))
-                            data[member.name.split('/')[-2]][member.name.split('/')[-1].split('.')[0]] = vector_data
-
-            index_list.append(i)
-
+            index_list.append(int(os.path.basename(filename).split('_')[-1].split('.')[0]))
+            with open(filename, 'rb') as f:
+                data = pickle.load(f)
+        
+            # This could be simplified and generalised for all inputs, by having the same function as block.from_pickle, 
+            # but leaving now as it is to extract only the relevant quantities
             for param in params:
                 p = param.name
                 # Extend the option where the parameters can be and which spectra we have!
@@ -93,14 +59,14 @@ class CosmoPowerSampler(Sampler):
                 if data.get(key):
                     runs.add(key)
                     if key != 'cmb_cl':
-                        out_dict[key]['k_h'].append(list(data[key]['k_h']))
-                        out_dict[key]['p_k'].append(list(data[key]['p_k']))
+                        out_dict[key]['k_h'].append(list(np.squeeze(data[key]['k_h'])))
+                        out_dict[key]['p_k'].append(list(np.squeeze(data[key]['p_k'])))
                     elif key == 'cmb_cl':
                         for cl in ['ell', 'tt', 'ee', 'bb', 'te']:
-                            out_dict[key][cl].append(list(data[key][cl]))
+                            out_dict[key][cl].append(list(np.squeeze(data[key][cl])))
                         for cl in ['pp', 'pt', 'pe']:
                             if cl in data[key]:
-                                out_dict[key][cl].append(list(data[key][cl]))
+                                out_dict[key][cl].append(list(np.squeeze(data[key][cl])))
 
         return index_list, list(runs), params_dict, dict(out_dict)
 
@@ -118,7 +84,6 @@ class CosmoPowerSampler(Sampler):
         self.tests_name =  f'{root_dir_name}/cosmopower_inputs_test'
 
     def execute(self):
-        import pickle
         import matplotlib.pyplot as plt
         import tensorflow as tf    
         from cosmopower import cosmopower_NN, cosmopower_PCAplusNN
@@ -201,12 +166,12 @@ class CosmoPowerSampler(Sampler):
         # CAMB by default returns power spectra at an vector. 
 
         # Load your data
-        tar_files_train = glob.glob(f"{self.samples_name}_*.tgz")
-        tar_files_test  = glob.glob(f"{self.tests_name}_*.tgz")
-        tar_files_train = [f for f in tar_files_train if f not in tar_files_test]
+        files_train = glob.glob(f"{self.samples_name}_*.pkl")
+        files_test  = glob.glob(f"{self.tests_name}_*.pkl")
+        files_train = [f for f in files_train if f not in files_test]
 
-        index_list_train, training_runs, params_dict_train, runs_dict = self.load_data(params, tar_files_train)
-        index_list_test, test_runs, params_dict_test, test_dict = self.load_data(params, tar_files_test)
+        index_list_train, training_runs, params_dict_train, runs_dict = self.load_pickles(params, files_train)
+        index_list_test, test_runs, params_dict_test, test_dict = self.load_pickles(params, files_test)
 
         assert set(training_runs) == set(test_runs), "The training and testing runs do not contain the same elements!"
             
