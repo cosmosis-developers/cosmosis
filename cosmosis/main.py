@@ -301,12 +301,12 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         if train_cosmopower:
             if os.path.exists(save_name) and not train_cosmopower_force:
                 if is_root:
-                    print("Tried to train the CosmoPower emulator, but emulator already exists. If you want to really re-train the emulator, add option --force. Quitting.")
+                    print(underline("Tried to train the CosmoPower emulator, but emulator already exists. If you want to really re-train the emulator, add option --force. Quitting."))
                 raise SystemExit
             else:
                 training = True
                 if is_root:
-                    print("Training the CosmoPower emulator!" if not train_cosmopower_force else "Re-training the CosmoPower emulator!")
+                    print(underline("Training the CosmoPower emulator!") if not train_cosmopower_force else underline("Re-training the CosmoPower emulator!"))
 
     # Create pipeline.
     if pipeline is None:

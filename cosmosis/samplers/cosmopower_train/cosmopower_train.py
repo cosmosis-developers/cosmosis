@@ -59,14 +59,14 @@ class CosmoPowerSampler(Sampler):
                 if data.get(key):
                     runs.add(key)
                     if key != 'cmb_cl':
-                        out_dict[key]['k_h'].append(list(np.squeeze(data[key]['k_h'])))
-                        out_dict[key]['p_k'].append(list(np.squeeze(data[key]['p_k'])))
+                        out_dict[key]['k_h'].append(np.squeeze(data[key]['k_h']).tolist())
+                        out_dict[key]['p_k'].append(np.squeeze(data[key]['p_k']).tolist())
                     elif key == 'cmb_cl':
                         for cl in ['ell', 'tt', 'ee', 'bb', 'te']:
-                            out_dict[key][cl].append(list(np.squeeze(data[key][cl])))
+                            out_dict[key][cl].append(np.squeeze(data[key][cl]).tolist())
                         for cl in ['pp', 'pt', 'pe']:
                             if cl in data[key]:
-                                out_dict[key][cl].append(list(np.squeeze(data[key][cl])))
+                                out_dict[key][cl].append(np.squeeze(data[key][cl]).tolist())
 
         return index_list, list(runs), params_dict, dict(out_dict)
 
@@ -176,16 +176,12 @@ class CosmoPowerSampler(Sampler):
         assert set(training_runs) == set(test_runs), "The training and testing runs do not contain the same elements!"
             
         # Save fixed parameters to file that were used to generate power spectra.
-        # This is useful later when we need to check if the input parameters are the same when using the emulator.đ
-        fixed_params = {}
-        for p in self.pipeline.fixed_params:
-            fixed_params[p.name] = p.limits[0]
+        # This is useful later when we need to check if the input parameters are the same when using the emulator.
+        fixed_params = {p.name: p.limits[0] for p in self.pipeline.fixed_params}
         with open(f'{self.save_dir}_fixed_params.pkl', 'wb') as f:
             pickle.dump(fixed_params, f)
 
-        limits = {}
-        for p in params:
-            limits[p.name] = p.limits
+        limits = {p.name: p.limits for p in params}
         with open(f'{self.save_dir}_param_limits.pkl', 'wb') as f:
             pickle.dump(limits, f)
 
