@@ -827,32 +827,36 @@ class LikelihoodPipeline(Pipeline):
             self.likelihood_names = likelihood_names.split()
 
         if self.training:
-            print("")
-            print("Running pipeline once to determine which free parametes are being used in order to correctly setup the CosmoPower")
-            print("-----------------------------------------------------------------------------------------------------------------")
-            # This seems like a hack...
-            zmin = self.options.getfloat(TRAINING_INI_SECITON, "zmin")
-            zmax = self.options.getfloat(TRAINING_INI_SECITON, "zmax")
-            z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
-            print("")
-            print("Created new parameter {} used for CosmoPower training".format(z_param))
-            print("    with start:", z_param.start)
-            print("    with limits:", z_param.limits)
-            print("    with prior:", z_param.prior)
-            self.parameters.append(z_param)
-            self.reset_fixed_varied_parameters()
+            self.setup_training()
             
-            test_results = self.run_results([p.start for p in self.varied_params])
-            used_params_per_module = test_results.block.get_all_parameter_use(self.varied_params)
-            used_params = used_params_per_module[self.train_on_module]
-            for p in self.varied_params:    
-                if (p.section, p.name) not in used_params:
-                    p.fix()
-            self.reset_fixed_varied_parameters()
-            # We reset the run stats so the rest functions as intended.
-            self.run_count = 0
-            self.run_count_ok = 0
-            self.has_run = False
+    
+    def setup_training(self):
+        print("")
+        print("Running pipeline once to determine which free parametes are being used in order to correctly setup the CosmoPower")
+        print("-----------------------------------------------------------------------------------------------------------------")
+        # This seems like a hack...
+        zmin = self.options.getfloat(TRAINING_INI_SECITON, "zmin")
+        zmax = self.options.getfloat(TRAINING_INI_SECITON, "zmax")
+        z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
+        print("")
+        print("Created new parameter {} used for CosmoPower training".format(z_param))
+        print("    with start:", z_param.start)
+        print("    with limits:", z_param.limits)
+        print("    with prior:", z_param.prior)
+        self.parameters.append(z_param)
+        self.reset_fixed_varied_parameters()
+            
+        test_results = self.run_results([p.start for p in self.varied_params])
+        used_params_per_module = test_results.block.get_all_parameter_use(self.varied_params)
+        used_params = used_params_per_module[self.train_on_module]
+        for p in self.varied_params:    
+             if (p.section, p.name) not in used_params:
+                p.fix()
+        self.reset_fixed_varied_parameters()
+        # We reset the run stats so the rest functions as intended.
+        self.run_count = 0
+        self.run_count_ok = 0
+        self.has_run = False
             
 
     @classmethod
