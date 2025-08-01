@@ -388,14 +388,14 @@ class Pipeline(object):
             module_list = self.options.get(PIPELINE_INI_SECTION,
                                            "modules", fallback="").split()
             if self.training:
-                train_on_module = self.options.get(TRAINING_INI_SECITON, "train_on_module", fallback="camb")
-                if train_on_module != "camb":
+                self.train_on_module = self.options.get(TRAINING_INI_SECITON, "train_on_module", fallback="camb")
+                if self.train_on_module != "camb":
                     raise ValueError("Currently we only support training the CosmoPower on CAMB!")
                 try:
-                    index = module_list.index(train_on_module)
+                    index = module_list.index(self.train_on_module)
                     module_list = module_list[:index + 1].copy()
                 except ValueError as e:
-                    raise Exception(f"In order to train the CosmoPower on {train_on_module}, {train_on_module} module needs to be in the specified modules.") from e
+                    raise Exception(f"In order to train the CosmoPower on {self.train_on_module}, {self.train_on_module} module needs to be in the specified modules.") from e
             self.modules = [
                 module.Module.from_options(module_name,self.options,self.root_directory)
                 for module_name in module_list
@@ -843,10 +843,10 @@ class LikelihoodPipeline(Pipeline):
             self.reset_fixed_varied_parameters()
 
             test_results = self.run_results([p.start for p in self.varied_params])
-            used_params = test_results.block.get_first_parameter_use(self.varied_params)
-            used_params_list = [param for section in used_params.values() for param in section]
+            used_params_per_module = test_results.block.get_all_parameter_use(self.varied_params)
+            used_params = used_params_per_module[self.train_on_module]
             for p in self.varied_params:    
-                if (p.section, p.name) not in used_params_list:
+                if (p.section, p.name) not in used_params:
                     p.fix()
             self.reset_fixed_varied_parameters()
 
