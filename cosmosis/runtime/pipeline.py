@@ -846,7 +846,7 @@ class LikelihoodPipeline(Pipeline):
             used_params = test_results.block.get_first_parameter_use(self.varied_params)
             used_params_list = [param for section in used_params.values() for param in section]
             for p in self.varied_params:    
-                if not (p.section, p.name) in used_params_list:
+                if (p.section, p.name) not in used_params_list:
                     p.fix()
             self.reset_fixed_varied_parameters()
 
