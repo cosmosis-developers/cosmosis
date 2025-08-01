@@ -841,7 +841,7 @@ class LikelihoodPipeline(Pipeline):
             print("    with prior:", z_param.prior)
             self.parameters.append(z_param)
             self.reset_fixed_varied_parameters()
-
+            
             test_results = self.run_results([p.start for p in self.varied_params])
             used_params_per_module = test_results.block.get_all_parameter_use(self.varied_params)
             used_params = used_params_per_module[self.train_on_module]
@@ -849,7 +849,11 @@ class LikelihoodPipeline(Pipeline):
                 if (p.section, p.name) not in used_params:
                     p.fix()
             self.reset_fixed_varied_parameters()
-
+            # We reset the run stats so the rest functions as intended.
+            self.run_count = 0
+            self.run_count_ok = 0
+            self.has_run = False
+            
 
     @classmethod
     def from_chain_file(cls, filename, **kwargs):

@@ -1324,7 +1324,6 @@ class DataBlock(object):
 		for i in range(self.get_log_count()):
 			ptype, section, name, _ = self.get_log_entry(i)
 			if ptype=="MODULE-START":
-				print(ptype, section, name)
 				# The previous current_module is already the
 				#last element in params_by_module (unless it's the
 				#very first one in which case we discard it because
