@@ -30,12 +30,14 @@ class LatinHypercubeSampler(ParallelSampler):
         self.nsample = self.read_ini("nsample", int, 1)
         self.save_name = self.read_ini("save", str, "")
         self.nstep = self.read_ini("nstep", int, -1)
+
         if self.pipeline.training:
             self.nsample = self.pipeline.nsample
             self.nsample_test = self.pipeline.nsample_test
             self.save_name = self.pipeline.save_name
         else:
             self.nsample_test = 0
+
         self.sample_points = None
         self.ndone = 0
         self.ndone1 = 0
@@ -78,9 +80,9 @@ class LatinHypercubeSampler(ParallelSampler):
 
         # We create a second LHS if we use the latin hypercube to create samples for
         # ML and / or CosmoPower training
-        if self.pipeline.training and self.nsample_test == 0:
-            raise ValueError("nsample_test needs to be greater than 0!")
         if self.pipeline.training:
+            if self.nsample_test == 0:
+                raise ValueError("nsample_test needs to be greater than 0!")
             # Create a Latin Hypercube sampler
             sampler_test = qmc.LatinHypercube(d=len(param_order))
 
@@ -135,11 +137,10 @@ class LatinHypercubeSampler(ParallelSampler):
                 results_test = self.pool.map(task, jobs_test)
             else:
                 results_test = list(map(task, jobs_test))
+            self.ndone_test += len(results_test)
 
         #Update the count
         self.ndone1 += len(results)
-        if self.pipeline.training:
-            self.ndone_test += len(results_test)
         self.ndone = self.ndone1 + self.ndone_test
 
         #Save the results of the sampling
