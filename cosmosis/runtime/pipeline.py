@@ -834,6 +834,11 @@ class LikelihoodPipeline(Pipeline):
         print("")
         print("Running pipeline once to determine which free parametes are being used in order to correctly setup the CosmoPower")
         print("-----------------------------------------------------------------------------------------------------------------")
+
+        self.nsample = self.options.getint(TRAINING_INI_SECITON, "nsample")
+        self.nsample_test = self.options.getint(TRAINING_INI_SECITON, "ntest")
+        self.save_name = f'{self.options.get(TRAINING_INI_SECITON, "save_dir")}/cosmopower_inputs'
+
         # This seems like a hack...
         zmin = self.options.getfloat(TRAINING_INI_SECITON, "zmin")
         zmax = self.options.getfloat(TRAINING_INI_SECITON, "zmax")

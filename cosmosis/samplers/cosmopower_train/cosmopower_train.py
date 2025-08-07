@@ -78,10 +78,9 @@ class CosmoPowerSampler(Sampler):
 
         self.device = 'gpu:0' if tf.config.list_physical_devices('GPU') else 'cpu'
 
-        root_dir_name = self.ini.get("training", "save_dir")
-        self.save_dir = f'{root_dir_name}/cosmopower_emulator'
-        self.samples_name = f'{root_dir_name}/cosmopower_inputs'
-        self.tests_name =  f'{root_dir_name}/cosmopower_inputs_test'
+        self.save_dir = self.pipeline.save_name.replace('cosmopower_inputs', 'cosmopower_emulator')
+        self.samples_name = self.pipeline.save_name
+        self.tests_name =  f'{self.pipeline.save_name}_test'
 
     def execute(self):
         import matplotlib.pyplot as plt
