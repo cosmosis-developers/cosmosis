@@ -80,8 +80,8 @@ class LatinHypercubeSampler(ParallelSampler):
 
         # We create a second LHS if we use the latin hypercube to create samples for
         # ML and / or CosmoPower training
-        #if self.training and self.nsample_test == 0:
-        #    raise ValueError("nsample_test needs to be greater than 0!")
+        if self.pipeline.training and self.nsample_test == 0:
+            raise ValueError("nsample_test needs to be greater than 0!")
         if self.pipeline.training and self.nsample_test > 0:
             # Create a Latin Hypercube sampler
             sampler_test = qmc.LatinHypercube(d=len(param_order))
