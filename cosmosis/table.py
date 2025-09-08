@@ -13,9 +13,10 @@ from typing import Union, IO
 def openr(f):
     if isinstance(f, str):
         return open(f, 'r')
-    else:
+    elif hasattr(f, 'read'):
         return f
-
+    else:
+        raise ValueError("Argument must be a filename or a readable file-like object")
 def openw(f):
     if isinstance(f, str):
         return open(f, 'w')
