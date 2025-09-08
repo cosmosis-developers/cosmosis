@@ -6,7 +6,9 @@ import numpy as np
 import os
 try:
     import astropy.table
-except:
+    # register the cosmosis table format:
+    import cosmosis.table
+except ImportError:
     astropy = None
 
 def populate_table(out, nparam, ns):
@@ -38,6 +40,22 @@ def test_text():
             t = astropy.table.Table.read(filename, format='ascii.commented_header')
             A = t['A']
             B = t['B']
+
+            # we should also be able to read it with the new table reader
+            t2 = astropy.table.Table.read(filename, format='cosmosis')
+
+            assert np.all(t2['A'] == A)
+            assert np.all(t2['B'] == B)
+            assert t2.meta['NP'] == nparam
+            assert t2.meta['NS'] == ns
+
+            t2.write(filename + ".2", format='cosmosis', overwrite=True)
+            t3 = astropy.table.Table.read(filename + ".2", format='cosmosis')
+            assert np.all(t3['A'] == A)
+            assert np.all(t3['B'] == B)
+            assert t3.meta['NP'] == nparam
+            assert t3.meta['NS'] == ns
+
         else:
             t = np.loadtxt(filename,dtype=int).T
             A = t[0]
@@ -54,6 +72,7 @@ def test_text():
         assert len(data[0])==ns
         assert meta[0]['NP']==nparam
         assert final[0]['FINISH'] is True
+
 
 def test_cosmomc_output():
     with tempfile.TemporaryDirectory() as dirname:
