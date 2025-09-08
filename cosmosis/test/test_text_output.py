@@ -49,6 +49,13 @@ def test_text():
             assert t2.meta['NP'] == nparam
             assert t2.meta['NS'] == ns
 
+            t2.write(filename + ".2", format='cosmosis', overwrite=True)
+            t3 = astropy.table.Table.read(filename + ".2", format='cosmosis')
+            assert np.all(t3['A'] == A)
+            assert np.all(t3['B'] == B)
+            assert t3.meta['NP'] == nparam
+            assert t3.meta['NS'] == ns
+
         else:
             t = np.loadtxt(filename,dtype=int).T
             A = t[0]
