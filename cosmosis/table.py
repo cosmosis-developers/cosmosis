@@ -131,7 +131,7 @@ def write_cosmosis_table(table: Table, filename: Union[str, IO], overwrite: bool
     delimiter : str, optional
         The delimiter to use in the file. Default is tab.
     """
-    if (not overwrite) and os.path.exists(filename):
+    if isinstance(filename, str) and (not overwrite) and os.path.exists(filename):
         raise OSError(f"File {filename} exists and overwrite=False")
 
     with openw(filename) as f:
