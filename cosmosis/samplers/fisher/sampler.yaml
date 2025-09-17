@@ -60,7 +60,7 @@ installation: >
 params:
     method: "(string; default='stencil') The method to use for numerical differentiation.  Options are 'stencil', 'numdifftools', 'smooth'. The latter two require the numdifftools and derivative packages respectively"
     step_size: "(float; default=0.01) The size, as a fraction of the total parameter range, of steps to use in the stencil and numdifftools methods."
+    use_numdifftools: "(bool; default=False) Whether to use the numdifftools package for numerical differentiation (deprecated)"
     step_size_min: "(float; default=1e-5) The minimum step size to use in the numerical differentiation using the 'smooth' method"
     step_size_max: "(float; default=1e-2) The maximum step size to use in the numerical differentiation using the 'smooth' method"
-    step_size_max: "(float; default=1e-2) The maximum step size to use in the numerical differentiation using the 'smooth' method"
-    step_size_count: "(int; default=10) The numer of steps to use in the numerical differentiation using the 'smooth' method"
+    step_count: "(int; default=10) The number of steps to use in the numerical differentiation using the 'smooth' method"

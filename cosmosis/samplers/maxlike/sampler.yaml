@@ -68,9 +68,10 @@ params:
     maxiter: (integer; default=1000) Maximum number of iterations of the sampler
     output_ini: "(string; default='') if present, save the resulting parameters to a new ini file with this name"
     output_covmat: "(string; default='') if present and the sampler supports it, save the estimated covariance to this file"
+    output_block: "(string; default='') if present, save the complete datablock output to this directory"
     max_posterior: "(bool; default=False) find the max a posteriori point instead of max like (includes the priors as well)"
     repeats: "(integer; default=1) number of times to repeat the minimization from different starting points"
     reiterations: "(integer; default=1) number of times to continue the minimization from the end of the previous run"
     start_method: "(string; default='') method to use to generate starting points.  Options are 'prior' and 'chain', 'cov', or blank for default start'"
     start_input: "(string; default='') input file to use for starting points if start_method is 'chain' or 'cov'"
-    nstep: "(integer; default=1) number of steps to output at once"
+    nsteps: "(integer; default=varies) number of steps to output at once"

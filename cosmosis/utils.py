@@ -265,21 +265,8 @@ def extract_params(chain, prefix):
 
 
 def tempdir_safe_docker():
-    # Under python3 TemporaryDirectory is in the tempfile
-    # standard library package.
-    # Under python2 the backports.tempfile package is required.
-    # It can be pip installed.
-    try:
-        TemporaryDirectory = tempfile.TemporaryDirectory
-    except AttributeError:
-        try:
-            import backports.tempfile
-            TemporaryDirectory = backports.tempfile.TemporaryDirectory
-        except ImportError:
-            raise ImportError("In python 2 the PriorFunction code "+
-                "requires you to install backports.tempfile.  It can be done with pip")
-
-    return TemporaryDirectory()
+    # TemporaryDirectory is in the tempfile standard library package in Python 3
+    return tempfile.TemporaryDirectory()
 
 
 class PriorFunction(object):

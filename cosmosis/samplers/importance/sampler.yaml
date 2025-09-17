@@ -22,6 +22,6 @@ installation: >
     No special installation required; everything is packaged with CosmoSIS
 
 params:
-    input_filename: (string) cosmosis-format chain of input samples
+    input: (string) cosmosis-format chain of input samples
     nstep: (integer; default=128) number of samples to do between saving output
     add_to_likelihood: (bool; default=N) include the old likelihood in the old likelihood; i.e. P'=P*P_new

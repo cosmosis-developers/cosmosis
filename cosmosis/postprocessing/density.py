@@ -188,7 +188,7 @@ def smooth_density_estimate_2d(x, y, xmin, xmax, ymin, ymax, weights=None, N=256
     width_x = np.sqrt(covmat[0, 0]) * scott_factor * smoothing / dx
     width_y = np.sqrt(covmat[1, 1]) * scott_factor * smoothing / dy
     
-    # get the smoothing kernel.  Much nicer if you don't have to support py2!
+    # get the smoothing kernel
     kernel_C = np.array([[width_x**2, width_x * width_y * rho], [width_x * width_y * rho, width_y**2]])
     kernel_Cinv = np.linalg.inv(kernel_C)
 

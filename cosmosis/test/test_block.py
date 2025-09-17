@@ -157,6 +157,28 @@ def test_keys():
     for k in keys:
         assert k in b
 
+def check_blocks_equal(b1, b2):
+    keys1 = list(b1.keys())
+    keys2 = list(b2.keys())
+    assert sorted(keys1) == sorted(keys2)
+    for sec, key in keys1:
+        v1 = b1.get(sec, key)
+        v2 = b2.get(sec, key)
+        assert np.equal(v1, v2).all()
+
+def test_to_string():
+    b = DataBlock()
+    section='dogs'
+    b.put(section, 'x', [1.4,2.1,3.6])
+    b.put(section, "n", 14)
+    b.put(section, 's', 'my_string')
+    section='other'
+    b.put(section, 'a', 98)
+    b.put(section, "b", 1.4)
+    b.put_string(section, 's', 'my_string')
+    s = b.to_string()
+    b2 = DataBlock.from_string(s)
+    check_blocks_equal(b, b2)
 
 def test_wrong_array_type():
     puts = {

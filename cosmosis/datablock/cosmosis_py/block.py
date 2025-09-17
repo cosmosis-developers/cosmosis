@@ -1340,13 +1340,6 @@ class DataBlock(object):
 	def from_yaml(cls, filename_or_stream):
 		import yaml
 
-		# work around problem with py2 yaml on unicode
-		# https://stackoverflow.com/questions/27518976/how-can-i-get-pyyaml-safe-load-to-handle-python-unicode-tag
-		if sys.version_info[0]==2:
-			def constructor(loader, node):
-				return node.value
-			yaml.SafeLoader.add_constructor("tag:yaml.org,2002:python/unicode", constructor)
-
 		block = cls()
 		if isinstance(filename_or_stream, str):
 			stream = open(filename_or_stream)
@@ -1421,29 +1414,19 @@ class DataBlock(object):
 
 	@classmethod
 	def from_string(cls, s):
-		if sys.version_info[0]==2:
-			sio = BytesIO(s)
-		else:
-			sio = StringIO(s)
+		sio = StringIO(s)
 		return cls.from_yaml(sio)
 
 	def to_string(self):
-		if sys.version_info[0]==2:
-			sio = BytesIO()
-		else:
-			sio = StringIO()
+		sio = StringIO()
 		self.to_yaml(sio)
 		sio.seek(0)
 		return sio.read()
 
 	def __reduce__(self):
-		return (datablock_from_string, (self.to_string(),))
+		return (DataBlock.from_string, (self.to_string(),))
 
 
-# This is not needed under python 3, where, the __reduce__ method
-# above can return the class method, but it is under python 2.
-def datablock_from_string(s):
-	return DataBlock.from_string(s)
 
 
 

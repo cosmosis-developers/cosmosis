@@ -45,3 +45,4 @@ install-record.txt
 .DS_Store
 output/*
 cosmosis.code-workspace
+tmp/

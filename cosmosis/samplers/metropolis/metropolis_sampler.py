@@ -13,7 +13,12 @@ pipeline=None
 METROPOLIS_INI_SECTION = "metropolis"
 
 def posterior(p):
-    return pipeline.run_results(p)
+    results = pipeline.run_results(p)
+    # We never use the block, and it was getting serialized
+    # unnecessarily when writing checkpoints
+    if results is not None:
+        results.block = None
+    return results
 
 
 class MetropolisSampler(ParallelSampler):

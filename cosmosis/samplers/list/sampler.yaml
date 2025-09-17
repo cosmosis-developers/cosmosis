@@ -22,3 +22,4 @@ params:
     burn: "(int, default=0) Number of samples to skip from the start of the input file"
     thin: "(int, default=1) Process only every n'th samples from the input file"
     limits: "(bool, default=False) Respect the parameter prior limits in the values file; otherwise use all samples"
+    chunk_size: "(int; default=100) Number of samples to process in each chunk for memory efficiency"

@@ -130,7 +130,7 @@ class FisherSampler(ParallelSampler):
             fisher_calc = fisher.Fisher(compute_fisher_vector, start_vector, 
                 self.step_size, pool=self.pool)
 
-        elif self.method == "smoothing":
+        elif self.method == "smoothing" or self.method == "smooth":
             fisher_calc = fisher.SmoothingFisher(compute_fisher_vector, start_vector,
                 self.step_size_min, self.step_size_max, self.step_count, pool=self.pool)
 

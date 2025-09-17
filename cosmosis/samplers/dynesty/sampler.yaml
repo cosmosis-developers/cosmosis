@@ -1,0 +1,40 @@
+name: "dynesty"
+version: "1.0"
+parallel: parallel
+purpose: "Dynamic nested sampling"
+url: "https://dynesty.readthedocs.io/"
+attribution: ["Josh Speagle and contributors"]
+cite:
+    - "Speagle, J.S., \"dynesty: A Dynamic Nested Sampling Package for Estimating Bayesian Posteriors and Evidences\", arXiv:1904.02180"
+
+explanation: >
+    dynesty is a pure-Python package for estimating Bayesian posteriors and evidences 
+    via Dynamic Nested Sampling. It provides both static and dynamic nested sampling 
+    algorithms to explore complex posterior distributions and estimate Bayesian evidence.
+
+    Dynamic nested sampling adaptively allocates sampling effort to regions of highest 
+    posterior density, making it particularly effective for multi-modal or highly 
+    constrained problems.
+
+installation: >
+    dynesty is included in the cosmosis bootstrap, but if you are installing
+    manually you can get dynesty using the command:
+
+    pip install dynesty  # to install centrally, may require sudo
+    
+    pip install dynesty --user  # to install just for you
+
+# List of configuration options for this sampler
+params:
+    mode: "(string; default='static') Nested sampling mode. Options: 'static', 'dynamic'"
+    nlive: "(int; default=500) Number of live points to use in the nested sampling algorithm"
+    bound: "(string; default='multi') Bounding method. Options: 'none', 'single', 'multi', 'balls', 'cube'"
+    sample: "(string; default='auto') Sampling method. Options: 'unif', 'rwalk', 'slice', 'rslice', 'hslice', 'auto'"
+    update_interval: "(float; default=0.6) Fraction of the evidence to use for updating bounds"
+    min_ncall: "(int; default=2*nlive) Minimum number of likelihood calls"
+    min_eff: "(float; default=10.0) Minimum sampling efficiency"
+    queue_size: "(int; default=varies) Size of the proposal queue for parallel sampling"
+    parallel_prior: "(bool; default=True) Whether to evaluate priors in parallel"
+    max_call: "(int; default=sys.maxsize) Maximum number of likelihood calls"
+    dlogz: "(float; default=0.01) Stopping criterion for evidence convergence"
+    print_progress: "(bool; default=varies) Whether to print progress information"
