@@ -300,8 +300,7 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         save_name = f'{root_dir_name}/cosmopower_emulator_fixed_params.pkl'
         if os.path.exists(save_name) and not overwrite_cosmopower:
             if is_root:
-                print(underline("Tried to train the CosmoPower emulator, but emulator already exists. If you want to really re-train the emulator, add option --force. Quitting."))
-                raise FileExistsError
+                raise FileExistsError("Tried to train the CosmoPower emulator, but emulator already exists. If you want to really re-train the emulator, add option --force")
         else:
             training = True
             if is_root:

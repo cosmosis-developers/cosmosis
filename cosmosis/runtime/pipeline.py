@@ -389,7 +389,7 @@ class Pipeline(object):
                                            "modules", fallback="").split()
             if self.training:
                 self.train_on_module = self.options.get(TRAINING_INI_SECITON, "train_on_module", fallback="camb")
-                if self.train_on_module != "camb":
+                if "camb" not in self.train_on_module:
                     sys.stderr.write("Warning: Currently we only support training the CosmoPower on CAMB, as other modules do not have the corresponding interfaces to read the trained emulators! You can help by writing one!\n")
                 try:
                     index = module_list.index(self.train_on_module)
