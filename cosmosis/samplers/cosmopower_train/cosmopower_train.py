@@ -154,9 +154,9 @@ class CosmoPowerSampler(Sampler):
 
     def config(self):
         self.TF_ENABLE_ONEDNN_OPTS = self.read_ini("TF_ENABLE_ONEDNN_OPTS", int, 0)
-        self.CUDA_VISIBLE_DEVICES = self.read_ini("CUDA_VISIBLE_DEVICES", int, 0)
-        self.np_seed = self.read_ini("np_seed", str, '0')
-        self.tf_seed = self.read_ini("tf_seed", str, '2')
+        self.CUDA_VISIBLE_DEVICES = self.read_ini("CUDA_VISIBLE_DEVICES", str, '0')
+        self.np_seed = self.read_ini("np_seed", int, 0)
+        self.tf_seed = self.read_ini("tf_seed", int, 2)
 
         os.environ['TF_ENABLE_ONEDNN_OPTS'] = str(self.TF_ENABLE_ONEDNN_OPTS)
         os.environ["CUDA_VISIBLE_DEVICES"]= str(self.CUDA_VISIBLE_DEVICES)

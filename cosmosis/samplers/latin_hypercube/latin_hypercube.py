@@ -118,8 +118,8 @@ class LatinHypercubeSampler(ParallelSampler):
         #Each job has an index number in case we are saving
         #the output results from each one
         sample_index = np.arange(len(samples)) + self.ndone_train
-        sample_name = ["" for i in sample_index]
-        training_flag = [self.pipeline.training for i in sample_index]
+        sample_name = ["" for _ in sample_index]
+        training_flag = [self.pipeline.training for _ in sample_index]
         jobs = list(zip(sample_index, samples, sample_name, training_flag))
 
         #Actually compute the likelihood results
