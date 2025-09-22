@@ -1397,8 +1397,6 @@ class DataBlock(object):
 			data[section] = {}
 			for (_, key) in self.keys(section):
 				value = self[section, key]
-				if isinstance(value, np.ndarray):
-					value = value.tolist()
 				data[section][key] = value
 
 		with open(filename + ".pkl", 'wb') as f:

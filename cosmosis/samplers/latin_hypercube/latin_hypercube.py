@@ -6,7 +6,7 @@ from .. import ParallelSampler
 
 
 def task(p):
-    i,p,name,training = p
+    i, p, name, training = p
     results = lh_sampler.pipeline.run_results(p)
     #If requested, save the data to file
     if lh_sampler.save_name and results.block is not None:
@@ -40,7 +40,7 @@ class LatinHypercubeSampler(ParallelSampler):
 
         self.sample_points = None
         self.ndone = 0
-        self.ndone1 = 0
+        self.ndone_train = 0
         self.ndone_test = 0
 
     def setup_sampling(self):
@@ -117,7 +117,7 @@ class LatinHypercubeSampler(ParallelSampler):
         
         #Each job has an index number in case we are saving
         #the output results from each one
-        sample_index = np.arange(len(samples)) + self.ndone1
+        sample_index = np.arange(len(samples)) + self.ndone_train
         sample_name = ["" for i in sample_index]
         training_flag = [self.pipeline.training for i in sample_index]
         jobs = list(zip(sample_index, samples, sample_name, training_flag))
@@ -140,8 +140,8 @@ class LatinHypercubeSampler(ParallelSampler):
             self.ndone_test += len(results_test)
 
         #Update the count
-        self.ndone1 += len(results)
-        self.ndone = self.ndone1 + self.ndone_test
+        self.ndone_train += len(results)
+        self.ndone = self.ndone_train + self.ndone_test
 
         #Save the results of the sampling
         for sample, result  in zip(samples, results):

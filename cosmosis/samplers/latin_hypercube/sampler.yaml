@@ -3,7 +3,7 @@ name: "latin_hypercube"
 version: "1.0"
 parallel: embarrassing
 purpose: "Latin Hypercube sampler"
-url: "https://bitbucket.org/joezuntz/cosmosis"
+url: "https://github.com/cosmosis-developers/cosmosis"
 attribution: [CosmoSIS Team]
 cite: []
 

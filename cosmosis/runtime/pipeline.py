@@ -390,7 +390,7 @@ class Pipeline(object):
             if self.training:
                 self.train_on_module = self.options.get(TRAINING_INI_SECITON, "train_on_module", fallback="camb")
                 if self.train_on_module != "camb":
-                    raise ValueError("Currently we only support training the CosmoPower on CAMB!")
+                    sys.stderr.write("Warning: Currently we only support training the CosmoPower on CAMB, as other modules do not have the corresponding interfaces to read the trained emulators! You can help by writing one!\n")
                 try:
                     index = module_list.index(self.train_on_module)
                     module_list = module_list[:index + 1].copy()
@@ -831,23 +831,28 @@ class LikelihoodPipeline(Pipeline):
             
     
     def setup_training(self):
-        print("")
-        print("Running pipeline once to determine which free parametes are being used in order to correctly setup the CosmoPower")
-        print("-----------------------------------------------------------------------------------------------------------------")
+        logs.overview("Running pipeline once to determine which free parametes are being used in order to correctly setup the CosmoPower.\n")
 
         self.nsample = self.options.getint(TRAINING_INI_SECITON, "nsample")
         self.nsample_test = self.options.getint(TRAINING_INI_SECITON, "ntest")
         self.save_name = f'{self.options.get(TRAINING_INI_SECITON, "save_dir")}/cosmopower_inputs'
 
         # This seems like a hack...
+        # We add the redshift as a parameter to be varied, so that CAMB / any other module
+        # will be called with different redshifts and the training set
+        # will contain the power spectra at different redshifts. At the same time we can create the
+        # Latin Hypercube samples in the same redshift range.
+        # This is needed for CosmoPower to work.
+        # We assume that the user will not have a parameter called 'z'
+        # in the ini file already.
         zmin = self.options.getfloat(TRAINING_INI_SECITON, "zmin")
         zmax = self.options.getfloat(TRAINING_INI_SECITON, "zmax")
         z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
-        print("")
-        print("Created new parameter {} used for CosmoPower training".format(z_param))
-        print("    with start:", z_param.start)
-        print("    with limits:", z_param.limits)
-        print("    with prior:", z_param.prior)
+    
+        logs.overview(f"Created new parameter {z_param} used for CosmoPower training")
+        logs.overview(f"    with start: {z_param.start}")
+        logs.overview(f"    with limits: {z_param.limits}")
+        logs.overview(f"    with prior: {z_param.prior}")
         self.parameters.append(z_param)
         self.reset_fixed_varied_parameters()
             
