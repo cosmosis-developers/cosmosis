@@ -570,8 +570,8 @@ parser.add_argument("--only", nargs="*", help="Fix all parameters except the one
 parser.add_argument("--graph", type=str, default='', help="Do not run a sampler; instead make a graphviz dot file of the pipeline")
 parser.add_argument('--version', action='version', version=__version__, help="Print out a version number")
 parser.add_argument('--profile' , help="Save profiling (timing) information to this named file")
-parser.add_argument('--train', action='store_true', help="Train the CosmoPower emulator")
-parser.add_argument('-f', '--force', action='store_true', help="Force train the CosmoPower emulator (will overwrite existing emulator)")
+parser.add_argument('--train_cosmopower', action='store_true', help="Train the CosmoPower emulator")
+parser.add_argument('--overwrite_cosmopower', action='store_true', help="Force train the CosmoPower emulator (will overwrite existing emulator)")
 
 
 @contextlib.contextmanager
