@@ -158,7 +158,7 @@ def test_gridmax():
     run('gridmax', True, can_postprocess=False, max_iterations=1000, hints_cov=False)
 
 def test_latin_hypercube():
-    run('latinhypercube', True, pp_extra=False, nsample=10, hints_cov=False)
+    run('latinhypercube', True, can_postprocess=False, nsample=10, hints_cov=False)
 
 # def test_kombine():
 #     run('kombine')

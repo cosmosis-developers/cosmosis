@@ -221,15 +221,6 @@ class GridProcessor(PostProcessor):
 		]
 	sampler="grid"
 
-class LHSProcessor(PostProcessor):
-	elements=[
-		plots.GridPlots1D,
-		plots.GridPlots2D,
-		statistics.GridStatistics,
-		statistics.Citations,
-		]
-	sampler="latinhypercube"
-
 
 
 class TestProcessor(PostProcessor):
