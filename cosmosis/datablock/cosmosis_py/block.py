@@ -1311,6 +1311,30 @@ class DataBlock(object):
 				params.remove((section,name))
 		#Return a list of lists of parameter first used in each section
 		return params_by_module
+	
+	def get_all_parameter_use(self, params_of_interest):
+		u"""Analyze the log and figure out which parameter is in use in specific module"""
+		params_by_module = collections.OrderedDict()
+		current_module = []
+		#make a copy of the parameter list
+		params = [(p.section,p.name) for p in params_of_interest]
+		#now actually parse the log
+		current_module = None
+		current_name = "None"
+		for i in range(self.get_log_count()):
+			ptype, section, name, _ = self.get_log_entry(i)
+			if ptype=="MODULE-START":
+				# The previous current_module is already the
+				#last element in params_by_module (unless it's the
+				#very first one in which case we discard it because
+				#it is the parameters being set in the sampler)
+				current_module = []
+				current_name = section
+				params_by_module[current_name] = current_module
+			elif ptype=="READ-OK" and (section, name) in params and (section, name) not in current_module:
+				current_module.append((section, name))
+		#Return a list of lists of parameter used in each module
+		return params_by_module
 
 	@classmethod
 	def from_yaml(cls, filename_or_stream):
@@ -1352,6 +1376,31 @@ class DataBlock(object):
 				data[section][key] = value
 
 		yaml.dump(data, stream)
+
+	@classmethod
+	def from_pickle(cls, filename):
+		import pickle
+
+		block = cls()
+		with open(filename + ".pkl", 'rb') as f:
+			data = pickle.load(f)
+		for section, values in data.items():
+			for key, value in values.items():
+				block[section, key] = value
+		return block
+
+	def to_pickle(self, filename):
+		import pickle
+
+		data = {}
+		for section in self.sections():
+			data[section] = {}
+			for (_, key) in self.keys(section):
+				value = self[section, key]
+				data[section][key] = value
+
+		with open(filename + ".pkl", 'wb') as f:
+			pickle.dump(data, f)
 
 	@classmethod
 	def from_dict(cls, d):

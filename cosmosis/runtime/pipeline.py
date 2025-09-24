@@ -46,6 +46,7 @@ class PipelineResults(object):
 
 PIPELINE_INI_SECTION = "pipeline"
 NO_LIKELIHOOD_NAMES = "no_likelihood_names_sentinel"
+TRAINING_INI_SECITON = "training"
 
 class MissingLikelihoodError(Exception):
 
@@ -336,7 +337,7 @@ class Pipeline(object):
 
     """
 
-    def __init__(self, arg=None, load=True, modules=None):
+    def __init__(self, arg=None, load=True, modules=None, training=False):
 
         u"""Pipeline constructor.
 
@@ -349,6 +350,8 @@ class Pipeline(object):
         configuration will be loaded into memory and initialized.
 
         """
+        self.training = training
+
         if arg is None:
             arg = list()
 
@@ -384,13 +387,21 @@ class Pipeline(object):
         elif load and PIPELINE_INI_SECTION in self.options.sections():
             module_list = self.options.get(PIPELINE_INI_SECTION,
                                            "modules", fallback="").split()
+            if self.training:
+                self.train_on_module = self.options.get(TRAINING_INI_SECITON, "train_on_module", fallback="camb")
+                if "camb" not in self.train_on_module:
+                    sys.stderr.write("Warning: Currently we only support training the CosmoPower on CAMB, as other modules do not have the corresponding interfaces to read the trained emulators! You can help by writing one!\n")
+                try:
+                    index = module_list.index(self.train_on_module)
+                    module_list = module_list[:index + 1].copy()
+                except ValueError as e:
+                    raise Exception(f"In order to train the CosmoPower on {self.train_on_module}, {self.train_on_module} module needs to be in the specified modules.") from e
             self.modules = [
                 module.Module.from_options(module_name,self.options,self.root_directory)
                 for module_name in module_list
             ]
         else:
             self.modules = []
-
 
         self.shortcut_module=0
         self.shortcut_data=None
@@ -735,7 +746,7 @@ class LikelihoodPipeline(Pipeline):
     pipeline_being_set_up = []
     module_being_set_up = []
 
-    def __init__(self, arg=None, id="", override=None, modules=None, load=True, values=None, priors=None, only=None):
+    def __init__(self, arg=None, id="", override=None, modules=None, load=True, values=None, priors=None, only=None, training=False):
         u"""Construct a :class:`LikelihoodPipeline`.
 
         The arguments `arg` and `load` are used in the base-class
@@ -745,7 +756,7 @@ class LikelihoodPipeline(Pipeline):
         settings for those parametersʼ values in the initialization files.
         
         """
-        super().__init__(arg=arg, load=load, modules=modules)
+        super().__init__(arg=arg, load=load, modules=modules, training=training)
 
         if id:
             self.id_code = "[%s] " % str(id)
@@ -772,7 +783,7 @@ class LikelihoodPipeline(Pipeline):
         self.parameters = parameter.Parameter.load_parameters(self.values_file,
                                                               self.priors_files,
                                                               override,
-                                                              )
+                                                              )     
         # We set up the modules first, so that if they want to e.g.
         # add parameters then they can.
         self.setup()
@@ -814,6 +825,49 @@ class LikelihoodPipeline(Pipeline):
             self.likelihood_names = NO_LIKELIHOOD_NAMES
         else:
             self.likelihood_names = likelihood_names.split()
+
+        if self.training:
+            self.setup_training()
+            
+    
+    def setup_training(self):
+        logs.overview("Running pipeline once to determine which free parametes are being used in order to correctly setup the CosmoPower.\n")
+
+        self.nsample = self.options.getint(TRAINING_INI_SECITON, "nsample")
+        self.nsample_test = self.options.getint(TRAINING_INI_SECITON, "ntest")
+        self.save_name = f'{self.options.get(TRAINING_INI_SECITON, "save_dir")}/cosmopower_inputs'
+
+        # This seems like a hack...
+        # We add the redshift as a parameter to be varied, so that CAMB / any other module
+        # will be called with different redshifts and the training set
+        # will contain the power spectra at different redshifts. At the same time we can create the
+        # Latin Hypercube samples in the same redshift range.
+        # This is needed for CosmoPower to work.
+        # We assume that the user will not have a parameter called 'z'
+        # in the ini file already.
+        zmin = self.options.getfloat(TRAINING_INI_SECITON, "zmin")
+        zmax = self.options.getfloat(TRAINING_INI_SECITON, "zmax")
+        z_param = parameter.Parameter('redshift_as_parameter', 'z', zmin+0.01, (zmin, zmax), None)
+    
+        logs.overview(f"Created new parameter {z_param} used for CosmoPower training")
+        logs.overview(f"    with start: {z_param.start}")
+        logs.overview(f"    with limits: {z_param.limits}")
+        logs.overview(f"    with prior: {z_param.prior}")
+        self.parameters.append(z_param)
+        self.reset_fixed_varied_parameters()
+            
+        test_results = self.run_results([p.start for p in self.varied_params])
+        used_params_per_module = test_results.block.get_all_parameter_use(self.varied_params)
+        used_params = used_params_per_module[self.train_on_module]
+        for p in self.varied_params:    
+             if (p.section, p.name) not in used_params:
+                p.fix()
+        self.reset_fixed_varied_parameters()
+        # We reset the run stats so the rest functions as intended.
+        self.run_count = 0
+        self.run_count_ok = 0
+        self.has_run = False
+            
 
     @classmethod
     def from_chain_file(cls, filename, **kwargs):
