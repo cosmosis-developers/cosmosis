@@ -600,15 +600,15 @@ def main():
         # initialize parallel workers
         if args.mpi:
             with mpi_pool.MPIPool() as pool:
-                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, overwrite_cosmopower=args.force)
+                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
         elif args.smp:
             with process_pool.Pool(args.smp) as pool:
-                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, overwrite_cosmopower=args.force)
+                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
         elif args.pdb:
             with run_under_debugger():
-                return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, overwrite_cosmopower=args.force)
+                return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
         else:
-            return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train, overwrite_cosmopower=args.force)
+            return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
 
     except CosmosisConfigurationError as e:
         print(e)
