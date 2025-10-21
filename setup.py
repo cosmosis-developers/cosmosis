@@ -193,6 +193,7 @@ requirements = [
     "dynesty",
     "zeus-mcmc",
     "nautilus-sampler>=1.0.1",
+    "h5py", # needed for nautilus
     "dulwich",
     "scikit-learn",
     "Py-BOBYQA",
