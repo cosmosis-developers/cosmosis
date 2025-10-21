@@ -69,8 +69,3 @@ def test_getdist_nautilus():
 
         chain_file = os.path.join(tempdir, "chain.txt")
         cosmosis.getdist.cosmosis_to_getdist(chain_file, "nautilus")
-
-
-
-if __name__ == "__main__":
-    test_getdist_nautilus()
