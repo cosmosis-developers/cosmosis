@@ -3,7 +3,6 @@
 u"""Definition of the :class:`DataBlock` class."""
 
 import ctypes as ct
-from . import lib
 from . import errors
 from . import dbt_types as types
 from ...utils import mkdir
@@ -15,6 +14,19 @@ import tarfile
 import io
 from io import StringIO, BytesIO
 import sys
+
+
+
+try:
+	from . import lib
+except:
+	_allow_unbuilt_import = os.environ.get("COSMOSIS_ALLOW_UNBUILT_IMPORT", "0") == "1"
+	if _allow_unbuilt_import:
+		print("Warning: importing cosmosis datablock without compiled library. "
+			  "You cannot use CosmoSIS properly; this is designed for building "
+			  "documentation", file=sys.stderr)
+	else:
+		raise
 
 
 
