@@ -3,15 +3,6 @@ import scipy.integrate
 import numpy as np
 from .datablock import names, SectionOptions
 from .runtime import FunctionModule
-import traceback 
-
-try:
-    from packaging.version import parse as parse_version
-    min_hermitian_version = parse_version('1.17.0')
-    use_hermitian_keyword = parse_version(np.version.version) > min_hermitian_version
-except ImportError: # fall back to not using hermitian
-    use_hermitian_keyword = False
-
 
 MISSING = "if_you_see_this_there_was_a_mistake_creating_a_gaussian_likelihood"
 
@@ -111,8 +102,12 @@ class GaussianLikelihood:
 
         """
         # inverse of symmetric matrix should remain symmetric
-        if np.allclose(self.cov, self.cov.T) and use_hermitian_keyword:
-            return np.linalg.pinv(self.cov, hermitian=True)
+        if np.allclose(self.cov, self.cov.T):
+            try:
+                return np.linalg.pinv(self.cov, hermitian=True)
+            except TypeError:
+                # Older numpy versions do not have hermitian keyword
+                return np.linalg.pinv(self.cov)
         return np.linalg.inv(self.cov)
 
 
