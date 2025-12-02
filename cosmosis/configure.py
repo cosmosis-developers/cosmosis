@@ -14,12 +14,13 @@ parser.add_argument("--no-conda", action='store_false', dest='conda', help='Swit
 parser.add_argument("--brew", action='store_true', help='Print commands for homebrew with clang')
 parser.add_argument("--brew-gcc", action='store_true', help='Print commands for homebrew with gcc')
 parser.add_argument("--ports", action='store_true', help='Print commands for macports')
+parser.add_argument("--automate-conda-setup", action='store_true', help='Automatically set up cosmosis when activating the environment from now on')
 
 def homebrew_gfortran_libs():
     s = subprocess.run('gfortran -print-search-dirs', shell=True, capture_output=True)
     if s.returncode:
         return ""
-    s.stdout.decode().split("\n")
+    lines = s.stdout.decode().split("\n")
 
     for line in lines:
         if line.startswith("libraries:"):
@@ -121,8 +122,49 @@ def generate_commands(cosmosis_src_dir, debug=False, omp=True, brew=False, brew_
 
     return commands
 
+def automate_conda_setup(cosmosis_src_dir, cmds, conda):
+    if not (conda and "CONDA_PREFIX" in os.environ):
+        print("Error: --automate-conda-setup requires a conda environment to be active", file=sys.stderr)
+        sys.exit(1)
+
+    activate_dir = os.path.join(os.environ["CONDA_PREFIX"], "etc", "conda", "activate.d")
+    os.makedirs(activate_dir, exist_ok=True)
+    activate_script_path =  os.path.join(activate_dir, "activate_cosmosis.sh")
+
+    with open(activate_script_path, 'w') as f:
+        for cmd in cmds:
+            f.write(cmd + "\n")
+
+    deactivate_dir = os.path.join(os.environ["CONDA_PREFIX"], "etc", "conda", "deactivate.d")
+    os.makedirs(deactivate_dir, exist_ok=True)
+    deactivate_script_path = os.path.join(deactivate_dir, "deactivate_cosmosis.sh")
+
+    with open(deactivate_script_path, 'w') as f:
+        f.write("unset COSMOSIS_SRC_DIR\n")
+        f.write("unset COSMOSIS_ALT_COMPILERS\n")
+        f.write("unset GSL_LIB\n")
+        f.write("unset GSL_INC\n")
+        f.write("unset FFTW_LIBRARY\n")
+        f.write("unset FFTW_INCLUDE_DIR\n")
+        f.write("unset LAPACK_LINK\n")
+        f.write("unset LAPACK_LIB\n")
+        f.write("unset CFITSIO_LIB\n")
+        f.write("unset CFITSIO_INC\n")
+        f.write("unset COSMOSIS_OMP\n")
+        f.write("unset COSMOSIS_DEBUG\n")
+
+        v = f"{cosmosis_src_dir}/datablock"
+        # remove datablock from LIBRARY_PATH and LD_LIBRARY_PATH
+        f.write('export LIBRARY_PATH=$(echo $LIBRARY_PATH | tr ":" "\\n" | grep -v "{}" | tr "\\n" ":")\n'.format(v))
+        f.write('export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ":" "\\n" | grep -v "{}" | tr "\\n" ":")\n'.format(v))
+
+    print(f"CosmoSIS will automatically configure when you activate the environment from now on", file=sys.stderr)
+
+
 if __name__ == '__main__':
     args = parser.parse_args()
     cmds = generate_commands(args.source, debug=args.debug, omp=args.omp, conda=args.conda, brew=args.brew or args.brew_gcc, brew_gcc=args.brew_gcc, ports=args.ports)
+    if args.automate_conda_setup:
+        automate_conda_setup(args.source, cmds, args.conda)
     print("; ".join(cmds))
 
