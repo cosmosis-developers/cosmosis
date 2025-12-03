@@ -36,75 +36,12 @@ class FisherParameterError(Exception):
         super(Exception,self).__init__(self, message)
         self.parameter_index = parameter_index
 
-
-class Fisher(object):
-    def __init__(self, compute_vector, start_vector, step_size, tolerance, maxiter, pool=None):
-        
+class FisherBase:
+    def __init__(self, compute_vector, start_vector, pool=None):
         self.compute_vector = compute_vector
-        self.maxiter = maxiter
-        self.step_size = step_size
-        self.start_params = start_vector
-        self.current_params = start_vector
-        self.nparams = start_vector.shape[0]
-        self.iterations = 0
+        self.start_vector = start_vector
         self.pool = pool
-
-    def converged(self):
-        crit = (abs(self.new_onesigma - self.old_onesigma).max() < self.threshold)
-        return crit
-
-    def converge_fisher_matrix(self):
-        
-        self.new_Fmatrix = compute_fisher_matrix(self.compute_vector,
-            self.start_vector, self.start_covmat)
-        
-        self.old_onesigma = compute_one_sigma(new_Fmatrix)
-
-        while True:
-            self.iterations+=1
-            self.old_onesigma = self.new_onesigma
-            self.current_params = self.choose_new_params(self.new_Fmatrix)
-
-            self.new_Fmatrix = self.compute_fisher_matrix()
-
-            self.new_onesigma = compute_one_sigma(self.new_Fmatrix)
-
-            if self.converged():
-                print('Fisher has converged!')
-                return new_Fmatrix
-
-            if self.iterations > self.maxiter:
-                print("Run out of iterations.")
-                print("Done %d, max allowed %d" % (self.iterations, self.maxiter))
-                return None
-
-    def compute_derivatives(self):
-        derivatives = []
-        points = []
-
-        #To improve parallelization we first gather all the data points
-        #we use in all the dimensions
-        for p in range(self.nparams):
-            points +=  self.five_points_stencil_points(p)
-        print("Calculating derivatives using {} total models".format(len(points)))
-        if self.pool is None:
-            results = list(map(self.compute_vector, points))
-        else:
-            results = self.pool.map(self.compute_vector, points)
-
-        # Bit of a waste of time to compute the inv cov separately,
-        # but it's a quick fix to a memory error if we compute the cov
-        # for every single value
-        _, inv_cov = self.compute_vector(points[0], cov=True)
-
-        #Now get out the results that correspond to each dimension
-        for p in range(self.nparams):
-            results_p = results[4*p:4*(p+1)]
-            derivative = self.five_point_stencil_deriv(results_p, p)
-            derivatives.append(derivative)
-        derivatives = np.array(derivatives)
-        return derivatives, inv_cov
-
+        self.nparams = start_vector.shape[0]
 
     def compute_fisher_matrix(self):
         derivatives, inv_cov = self.compute_derivatives()
@@ -117,10 +54,54 @@ class Fisher(object):
         fisher_matrix = np.einsum("il,lk,jk->ij", derivatives, inv_cov, derivatives)
         return fisher_matrix
 
+
+    def compute_derivatives(self):
+        derivatives = []
+        points = self.generate_sample_points()
+        print("Calculating derivatives using {} total models".format(len(points)))
+        if self.pool is None:
+            results = list(map(self.compute_vector, points))
+        else:
+            results = self.pool.map(self.compute_vector, points)
+
+        # Bit of a waste of time to compute the inv cov separately,
+        # but it's a quick fix to a memory error if we compute the cov
+        # for every single value
+        _, inv_cov = self.compute_vector(points[0], cov=True)
+
+        derivatives = self.extract_derivatives(results)
+
+        return derivatives, inv_cov
+
+class Fisher(FisherBase):
+    def __init__(self, compute_vector, start_vector, step_size, pool=None):
+        super().__init__(compute_vector, start_vector, pool)
+        self.iterations = 0
+        self.step_size = step_size
+
+    def generate_sample_points(self):
+        points = []
+
+        #To improve parallelization we first gather all the data points
+        #we use in all the dimensions
+        for p in range(self.nparams):
+            points +=  self.five_points_stencil_points(p)
+
+        return points
+
+    def extract_derivatives(self, results):
+        derivatives = []
+        #Now get out the results that correspond to each dimension
+        for p in range(self.nparams):
+            results_p = results[4*p:4*(p+1)]
+            derivative = self.five_point_stencil_deriv(results_p, p)
+            derivatives.append(derivative)
+        return np.array(derivatives)
+
     def five_points_stencil_points(self, param_index):
         delta = np.zeros(self.nparams)
         delta[param_index] = 1.0
-        points = [self.current_params + x*delta for x in 
+        points = [self.start_vector + x*delta for x in 
             [2*self.step_size, 
              1*self.step_size, 
             -1*self.step_size, 
@@ -135,29 +116,78 @@ class Fisher(object):
         deriv = (-obs[0] + 8*obs[1] - 8*obs[2] + obs[3])/(12*self.step_size)
         return deriv
 
-    def compute_one_sigma(Fmatrix):
-        sigma = np.sqrt(np.linalg.inv(Fmatrix))
-        return sigma
+
 
 class NumDiffToolsFisher(Fisher):
     def compute_derivatives(self):
         import numdifftools as nd
         def wrapper(param_vector):
-            print("Running pipeline:", param_vector)
             return self.compute_vector(param_vector, cov=False)
         jacobian_calculator = nd.Jacobian(wrapper, step=self.step_size)
-        derivatives = jacobian_calculator(self.current_params)
-        _, inv_cov = self.compute_vector(self.current_params, cov=True)
-        print(derivatives.shape, inv_cov.shape)
+        derivatives = jacobian_calculator(self.start_vector)
+        _, inv_cov = self.compute_vector(self.start_vector, cov=True)
         return derivatives.T, inv_cov
     
+
+class SmoothingFisher(FisherBase):
+    def __init__(self, compute_vector, start_vector,
+                step_size_min, step_size_max, step_count, pool=None):
+        super().__init__(compute_vector, start_vector, pool)
+        # import the "derivative" library here, since otherwise it will
+        # not be imported until right at the end, after lots of time
+        # has been spent computing the sample points. 
+        import derivative
+        self.step_size_min = step_size_min
+        self.step_size_max = step_size_max
+        if step_count % 2 == 0:
+            self.half_step_count = step_count // 2
+        else:
+            self.half_step_count = (step_count - 1) // 2
+    
+    def generate_sample_points(self):
+        points = []
+        self.x_values = []
+
+        # Recall that this whole file assumes all the bounds are already
+        # normalized, so we can just use the same bounds for all parameters
+        delta = np.logspace(np.log10(self.step_size_min), np.log10(self.step_size_max), self.half_step_count)
+
+        #To improve parallelization we first gather all the data points
+        #we use in all the dimensions
+        for p in range(self.nparams):
+            x0 = self.start_vector[p]
+            x = np.concatenate([(x0 - delta)[::-1], [x0], x0 + delta])
+            self.x_values.append(x)
+            for xi in x:
+                point = np.copy(self.start_vector)
+                point[p] = xi
+                points.append(point)
+
+        return points
+
+    def extract_derivatives(self, results):
+        import derivative
+        chunk = 2*self.half_step_count + 1
+        derivatives = []
+
+        # Consider exposing some options for these
+        calculator = derivative.SavitzkyGolay(left=.5, right=.5, order=2)
+
+        #Now get out the results that correspond to each dimension
+        for p in range(self.nparams):
+            x = self.x_values[p]
+            y = np.array(results[chunk * p : chunk * (p + 1)])
+            d = calculator.d(y, x, axis=0)
+            derivatives.append(d[self.half_step_count])
+        return np.array(derivatives)
+
 
 
 def test():
     def theory_prediction(x, cov=False):
         #same number of data points as parameters here
         x = np.concatenate([x,x])
-        theory = 2*x + 2
+        theory = x ** 3 + 2*x + 2
         inv_cov = np.diag(np.ones_like(x)**-1)
         if cov:
             return theory, inv_cov
@@ -165,10 +195,18 @@ def test():
             return theory
 
     best_fit_params = np.array([0.1, 1.0, 2.0, 4.0,])
-    fisher_calculator = Fisher(theory_prediction, best_fit_params, 0.01, 0.0, 100)
+    fisher_calculator = Fisher(theory_prediction, best_fit_params, 0.01)
     F = fisher_calculator.compute_fisher_matrix()
     print(F)
-    return F
+
+    fisher_calculator = SmoothingFisher(theory_prediction, best_fit_params, 1e-5, 0.01, 20)
+    F = fisher_calculator.compute_fisher_matrix()
+    print(F)
+
+    fisher_calculator = NumDiffToolsFisher(theory_prediction, best_fit_params, 0.01)
+    F = fisher_calculator.compute_fisher_matrix()
+    print(F)
+
 
 if __name__ == '__main__':
     test()

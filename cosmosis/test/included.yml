@@ -1,0 +1,10 @@
+
+components: 
+  test_component_2:
+    params:
+    - emcee.walkers = 200
+
+
+runs:
+  - name: imported-run
+    base: cosmosis/test/example.ini

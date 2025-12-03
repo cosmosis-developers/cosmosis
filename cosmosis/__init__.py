@@ -9,3 +9,4 @@ from .datablock import option_section, DataBlock
 from .gaussian_likelihood import GaussianLikelihood, \
                                  SingleValueGaussianLikelihood, \
                                  WindowedGaussianLikelihood
+from .output import TextColumnOutput, InMemoryOutput, NullOutput, AstropyOutput, CosmoMCOutput, FitsOutput

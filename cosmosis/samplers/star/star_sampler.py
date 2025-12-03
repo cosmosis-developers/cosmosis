@@ -118,6 +118,7 @@ class StarSampler(ParallelSampler):
             (post, prior, extra) = result
             #always save the usual text output
             self.output.parameters(sample, extra, prior, post)
+            self.distribution_hints.set_peak(sample, post)
 
     def is_converged(self):
         return self.converged

@@ -31,3 +31,6 @@ class AstropyOutput(OutputBase):
     def _write_comment(self, comment):
         self.table.meta["comments"] = self.table.meta.get("comments", []) + [comment]
 
+    def reset_to_chain_start(self):
+         self.table.remove_rows(slice(None))
+

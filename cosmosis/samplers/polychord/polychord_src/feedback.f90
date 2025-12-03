@@ -267,7 +267,7 @@ module feedback_module
             write(fmt_nlike,'("(""nlike      ="",",I0,"I20)")') size(nlikesum)
             write(stdout_unit,fmt_nlike) RTI%nlike
 
-            write(fmt_nlike,'(  "(""<nlike>    ="","  ,I0,   "F15.2,""   (""",I0,"F15.2 "" per slice )"")")') size(nlikesum), size(nlikesum)
+            write(fmt_nlike,'(  "(""<nlike>    ="","  ,I0,   "F15.2,""   ("",",I0,"F15.2, "" per slice )"")")') size(nlikesum), size(nlikesum)
             write(stdout_unit,fmt_nlike) dble(nlikesum)/dble(settings%nlive),dble(nlikesum)/dble(RTI%num_repeats*settings%nlive)
 
 

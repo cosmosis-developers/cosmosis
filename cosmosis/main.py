@@ -1,13 +1,11 @@
 #!/usr/bin/env python
-
-
 import sys
 import configparser
-
 import argparse
 import os
 import pdb
 import cProfile
+import contextlib
 from .runtime.config import Inifile, CosmosisConfigurationError
 from .runtime.pipeline import LikelihoodPipeline
 from .runtime import mpi_pool
@@ -85,7 +83,7 @@ def sampler_main_loop(sampler, output, pool, is_root):
 
 
 
-def write_header_output(output, params, values, pipeline):
+def write_header_output(output, params, values, pipeline, values_override=None):
     # If there is an output file, save the ini information to
     # it as well.  We do it here since it's nicer to have it
     # after the sampler options that get written in sampler.config.
@@ -100,7 +98,7 @@ def write_header_output(output, params, values, pipeline):
     if isinstance(values, Inifile):
         values_ini = values
     elif values is None:
-        values_ini=Inifile(pipeline.values_filename)
+        values_ini=Inifile(pipeline.values_filename, override=values_override)
     else:
         values_ini=values
     output.comment("START_OF_VALUES_INI")
@@ -117,7 +115,7 @@ def write_header_output(output, params, values, pipeline):
         prior_ini.write(comment_wrapper)
     output.comment("END_OF_PRIORS_INI")
 
-def setup_output(sampler_class, sampler_number, ini, pool, number_samplers, sample_method, resume, output):
+def setup_output(sampler_class, sampler_number, ini, pool, sample_methods, sample_method, resume, output):
 
     output_original = output
 
@@ -139,16 +137,29 @@ def setup_output(sampler_class, sampler_number, ini, pool, number_samplers, samp
             output_options['rank'] = pool.rank
             output_options['parallel'] = pool.size
 
+        number_samplers = len(sample_methods)
+
         #Give different output filenames to the different sampling steps
         #Only change if this is not the last sampling step - the final
         #one retains the name in the output file.
         # Change, e.g. demo17.txt to demo17.fisher.txt
         if ("filename" in output_options) and (sampler_number<number_samplers-1):
+
+            sampler_count = sample_methods.count(sample_method)
             filename = output_options['filename']
             filename, ext = os.path.splitext(filename)
-            filename += '.' + sampler_class.name
-            filename += ext
+            if sampler_count == 1:
+                filename += '.' + sampler_class.name
+                filename += ext
+            else:
+                sampler_repeat_index = 0
+                for i in range(sampler_number):
+                    if sample_methods[i] == sample_method:
+                        sampler_repeat_index += 1
+                filename += '.' + sampler_class.name + '.' + str(sampler_repeat_index)
+                filename += ext
             output_options['filename'] = filename
+
 
         if ("filename" in output_options):
             print("* Saving output -> {}".format(output_options['filename']))
@@ -176,7 +187,8 @@ def setup_output(sampler_class, sampler_number, ini, pool, number_samplers, samp
 
 
 def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, override=None,
-                 profile_mem=0, profile_cpu="", variables=None, only=None, output=None):
+                 profile_mem=0, profile_cpu="", variables=None, only=None, output=None,
+                 train_cosmopower=False, overwrite_cosmopower=False):
     """
     Execute cosmosis.
 
@@ -225,6 +237,14 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
     output: None or cosmosis.Output
         If set, use this output object to save the results. If not set, create
         an output object from the ini file.
+
+    train_cosmopower: bool
+        If set, it will run a specific set of samplers and modules up to and including CAMB to 
+        train the CosmoPower emulator, which can then be used as a drop-in replacement to CAMB.
+        Will refuse to re-train if emulator exists.
+
+    overwrite_cosmopower: bool
+        Force re-train even if emulator exists.
     """
     no_subprocesses = os.environ.get("COSMOSIS_NO_SUBPROCESS", "") not in ["", "0"]
 
@@ -274,6 +294,18 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         profile = cProfile.Profile()
         profile.enable()
 
+    training = False
+    if train_cosmopower:
+        root_dir_name = ini.get("training", "save_dir")
+        save_name = f'{root_dir_name}/cosmopower_emulator_fixed_params.pkl'
+        if os.path.exists(save_name) and not overwrite_cosmopower:
+            if is_root:
+                raise FileExistsError("Tried to train the CosmoPower emulator, but emulator already exists. If you want to really re-train the emulator, add option --force")
+        else:
+            training = True
+            if is_root:
+                print(underline("Training the CosmoPower emulator!") if not overwrite_cosmopower else underline("Re-training the CosmoPower emulator!"))
+
     # Create pipeline.
     if pipeline is None:
         cleanup_pipeline = True
@@ -285,14 +317,14 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
                 print(underline(f"Setting up pipeline from pre-constructed configuration"))
 
         if is_root or pool_stdout:
-            pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors)
+            pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors, training=training)
         else:
             if pool_stdout:
-                pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors)
+                pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors, training=training)
             else:
                 # Suppress output on everything except the root process
                 with stdout_redirected():
-                    pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors)
+                    pipeline = LikelihoodPipeline(ini, override=variables, values=values, only=only, priors=priors, training=training)
 
         if pipeline.do_fast_slow:
             pipeline.setup_fast_subspaces()
@@ -306,11 +338,14 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         # give the module a new name to avoid name clashes if people
         # just call their thing by the same name
         import_by_path('additional_samplers_{}'.format(i), sampler_file)
-
-
+    
 
     # determine the type(s) of sampling we want.
     sample_methods = ini.get(RUNTIME_INI_SECTION, "sampler", fallback="test").split()
+
+    # if we run the training option, we override the selected samplers, as they need to be fixed!
+    if training:
+        sample_methods = ["latinhypercube", "cosmopower"]
 
     for sample_method in sample_methods:
         if sample_method not in Sampler.registry:
@@ -332,6 +367,14 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
 
     number_samplers = len(sampler_classes)
 
+    if ini.has_option("pipeline", "failure_log"):
+        filename = ini.get("pipeline", "failure_log")
+        failure_log_file = mpi_pool.MPILogFile(filename, pool)
+        pipeline.set_failure_log_file(failure_log_file)
+    else:
+        failure_log_file = None
+
+
 
     #To start with we do not have any estimates of 
     #anything the samplers might give us like centers
@@ -341,7 +384,7 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
     #Now that we have a sampler we know whether we will need an
     #output file or not.  By default new samplers do need one.
     for sampler_number, (sampler_class, sample_method) in enumerate(
-            zip(sampler_classes, sample_methods)):
+            zip(sampler_classes, sample_methods[:])):
         sampler_name = sampler_class.__name__[:-len("Sampler")].lower()
 
         # The resume feature lets us restart from an existing file.
@@ -382,7 +425,7 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
             else:
                 print("* Running in serial mode.")
 
-        output = setup_output(sampler_class, sampler_number, ini, pool, number_samplers, sample_method, resume, output_original)
+        output = setup_output(sampler_class, sampler_number, ini, pool, sample_methods, sample_method, resume, output_original)
 
         if is_root:
             print("****************************************************")
@@ -408,7 +451,7 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
            sampler.resume()
 
         if output:
-            write_header_output(output, ini, values, pipeline)
+            write_header_output(output, ini, values, pipeline, values_override=variables)
 
         sys.stdout.flush()
         sys.stderr.flush()
@@ -422,15 +465,15 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
             run_count_total = pipeline.run_count
             run_count_ok_total = pipeline.run_count_ok
         else:
-            run_count_total = pool.comm.allreduce(pipeline.run_count)
-            run_count_ok_total = pool.comm.allreduce(pipeline.run_count_ok)
+            run_count_total = pool.allreduce(pipeline.run_count)
+            run_count_ok_total = pool.allreduce(pipeline.run_count_ok)
         
         if is_root and sampler_name != 'test':
             logs.overview(f"Total posterior evaluations = {run_count_total} across all processes")
             logs.overview(f"Successful posterior evaluations = {run_count_ok_total} across all processes")
             if output:
                 output.final("evaluations", run_count_total)
-                output.final("successes", run_count_total)
+                output.final("successes", run_count_ok_total)
                 output.final("complete", "1")
 
 
@@ -439,6 +482,9 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
 
     if cleanup_pipeline:
         pipeline.cleanup()
+
+    if failure_log_file is not None:
+        failure_log_file.close()
 
     if profile_cpu:
         profile.disable()
@@ -524,6 +570,20 @@ parser.add_argument("--only", nargs="*", help="Fix all parameters except the one
 parser.add_argument("--graph", type=str, default='', help="Do not run a sampler; instead make a graphviz dot file of the pipeline")
 parser.add_argument('--version', action='version', version=__version__, help="Print out a version number")
 parser.add_argument('--profile' , help="Save profiling (timing) information to this named file")
+parser.add_argument('--train_cosmopower', action='store_true', help="Train the CosmoPower emulator")
+parser.add_argument('--overwrite_cosmopower', action='store_true', help="Force train the CosmoPower emulator (will overwrite existing emulator)")
+
+
+@contextlib.contextmanager
+def run_under_debugger():
+    try:
+        yield
+    except Exception as error:
+        print("There was an exception - starting python debugger because you ran with --pdb")
+        print(error)
+        pdb.post_mortem()
+
+
 
 
 def main():
@@ -540,20 +600,16 @@ def main():
         # initialize parallel workers
         if args.mpi:
             with mpi_pool.MPIPool() as pool:
-                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
+                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
         elif args.smp:
             with process_pool.Pool(args.smp) as pool:
-                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
+                return run_cosmosis(ini=args.inifile, pool=pool, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
+        elif args.pdb:
+            with run_under_debugger():
+                return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
         else:
-            try:
-                return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only)
-            except Exception as error:
-                if args.pdb:
-                    print("There was an exception - starting python debugger because you ran with --pdb")
-                    print(error)
-                    pdb.post_mortem()
-                else:
-                    raise
+            return run_cosmosis(ini=args.inifile, pool=None, override=args.params, profile_mem=args.mem, profile_cpu=args.profile, variables=args.variables, only=args.only, train_cosmopower=args.train_cosmopower, overwrite_cosmopower=args.overwrite_cosmopower)
+
     except CosmosisConfigurationError as e:
         print(e)
         return 1

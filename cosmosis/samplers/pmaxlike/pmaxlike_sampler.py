@@ -94,7 +94,7 @@ class PmaxlikeSampler(ParallelSampler):
           self.pipeline.create_ini(opt, self.output_ini)
 
         # If we are coupling to later samplers they can use the peak we have found.
-        self.distribution_hints.set_peak(opt)
+        self.distribution_hints.set_peak(opt, results.post)
 
         #Also if requested, approximate the covariance matrix with the 
         #inverse of the Hessian matrix.

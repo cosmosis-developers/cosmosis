@@ -281,7 +281,20 @@ class MetropolisHastingsStatistics(ConstrainingStatistics, MCMCPostProcessorElem
     def compute_basic_statsgd_col(self, gdc, col):
         dens1d = gdc.get1DDensity(col,writeDataToFile=False)
         if dens1d is None:
-            return [np.nan for i in range(9)]
+            return [np.nan for i in range(11)]
+
+        
+        post = self.reduced_col("post")
+
+        try:
+            like = self.reduced_col("like")
+        except ValueError:
+            like = post - self.reduced_col("prior")
+
+        data1 = self.reduced_col(col)
+        maxlike = data1[like.argmax()]
+        maxpost = data1[post.argmax()]
+
 
         def func(x):
             return -dens1d.Prob(x)
@@ -298,6 +311,8 @@ class MetropolisHastingsStatistics(ConstrainingStatistics, MCMCPostProcessorElem
             dens1d.getLimits([0.68])[1],
             dens1d.getLimits([0.95])[0],
             dens1d.getLimits([0.95])[1],
+            maxlike,
+            maxpost,
         ]
         return results
 
@@ -753,8 +768,12 @@ class WeightedMetropolisStatistics(WeightedStatistics, ConstrainingStatistics, W
         if dens1d is None:
             return [np.nan for i in range(11)]
         
-        like = self.reduced_col("like")
         post = self.reduced_col("post")
+        try:
+            like = self.reduced_col("like")
+        except ValueError:
+            like = post - self.reduced_col("prior")
+
         data1 = self.reduced_col(col)
         maxlike = data1[like.argmax()]
         maxpost = data1[post.argmax()]

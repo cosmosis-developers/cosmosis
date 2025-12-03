@@ -1,5 +1,38 @@
 output_dir: output/campaign-test
-include: []
+output_name: my_project_{name}_suite1
+include: [cosmosis/test/included.yml]
+
+components: 
+  test_component_1:
+    params:
+    - emcee.walkers = 100
+
+submission:
+  # These parameters can be overridden per run.
+  # Normally this would be "sbatch" or "qsub". This
+  # is just for testing.
+  submit: cat
+  cores_per_task: 1
+  tasks: 2
+  nodes: 1
+  walltime: 06:00:00
+  queue: regular
+  template: |
+    #!/bin/bash
+    #SBATCH -N {nodes}
+    #SBATCH -q {queue}
+    #SBATCH -J {job_name}
+    #SBATCH -t {walltime}
+
+    # OpenMP settings:
+    export OMP_NUM_THREADS={cores_per_task}
+    export OMP_PLACES=threads
+    export OMP_PROC_BIND=spread
+    
+    # You might need to add some setup commands here
+    mpirun -n {tasks}  {command} &> {log}
+
+
 
 runs:
   - name: v1
@@ -23,3 +56,63 @@ runs:
     parent: v2
     priors:
     - del parameters .p2
+    # override submission parameters
+    submission:
+      submit: cat
+      walltime: 04:00:00
+
+  - name: env-test-1
+    base: cosmosis/test/example.ini
+    env:
+      TEST : xxx
+
+  - name: env-test-2
+    parent: env-test-1
+    env:
+      TEST : yyy
+
+  - name: env-test-3
+    parent: env-test-1
+    params:
+    - emcee.walkers = ${TEST}
+
+  - name: env-test-4
+    parent: env-test-2
+    env:
+      TEST2 : zzz
+
+  # Test double inheritance
+  - name: env-test-5
+    parent: env-test-4
+
+  - name: component-test
+    parent: v1
+    components:
+    - test_component_1
+
+  - name: include-test-1
+    parent: imported-run
+    params:
+    - emcee.walkers = 755
+
+  - name: include-test-2
+    parent: v1
+    components:
+    - test_component_2
+
+  # Multinest and polychord need specific tests because
+  # they set up their own output directories
+  - name: multinest-test
+    parent: v1
+    params:
+    - sampler = multinest
+    - runtime.verbosity = quiet
+    - multinest.max_iterations = 2
+    - multinest.live_points = 20
+
+  - name: polychord-test
+    parent: v1
+    params:
+    - sampler = polychord
+    - runtime.verbosity = quiet
+    - polychord.live_points = 20

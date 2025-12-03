@@ -81,16 +81,18 @@ class DynestySampler(ParallelSampler):
         results = sampler.results
         results.summary()
 
+        posts = results['blob'][:, 0] + results['logl']
+        self.distribution_hints.set_from_sample(results['samples'], posts, log_weights=results['logwt'])
+
         for sample, logwt, logl, derived in zip(results['samples'],results['logwt'], results['logl'], results['blob']):
             prior = derived[0]
             post = prior + logl
-            self.output.parameters(sample, logwt, prior, post, derived[1:])
+            self.output.parameters(sample, derived[1:], logwt, prior, post)
 
         self.output.final("efficiency", results['eff'])
         self.output.final("nsample", len(results['samples']))
         self.output.final("log_z", results['logz'][-1])
         self.output.final("log_z_error", results['logzerr'][-1])
-
         self.converged = True
 
 

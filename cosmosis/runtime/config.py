@@ -31,7 +31,8 @@ class IncludingConfigParser(configparser.ConfigParser):
     comments, but still delineate sections).
     """
 
-    def __init__(self, defaults=None, print_include_messages=True):
+    def __init__(self, defaults=None, print_include_messages=True, no_expand_vars=False):
+        self.no_expand_vars = no_expand_vars
         configparser.ConfigParser.__init__(self,
                                    defaults=defaults,
                                    dict_type=collections.OrderedDict,
@@ -52,7 +53,7 @@ class IncludingConfigParser(configparser.ConfigParser):
         s = io.StringIO()
         for line in fp:
             # check for include directives
-            if not getattr(self, 'no_expand_vars', False):
+            if not self.no_expand_vars:
                 line = os.path.expandvars(line)
 
             if line.lower().startswith('%include'):
@@ -95,7 +96,7 @@ class Inifile(IncludingConfigParser):
 
     """
 
-    def __init__(self, filename, defaults=None, override=None, print_include_messages=True):
+    def __init__(self, filename, defaults=None, override=None, print_include_messages=True, no_expand_vars=False):
         u"""Read in a configuration from `filename`.
 
         The `defaults` will be applied if a parameter is not specified in
@@ -110,7 +111,8 @@ class Inifile(IncludingConfigParser):
 
         IncludingConfigParser.__init__(self,
                                        defaults=defaults,
-                                       print_include_messages=print_include_messages)
+                                       print_include_messages=print_include_messages,
+                                       no_expand_vars=no_expand_vars)
 
         # if we are pased a dict, convert it to an inifile
         if isinstance(filename, dict):
@@ -126,6 +128,8 @@ class Inifile(IncludingConfigParser):
             filename.write(s)
             s.seek(0)
             self.read_file(s)
+        elif hasattr(filename, "read"):
+            self.read_file(filename)
         # default read behaviour is to ignore unreadable files which
         # is probably not what we want here
         elif filename is not None:
@@ -143,7 +147,11 @@ class Inifile(IncludingConfigParser):
                         self.add_section(section)
                     self.set(section, name, override[(section, name)])
 
-
+    @classmethod
+    def from_lines(cls, lines, *args, **kwargs):
+        u"""Create an Inifile from a list of lines."""
+        s = io.StringIO("\n".join(lines))
+        return cls(s, *args, **kwargs)
 
     def __iter__(self):
         u"""Iterate over all the parameters.

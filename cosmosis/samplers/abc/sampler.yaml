@@ -44,5 +44,7 @@ params:
     set_prior: "(string; default = Gaussian) prior, options = Gaussian, uniform"
     run_multigauss: (boolean; default = F) generate multigaussian data
     ngauss: (int; default = 4) dimension of multigaussian if run_multigauss
-    metric_kw: (str; default = "chi2") mean, chi2 or other; if "other" then need to specify name of function "distance_func"
+    metric: (str; default = "chi2") mean, chi2 or other; if "other" then need to specify name of function "distance_func"
     distance_func: (str; default=None) "def func(x,y):\n\t do some calculation\n\t return dist_result"
+    param_cov_file: (str; default = "None") Parameter covariance file for the prior
+    diag_cov: (bool; default = False) Use diagonal covariance matrix

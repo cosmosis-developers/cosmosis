@@ -1080,8 +1080,11 @@ class CovarianceMatrixGaussians(Plots):
         sigma2 = sigma**2
         x = np.linspace(xmin, xmax, 200)
         p = np.exp(-0.5 * (x-mu)**2 / sigma2)# / np.sqrt(2*np.pi*sigma2)
-        figure,filename = self.figure(name)
+        figure, filename = self.figure(name)
         pylab.figure(figure.number)
+        if not hasattr(figure, "cosmosis_done_truth"):
+            self.plot_truth_1d(name)
+            figure.cosmosis_done_truth = True
         pylab.plot(x, p, label=self.source.label)
         pylab.xlabel(self.latex(name))
         pylab.ylabel("Posterior")
@@ -1116,8 +1119,12 @@ class CovarianceMatrixEllipse(Plots):
         s22 = covmat[1,1]**0.5
 
         #Open the figure (new or existing) for this pair
-        figure,filename = self.figure("2D", name1, name2)
+        figure, filename = self.figure("2D", name1, name2)
         pylab.figure(figure.number)
+
+        if not hasattr(figure, "cosmosis_done_truth"):
+            self.plot_truth_2d(name1, name2)
+            figure.cosmosis_done_truth = True
 
         #Plot the 1 sigma and 2 sigma ellipses
         self.plot_cov_ellipse(covmat, pos, nstd=1, facecolor=None, 

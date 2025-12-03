@@ -22,7 +22,7 @@ class TestSampler(Sampler):
 
     def execute(self):
         # load initial parameter values
-        p = np.array([param.start for param in self.pipeline.varied_params])
+        p = self.start_estimate()
     
         # try to print likelihood if it exists
         data=None

@@ -1,0 +1,40 @@
+name: "pmaxlike"
+version: "1.0"
+parallel: parallel
+purpose: "Parallel maximum likelihood estimation using gradient-based optimization"
+url: "http://docs.scipy.org/doc/scipy-0.15.1/reference/generated/scipy.optimize.minimize.html"
+attribution: ["CosmoSIS Team", "SciPy developers"]
+cite: []
+
+explanation: >
+    This sampler finds the maximum likelihood point in parameter space using 
+    gradient-based optimization methods from scipy.optimize. Unlike the serial 
+    maxlike sampler, this version can run in parallel and automatically computes 
+    gradients numerically using finite differences.
+
+    The pmaxlike sampler is particularly useful when you have a smooth likelihood 
+    surface and want to leverage parallel computing to accelerate the optimization. 
+    It normalizes parameters to the range [0,1] before optimization to improve 
+    numerical stability.
+
+    The sampler computes both the posterior value and its gradient at each 
+    evaluation point, making it more efficient for gradient-based optimization 
+    methods like conjugate gradient (CG) or BFGS.
+
+installation: >
+    Requires SciPy 0.14 or above. This is installed by the CosmoSIS bootstrap,
+    but if you are installing manually you can get it with the command:
+
+    pip install scipy  # to install centrally, may require sudo
+    
+    pip install scipy --user  # to install just for you
+
+# List of configuration options for this sampler
+params:
+    method: "(string; default='CG') The optimization method to use. Options include CG, BFGS, L-BFGS-B, etc."
+    tolerance: "(float; default=1e-3) Tolerance for termination of the optimization algorithm"
+    maxiter: "(int; default=1000) Maximum number of iterations for the optimization"
+    output_ini: "(string; default='') If present, save the resulting parameters to a new ini file with this name"
+    output_covmat: "(string; default='') If present, save the estimated covariance matrix to this file"
+    gradient_epsilon: "(float; default=1e-9) Step size for numerical gradient computation"
+    gradient_tolerance: "(float; default=1e-5) Tolerance for gradient convergence criterion"

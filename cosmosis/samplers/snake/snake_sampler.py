@@ -35,9 +35,9 @@ class SnakeSampler(ParallelSampler):
             try:
                 x = self.pipeline.denormalize_vector(x)
                 self.output.parameters(x, extra, prior, post)
+                self.distribution_hints.set_peak(x, post)
             except ValueError:
                 logs.noisy("The snake is trying to escape its bounds!")
-
 
 
     def is_converged(self):

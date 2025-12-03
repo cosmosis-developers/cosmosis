@@ -26,7 +26,13 @@ class ListSampler(ParallelSampler):
         self.converged = False
         self.filename = self.read_ini("filename", str)
         self.save_name = self.read_ini("save", str, "")
-        self.burn = self.read_ini("burn", int, 0)
+        # The burn parameter can be an int or a float
+        # so we read it as a string and then convert it
+        burn = self.read_ini("burn", str, "0")
+        try:
+            self.burn = int(burn)
+        except ValueError:
+            self.burn = float(burn)
         self.thin = self.read_ini("thin", int, 1)
         limits = self.read_ini("limits", bool, False)
         self.chunk_size = self.read_ini("chunk_size", int, 100)
@@ -57,6 +63,12 @@ class ListSampler(ParallelSampler):
         file_options = {"filename":self.filename}
         column_names, samples, _, _, _ = TextColumnOutput.load_from_options(file_options)
         samples = samples[0]
+        if (self.burn != 0) or (self.thin != 1):
+            if isinstance(self.burn, float):
+                burn = int(self.burn*len(samples))
+            else:
+                burn = self.burn
+            samples = samples[burn::self.thin]
         # find where in the parameter vector of the pipeline
         # each of the table parameters can be found
         replaced_params = []
@@ -121,6 +133,7 @@ class ListSampler(ParallelSampler):
                 (prob, (prior,extra)) = result
                 # always save the usual text output
                 self.output.parameters(sample, extra, prior, prob)
+                self.distribution_hints.set_peak(sample, prob)
 
         # We only ever run this once, though that could 
         # change if we decide to split up the runs

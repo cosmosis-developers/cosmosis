@@ -73,6 +73,7 @@ class PmcSampler(ParallelSampler):
 
         for (vector, post, extra, component, weight) in zip(*results):
             prior, extra = extra
+            self.distribution_hints.set_peak(vector, post)
             self.output.parameters(vector, extra, (component, prior, post, weight))
 
         logs.overview("Done %d iterations, %d samples" % (self.iterations, self.samples))

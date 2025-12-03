@@ -64,6 +64,7 @@ class GridmaxSampler(ParallelSampler):
         #Log the results for posterity
         for p, (pr, po, e) in zip(points, results):
             self.output.parameters(p, e, pr, po)
+            self.distribution_hints.set_peak(p, po)
 
         #And now update our information.
         #We need to find the two points either side
@@ -103,6 +104,8 @@ class GridmaxSampler(ParallelSampler):
             self.maxlike = results[best][0]
 
         logs.overview(f"New best fit L = {posteriors.max()} at {self.pipeline.varied_params[d].name} = {points[best][d]}")
+
+        
 
         #and go on to the next dimension
         self.dimension = (d+1)%self.ndim

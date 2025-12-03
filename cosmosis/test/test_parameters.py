@@ -1,7 +1,9 @@
-from ..runtime import parameter
+from cosmosis.runtime import parameter
+from cosmosis import run_cosmosis, Inifile
+from cosmosis.output import InMemoryOutput
 import numpy as np
 import tempfile
-
+import os
 
 def test_override_new():
     with tempfile.NamedTemporaryFile('w') as values:
@@ -55,3 +57,36 @@ def test_override_new():
     assert np.isclose(params[3].start, 100.0)
     assert np.allclose(params[3].limits, 100.0)
 
+
+def test_header_update():
+    root = os.path.split(os.path.abspath(__file__))[0]
+
+    # Create a values file
+    with tempfile.NamedTemporaryFile('w') as values:
+        values.write(
+            "[parameters]\n"
+            "p1=-3.0  0.0  3.0\n"
+            "p2=-3.0  0.0  3.0\n"
+            "p3=20.0\n")
+        values.flush()
+
+        override = {
+            ('runtime', 'root'): root,
+            ('runtime', 'sampler'): 'emcee',
+            ("pipeline", "debug"): "F",
+            ("pipeline", "modules"): "test1",
+            ("pipeline", "values"): values.name,
+            ("test1", "file"): "example_module.py",
+            ("emcee", "walkers"): "8",
+            ("emcee", "samples"): "10"
+        }
+        ini = Inifile(None, override=override)
+        output = InMemoryOutput()
+        override_values = {
+            ("parameters", "p1"): "-2.0  0.0  2.0",
+        }
+
+        run_cosmosis(ini, variables=override_values, output=output)
+        print(output.comments)
+
+        assert 'p1 = -2.0  0.0  2.0' in output.comments

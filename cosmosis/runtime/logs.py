@@ -1,5 +1,6 @@
 import logging
 import sys
+import os
 
 NOISY = 15
 
@@ -10,7 +11,17 @@ handler = logging.StreamHandler(sys.stdout)
 logger.addHandler(handler)
 formatter = logging.Formatter('%(message)s')
 handler.setFormatter(formatter)
-logger.propagate = False
+
+# The pytest tests about whether a particular log message is printed
+# fail if the logger is not set to propagate, I think because it replaces
+# the logger. So we only set it to not propagate if we are running
+# the tests, not otherwise. I'm probably using this wrong and should just
+# not use the python logging system, it's not really a good fit for this
+# application
+if ("PYTEST_VERSION" in os.environ) or ("COSMOSIS_TESTING" in os.environ):
+    logger.propagate = True
+else:
+    logger.propagate = False
 
 
 verbosity_levels = {

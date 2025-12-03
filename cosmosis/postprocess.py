@@ -52,16 +52,13 @@ plots.add_argument("--truth", default="", help="An ini file containing truth val
 
 
 def main(args):
-	#Read the command line arguments and load the
-	#ini file that created the run
 	args = parser.parse_args(args)
 
-	for ini_filename in args.inifile:
-		if not os.path.exists(ini_filename):
-			raise ValueError("The file (or directory) {} does not exist.".format(ini_filename))
-
+	# Run the main postprocessing code
 	processor = run_cosmosis_postprocess(args.inifile, **vars(args))
 
+	# The postprocessor doesn't finalize the plots until it is saved
+	# so that we can use it interactively too. So save here.
 	if processor is not None:
 		#Save all the image files and close the text files
 		processor.save()

@@ -3,7 +3,7 @@ from cosmosis.datablock import DataBlock
 from cosmosis.samplers.sampler import Sampler
 from cosmosis.runtime.prior import TruncatedGaussianPrior, DeltaFunctionPrior
 from cosmosis.output.in_memory_output import InMemoryOutput
-from cosmosis.main import run_cosmosis, parser
+from cosmosis.main import run_cosmosis, parser, mpi_pool
 import numpy as np
 import os
 import tempfile
@@ -263,6 +263,102 @@ def test_pipeline_from_function():
     r = pipeline.run_results([0,0,0,0])
     assert r.like == 0.0
     assert len(r.extra) == 0
+
+
+def test_failure_log():
+    def log_like(p):
+        if p[0] < 0:
+            print("Deliberately failing pipeline ...")
+            raise ValueError("p0 must be positive")
+        return -0.5 * np.sum(p**2)
+
+    param_ranges = [
+        (-3.0,  0.0,  3.0),
+        (-3.0,  0.0,  3.0),
+        (-3.0,  0.0,  3.0),
+        (-3.0,  0.0,  3.0),
+    ]
+
+    with tempfile.TemporaryDirectory() as dirname:
+        logname = f"{dirname}/failure.log"
+        failure_log = mpi_pool.MPILogFile(logname)
+    
+        pipeline = LikelihoodPipeline.from_likelihood_function(log_like, param_ranges)
+        pipeline.set_failure_log_file(failure_log)
+        # two that should work and produce nothing
+        # and two that should log some errors
+        param_sets = [
+            [0.0,0.0,0.0,0.0],
+            [1.0,0.0,0.0,0.0],
+            [-1.0,0.0,0.0,4.0],
+            [-2.0,0.0,0.0,8.0],
+        ]
+        print("Pipeline errors are expected below - we are testing logging of them")
+        for p in param_sets:
+            pipeline.run_parameters(p)
+
+        failure_log.close()
+        with open(logname) as f:
+            lines = f.readlines()
+        assert len(lines) == 2
+        assert lines[0].strip() == "-1.0 0.0 0.0 4.0"
+        assert lines[1].strip() == "-2.0 0.0 0.0 8.0"
+
+
+def test_recreate_pipeline():
+    with tempfile.TemporaryDirectory() as dirname:
+
+        values = os.path.join(dirname, "values.ini")
+        priors = os.path.join(dirname, "priors.ini")
+        output = os.path.join(dirname, "output.txt")
+        with open(values, "w") as f:
+            f.write(
+                "[parameters]\n"
+                "p1=-10.0  0.0  10.0\n"
+                "p2=-1000.0  0.0  1000.0\n")
+
+        with open(priors, "w") as f:
+            f.write(
+                "[parameters]\n"
+                "p1=uniform -5.0 5.0\n"
+                "p2=gaussian 0.0 1.0"
+            )
+
+        override = {
+            ('runtime', 'root'): root,
+            ('runtime', 'sampler'): "emcee",
+            ("pipeline", "debug"): "F",
+            ("pipeline", "modules"): "test2",
+            ("pipeline", "values"): values,
+            ("pipeline", "priors"): priors,
+            ("pipeline", "extra_output"): "parameters/p3",
+            ("output", "filename"): output,
+            ("output", "format"): "text",
+            ("test2", "file"): "example_module.py",
+            ("emcee", "walkers"): "8",
+            ("emcee", "samples"): "10"
+        }
+
+        ini = Inifile(None, override=override)
+
+        status = run_cosmosis(ini)
+
+        # Now we want to recreate the pipeline from the output
+        pipeline = LikelihoodPipeline.from_chain_file(output)
+
+        # check the basic pipeline configuration
+        assert pipeline.modules[0].name == "test2"
+        assert len(pipeline.modules) == 1
+
+        # check it produces the same results
+        r = pipeline.run_results([1.,2.])
+        assert np.isclose(r.like, -2.5)
+        assert np.isclose(r.extra[0], 3.0)
+
+        # check that the priors have been correctly passed through
+        # the recreated pipeline
+        assert np.isclose(r.prior, np.log(0.1) - 2.0 - 0.5*np.log(2*np.pi))
+
 
 
 

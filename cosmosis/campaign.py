@@ -1,12 +1,48 @@
 from .runtime import Inifile, MPIPool
-from .main import run_cosmosis
+from .main import run_cosmosis, run_under_debugger
 from .runtime.utils import underline
 import time
 import os
 import yaml
 import sys
 import warnings
+import subprocess
 import contextlib
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    """
+    This is a YAML loader that raises an error if there are duplicate keys.
+
+    It is based on the discussion here:
+    https://gist.github.com/pypt/94d747fe5180851196eb
+    """
+    def construct_mapping(self, node, deep=False):
+        mapping = set()
+        for key_node, _ in node.value:
+            if ":merge" in key_node.tag:
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise ValueError(f"Duplicate {key} key found in YAML.")
+            mapping.add(key)
+        return super().construct_mapping(node, deep)
+
+def load_yaml(stream):
+    """
+    Load YAML markup from a stream, with a check for duplicate keys.
+
+    Parameters
+    ----------
+    stream : file
+        The open file-like object to load from
+
+    Returns
+    -------
+    data : object
+        The dict or list loaded from the YAML file
+    """
+    return yaml.load(stream, Loader=UniqueKeyLoader)
+
 
 def pipeline_after(params, after_module, modules):
     """
@@ -305,7 +341,7 @@ def temporary_environment(env):
         os.environ.clear()
         os.environ.update(original_environment)
 
-def set_output_dir(params, name, output_dir):
+def set_output_dir(params, name, output_dir, output_name):
     """
     Modify a parameters file to set the output directory and file names to be
     based on the run name and output directory.
@@ -318,7 +354,10 @@ def set_output_dir(params, name, output_dir):
         The name of the run
     output_dir : str
         The output directory to use
-
+    output_name : str
+        The format string to use to generate the output file name, using {name}
+        for the run name.
+        
     Returns
     -------
     None
@@ -329,16 +368,24 @@ def set_output_dir(params, name, output_dir):
     if not params.has_section("test"):
         params.add_section("test")
 
-    params.set("output", "filename", os.path.join(output_dir, f"{name}.txt"))
-    params.set("test", "save_dir", os.path.join(output_dir, name))
+    output_name_base = output_name.format(name=name)
+    output_name = output_name_base + ".txt"
+    params.set("output", "filename", os.path.join(output_dir, output_name))
+    params.set("test", "save_dir", os.path.join(output_dir, output_name_base))
 
+    # Polychord and Multinest have their own output files. They are handled slightly
+    # differently. It would be nicer to put all these files in specific directories
+    # instead of just using specific base names, and I will do that at the next breaking
+    # change, but right now doing that would mean I had to change the multinest sampler
+    # to create the directories, which would be backwards incompatible.
     if params.has_section("multinest"):
-        params.set("multinest", "multinest_outfile_root", os.path.join(output_dir, f"{name}.multinest"))
+        params.set("multinest", "multinest_outfile_root", os.path.join(output_dir, f"{output_name_base}.multinest"))
+
     if params.has_section("polychord"):
-        params.set("polychord", "polychord_outfile_root", f"{name}.polychord")
+        params.set("polychord", "polychord_outfile_root", f"{output_name_base}.polychord")
         params.set("polychord", "base_dir", output_dir)
 
-def build_run(name, run_info, runs, components, output_dir):
+def build_run(name, run_info, runs, components, output_dir, submission_info, output_name="{name}"):
     """
     Generate a dictionary specifying a CosmoSIS run from a run_info dictioary.
 
@@ -362,78 +409,95 @@ def build_run(name, run_info, runs, components, output_dir):
         A dictionary of previously built components
     output_dir : str
         The output directory to use
+    submission_info : dict
+        A dictionary of submission information
+    output_name : str
+        The format string to use to generate the output file name, using {name}
+        for the run name.
 
     Returns
     -------
     """
     run = run_info.copy()
-    env_vars = run_info.get("env", {})
+
+    # We want to delay expanding environment variables so that child runs
+    # have a chance to override them. So we set no_expand_vars=True on all of these
+    if "base" in run_info:
+        params = Inifile(run_info["base"], print_include_messages=False, no_expand_vars=True)
+    elif "parent" in run_info:
+        try:
+            parent = runs[run_info["parent"]]
+        except KeyError:
+            warnings.warn(f"Run {name} specifies parent {run_info['parent']} but there is no run with that name yet")
+            return None
+        params = Inifile(parent["params"], print_include_messages=False, no_expand_vars=True)
+    else:
+        warnings.warn(f"Run {name} specifies neither 'parent' nor 'base' so is invalid")
+        return None
+    
+    # Build environment variables
+    # These are inherited from the parent run, if there is one,
+    # and then updated with any specific to this run, which can overwrite.
+    # env vars are only applied right at the end when all runs are collected
+    if "parent" in run_info:
+        env_vars = parent["env"].copy()
+    else:
+        env_vars = {}
+    env_vars.update(run_info.get("env", {}))
     run["env"] = env_vars
 
+    # Build values file, which is mandatory
+    if "parent" in run_info:
+        values = Inifile(parent["values"], print_include_messages=False, no_expand_vars=True)
+    else:
+        values_file = params.get('pipeline', 'values')
+        values = Inifile(values_file, print_include_messages=False, no_expand_vars=True)
 
-    # We set the environment both now, when reading the ini files,
-    # so that any variable expansion is done, and also later when running
-    with temporary_environment(env_vars):
-        if "base" in run_info:
-            params = Inifile(run_info["base"], print_include_messages=False)
-        elif "parent" in run_info:
-            try:
-                parent = runs[run_info["parent"]]
-            except KeyError:
-                warnings.warn(f"Run {name} specifies parent {run_info['parent']} but there is no run with that name yet")
-                return None
-            params = Inifile(parent["params"], print_include_messages=False)
-        else:
-            warnings.warn(f"Run {name} specifies neither 'parent' nor 'base' so is invalid")
-            return None
+    # Build optional priors file
+    if "parent" in run_info:
+        priors = Inifile(parent["priors"], print_include_messages=False, no_expand_vars=True)
+    elif "priors" in params.options("pipeline"):
+        priors_file = params.get('pipeline', 'priors')
+        priors = Inifile(priors_file, print_include_messages=False, no_expand_vars=True)
+    else:
+        priors = Inifile(None, no_expand_vars=True)
 
-        # Build values file, which is mandatory
-        if "parent" in run_info:
-            values = Inifile(parent["values"], print_include_messages=False)
-        else:
-            values_file = params.get('pipeline', 'values')
-            values = Inifile(values_file, print_include_messages=False)
+    # Make a list of all the modifications to be applied
+    # to the different bits of this pipeline
 
-        # Build optional priors file
-        if "parent" in run_info:
-            priors = Inifile(parent["priors"], print_include_messages=False)
-        elif "priors" in params.options("pipeline"):
-            priors_file = params.get('pipeline', 'priors')
-            priors = Inifile(priors_file, print_include_messages=False)
-        else:
-            priors = Inifile(None)
-        
+    param_updates = []
+    value_updates = []
+    prior_updates = []
+    pipeline_updates = []
 
+    # First from any generic components specified
+    for component in run_info.get("components", []):
+        component_info = components[component]
+        param_updates.extend(component_info.get("params", []))
+        value_updates.extend(component_info.get("values", []))
+        prior_updates.extend(component_info.get("priors", []))
+        pipeline_updates.extend(component_info.get("pipeline", []))
 
-        # Make a list of all the modifications to be applied
-        # to the different bits of this pipeline
+    # And then for anything specific to this pipeline
+    param_updates.extend(run_info.get("params", []))
+    value_updates.extend(run_info.get("values", []))
+    prior_updates.extend(run_info.get("priors", []))
+    pipeline_updates.extend(run_info.get("pipeline", []))
 
-        param_updates = []
-        value_updates = []
-        prior_updates = []
-        pipeline_updates = []
+    # Now apply all the steps
+    apply_updates(params, param_updates, is_params=True)
+    apply_updates(values, value_updates)
+    apply_updates(priors, prior_updates)
+    apply_pipeline_updates(params, pipeline_updates)
 
-        # First from any generic components specified
-        for component in run_info.get("components", []):
-            component_info = components[component]
-            param_updates.extend(component_info.get("params", []))
-            value_updates.extend(component_info.get("values", []))
-            prior_updates.extend(component_info.get("priors", []))
-            pipeline_updates.extend(component_info.get("pipeline", []))
+    output_name = run_info.get("output_name", output_name)
+    set_output_dir(params, name, output_dir, output_name)
 
-        # And then for anything specific to this pipeline
-        param_updates.extend(run_info.get("params", []))
-        value_updates.extend(run_info.get("values", []))
-        prior_updates.extend(run_info.get("priors", []))
-        pipeline_updates.extend(run_info.get("pipeline", []))
-
-        # Now apply all the steps
-        apply_updates(params, param_updates, is_params=True)
-        apply_updates(values, value_updates)
-        apply_updates(priors, prior_updates)
-        apply_pipeline_updates(params, pipeline_updates)
-
-        set_output_dir(params, name, output_dir)
+    # Finally, set the submission information
+    submission_info = submission_info.copy()
+    submission_info["output_dir"] = output_dir
+    submission_info.update(run_info.get("submission", {}))
+    run["submission"] = submission_info
 
     run["params"] = params
     run["values"] = values
@@ -441,6 +505,31 @@ def build_run(name, run_info, runs, components, output_dir):
 
     return run
 
+
+def expand_environment_variables(runs):
+    """
+    For each run, expand any environment variables in the all three parameter files.
+
+    Environment variables are only supported in values, not in keys or sections.
+
+    Parameters
+    ----------
+    runs : dict
+        A dictionary of runs, keyed by name
+    """
+    for run in runs.values():
+        # This sets environment varibles for the duration of the with block
+        with temporary_environment(run["env"]):
+
+            # We apply this to all the different ini files
+            for ini in [run["params"], run["values"], run["priors"]]:
+                for section in ini.sections():
+                    # Now we can expand all the actual options
+                    for option in ini.options(section):
+                        value = ini.get(section, option)
+                        new_value = os.path.expandvars(value)
+                        if new_value != value:
+                            ini.set(section, option, new_value)
 
 def parse_yaml_run_file(run_config):
     """
@@ -481,7 +570,18 @@ def parse_yaml_run_file(run_config):
         - <list of updates to apply to the priors file>
         pipeline:
         - <list of updates to apply to the pipeline>
-            
+
+    submission:
+        submit: a command to submit runs from batch files (default sbatch)
+        cancel: a command to cancel runs from batch files (default scancel)
+        template: a template for the batch file (default is a SLURM one suitable for NERSC)
+        # remaining variables are passed to the template and can be overridden in specific runs
+        time: Wall time for the job, e.g. 00:30:00
+        nodes: Number of nodes, e.g. 1
+        tasks: Number of tasks in total, e.g. 1
+        cores_per_task: Number of cores (threads) per task, e.g. 1
+        queue: Queue to submit to, e.g. regular
+
                 
     Parameters
     ----------
@@ -492,14 +592,18 @@ def parse_yaml_run_file(run_config):
     -------
     runs : dict
         A dictionary of runs, keyed by name
+    
+    components : dict
+        A dictionary of components, keyed by name
     """
     if isinstance(run_config, dict):
         info = run_config
     else:
         with open(run_config, 'r') as f:
-            info = yaml.safe_load(f)
+            info = load_yaml(f)
     
     output_dir = info.get("output_dir", ".")
+    output_name = info.get("output_name", "{name}")
 
     include = info.get("include", [])
     if isinstance(include, str):
@@ -508,23 +612,32 @@ def parse_yaml_run_file(run_config):
     # Can include another run file, which we deal with
     # recursively.  
     runs = {}
+    components = {}
     for include_file in include:
-        runs.update(parse_yaml_run_file(include_file))
+        inc_runs, inc_comps = parse_yaml_run_file(include_file)
+        components.update(inc_comps)
+        runs.update(inc_runs)
 
     # But we override the output directory
     # of any imported runs with the one we have here   
     for name, run in runs.items():
-        set_output_dir(run["params"], name, output_dir)
+        set_output_dir(run["params"], name, output_dir, output_name)
     
     # deal with re-usable components
-    components = info.get("components", {})
+    components.update(info.get("components", {}))
+
+    submission_info = info.get("submission", {})
 
     # Build the parameter, value, and prior objects for this run
     for run_dict in info["runs"]:
         name = run_dict["name"]
-        runs[name] = build_run(name, run_dict, runs, components, output_dir)
+        runs[name] = build_run(name, run_dict, runs, components, output_dir, submission_info, output_name)
 
-    return runs
+    # Only now do we expand environment variables in the runs.  This gives the child runs
+    # a chance to override the environment variables of their parents.
+    expand_environment_variables(runs)
+
+    return runs, components
 
 
 def show_run(run):
@@ -551,7 +664,7 @@ def show_run(run):
     run["priors"].write(sys.stdout)
     print("")
 
-def perform_test_run(run):
+def perform_test_run(run, use_pdb=False):
     """
     Launch a run under the "test" sampler, which just runs the pipeline
     and does not do any sampling.
@@ -576,7 +689,11 @@ def perform_test_run(run):
     params.set("runtime", "resume", "F")
 
     with temporary_environment(env):
-        return run_cosmosis(params, values=values, priors=priors)
+        if use_pdb:
+            with run_under_debugger():
+                return run_cosmosis(params, values=values, priors=priors)
+        else:
+            return run_cosmosis(params, values=values, priors=priors)
 
 def chain_status(filename, include_comments=False):
     n = 0
@@ -659,6 +776,39 @@ def launch_run(run, mpi=False):
             return run_cosmosis(params, values=values, priors=priors)
 
 
+def submit_run(run_file, run):
+    """
+    Subnmit a CosmoSIS run using a batch system such as SLURM.
+    """
+
+    submission_info = run["submission"]
+    template = submission_info["template"]
+    keys = submission_info.copy()
+    name = run["name"]
+    keys["job_name"] = name
+    output_dir = keys["output_dir"]
+
+    # We use the campaign program to actually run the jobs
+    keys["command"]  = f"cosmosis-campaign {run_file} --run {name} --mpi"
+
+    # choose where the jobs stdout / stderr should go
+    os.makedirs(os.path.join(output_dir, "logs"), exist_ok=True)
+    keys["log"] = os.path.join(output_dir, "logs", f"{name}.log")
+
+    # fill in the template
+    sub_script = template.format(**keys).lstrip()
+
+    # write the submission file to a batch subdir
+    os.makedirs(os.path.join(output_dir, "batch"), exist_ok=True)
+    sub_file = os.path.join(output_dir, "batch", f"{name}.sub")
+    with open(sub_file, "w") as f:
+        f.write(sub_script)
+
+    # Actually submit the job using slurm or similar
+    submit = submission_info.get("submit", "sbatch")
+    subprocess.check_call(f"{submit} {sub_file}", shell=True)
+    print(f"Submitted {sub_file}\nJob output in", keys["log"])
+
 
 
 import argparse
@@ -669,13 +819,15 @@ group.add_argument("--list", "-l", action="store_true", help="List all available
 group.add_argument("--cat", "-c",  type=str, help="Show a single run")
 group.add_argument("--status", "-s", default="_unset", nargs="*", help="Show the status of a single run, or all runs if called with no argument")
 group.add_argument("--run", "-r",  help="Run the named run")
-group.add_argument("--test", "-t",  help="Launch the named run")
+group.add_argument("--test", "-t",  help="Test the named run")
+group.add_argument("--submit", "-x",  help="Submit the named run to a batch system")
 parser.add_argument("--mpi", action="store_true", help="Use MPI to launch the runs")
+parser.add_argument("--pdb",  action="store_true", help="When testing a run, enter the debugger in case of failure")
 
 
 
 def main(args):
-    runs = parse_yaml_run_file(args.run_config)
+    runs, _ = parse_yaml_run_file(args.run_config)
 
     if args.mpi and not args.run:
         raise ValueError("MPI can only be used when running a single run")
@@ -690,11 +842,13 @@ def main(args):
     elif args.cat:
         show_run(runs[args.cat])
     elif args.test:
-        perform_test_run(runs[args.test])
+        perform_test_run(runs[args.test], args.pdb)
     elif status_set:
         show_run_status(runs, args.status)
     elif args.run:
         launch_run(runs[args.run], mpi=args.mpi)
+    elif args.submit:
+        submit_run(args.run_config, runs[args.submit])
 
 
 

@@ -38,9 +38,14 @@ class PipelineAttribution(object):
 		self.attributions = collections.OrderedDict()
 
 		for module in modules:
-			directory, _ = os.path.split(module.filename)
-			filename = os.path.join(directory, "module.yaml")
-			self.attributions[module.name] = ModuleAttribution.from_yaml(filename)
+			# we really don't ever want to cause a crash due to
+			# an atrribution failure, so wrap all of this in try/except
+			try:
+				directory, _ = os.path.split(module.filename)
+				filename = os.path.join(directory, "module.yaml")
+				self.attributions[module.name] = ModuleAttribution.from_yaml(filename)
+			except:
+				continue
 
 	def write_output(self, output):
 		comments = []

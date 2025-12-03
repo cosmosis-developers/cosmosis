@@ -78,6 +78,8 @@ testing_files = [
     "test/libtest/test_c_datablock_scalars.template",
     "test/libtest/Makefile",
     "test/campaign.yml",
+    "test/included.yml",
+    "test/bad-campaign.yml",
     "test/example-priors.ini",
     "test/example-values.ini",
     "test/example.ini",
@@ -197,10 +199,11 @@ requirements = [
     "emcee",
     "dynesty",
     "zeus-mcmc",
-    "nautilus-sampler==0.6.*",
+    "nautilus-sampler>=1.0.1",
+    "h5py", # needed for nautilus
     "dulwich",
     "scikit-learn",
-    "future",
+    "Py-BOBYQA",
 
 ]
 

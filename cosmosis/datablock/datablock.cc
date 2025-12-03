@@ -154,16 +154,20 @@ cosmosis::DataBlock::get_log_entry(int i,
   section = std::get<1>(entry);
   name = std::get<2>(entry);
   std::type_index info(std::get<3>(entry));
-  char type_name[128];
-  int status;
+  // __cxa_demangle requires that the buffer is allocated with malloc,
+  // as it will sometimes reallocate the buffer to fit the string.
   size_t len = 128;
-  abi::__cxa_demangle(info.name(), type_name, &len, &status); 
+  char * type_name = (char *) malloc(len);
+  int status;
+  char * type_name2 = abi::__cxa_demangle(info.name(), type_name, &len, &status);
+
   if (status){
     type = info.name();
   }
   else{
-    type = type_name;
+    type = type_name2;
   }
+  free(type_name2);
 
   return DBS_SUCCESS;
 }

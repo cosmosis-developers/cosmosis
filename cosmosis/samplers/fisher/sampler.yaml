@@ -28,7 +28,7 @@ explanation: >
     
     There is an additional term that arises when the covariance matrix C depends on
     the parameters p, which we do not currently calculate here, as it is usually fixed in 
-    cosmology. We plan to implement this shortly, however.
+    cosmology.
 
     The CosmoSIS fisher sampler is calculated around the central value provided in the
     values file; no optimization is done before running.
@@ -45,15 +45,22 @@ explanation: >
     or you can manually save name+"_theory" and name+"_inverse_covariance" for any data that 
     you add.
 
+    Three methods are exposed for calculating the numerical derivatives.
+
+    1. 'stencil' - Uses a simple finite difference stencil to calculate the derivative.
+    2. 'numdifftools' - Uses the numdifftools package to calculate the derivative.
+    3. 'smooth' - Uses the derivative package to calculate the derivative - this can be slower but more robust.
+
 
 
 installation: >
-    No special installation required; everything is packaged with CosmoSIS
+    You can pip install numdifftools and derivative to use the 'numdifftools' and 'smooth' methods respectively.
 
 # List of configuration options for this sampler
 params:
-    step_size: "(float; default=0.01) The size, as a fraction of the total parameter range, of steps to use in the derivative calculation. You should investigate stability wrt this."
-    use_numdifftools: "(bool; default=False) Use the library numdifftools instead of the default code (should be little difference)"
-# Not currently working:
-#    tolerance: "(float; default=0.01) tolerance of the iterative process to find the right step size"
-#    maxiter: "(integer; default=10) Max number of iterations to use"
+    method: "(string; default='stencil') The method to use for numerical differentiation.  Options are 'stencil', 'numdifftools', 'smooth'. The latter two require the numdifftools and derivative packages respectively"
+    step_size: "(float; default=0.01) The size, as a fraction of the total parameter range, of steps to use in the stencil and numdifftools methods."
+    use_numdifftools: "(bool; default=False) Whether to use the numdifftools package for numerical differentiation (deprecated)"
+    step_size_min: "(float; default=1e-5) The minimum step size to use in the numerical differentiation using the 'smooth' method"
+    step_size_max: "(float; default=1e-2) The maximum step size to use in the numerical differentiation using the 'smooth' method"
+    step_count: "(int; default=10) The number of steps to use in the numerical differentiation using the 'smooth' method"

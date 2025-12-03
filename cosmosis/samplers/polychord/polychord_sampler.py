@@ -6,6 +6,7 @@ import os
 import numpy as np
 import sys
 from ...runtime.utils import mkdir
+from ...output import TextColumnOutput
 import warnings
 
 prior_type = ct.CFUNCTYPE(None, 
@@ -302,6 +303,78 @@ class PolychordSampler(ParallelSampler):
 
         self.converged = True
 
+        if self.is_master() and self.boost_posteriors:
+            self.make_boosted_posterior_file()
+
+    def make_boosted_posterior_file(self):
+        # two cases where there is nothing to boost
+        if not self.polychord_outfile_root:
+            return
+        if not self.boost_posteriors:
+            return
+
+        old = self.output
+
+        boosted_filename = os.path.join(self.base_dir, self.polychord_outfile_root + ".txt")
+
+        # This is a horribly awkward hack
+        if isinstance(self.output, TextColumnOutput):
+            # make sure everything is written out already
+            old.flush()
+            
+            new_output_filename = old.filename_base + "_boosted.txt"
+            main_output_info = TextColumnOutput.load_from_options({"filename":old._filename, "delimiter":old.delimiter})
+
+            _, _, metadata, comments, final_metadata = main_output_info
+            metadata = metadata[0]
+            comments = comments[0]
+            final_metadata = final_metadata[0]
+
+            # make a new output object
+            new = TextColumnOutput.from_options({"filename":new_output_filename})
+
+            # write the main bits of metadata from the output file
+            new.metadata("sampler", "polychord")
+            new.comment("NOTE: Boosted posterior file")
+            self.write_header(new)
+            for md in metadata:
+                new.metadata(md, metadata[md])
+            for c in comments:
+                new.comment(c)
+            
+            nsample = 0
+            # write the parameter rows from the old file
+            with open(boosted_filename, "r")  as f:
+                for line in f:
+                    values = [float(x) for x in line.split()]
+                    weight = values[0]
+                    like = -0.5 * values[1]
+                    params = values[2:]
+                    prior = params[-1]
+                    post = like + prior
+                    new.parameters(params, like, post, weight)
+                    nsample += 1
+
+            metadata = old._final_metadata.copy()
+            metadata["nsample"] = nsample
+            # This hasn't been written yet because the original output file has not been closed.
+            # so we have to use the saved one in the old object. The * is because a comment is also included
+            for key, value in metadata.items():
+                if isinstance(value, tuple):
+                    new.final(key, *value)
+                else:
+                    new.final(key, value)
+            new.final("log_z", self.log_z)
+            new.final("log_z_error", self.log_z_err)
+
+            # fake these first two, and add the completion marker.
+            new.final("evaluations", 0)
+            new.final("successes", 0)
+            new.final("complete", 1)
+            new.close()
+
+
+
     def output_params(self, ndead, nlive, npars, live, dead, logweights, log_z, log_z_err):
         # Polychord repeats output, but with changed weights, so reset to the start
         # of the chain to overwrite them.
@@ -319,6 +392,11 @@ class PolychordSampler(ParallelSampler):
             importance = np.exp(w)
             post = like + prior
             self.output.parameters(params, extra_vals, prior, like, post, importance)
+
+        # priors + likes
+        posts = data[:, self.ndim+self.nderived-1] + data[:, self.ndim+self.nderived+1]
+        self.distribution_hints.set_from_sample(data[:, :self.ndim], posts, log_weights=logw)
+
         self.output.final("nsample", ndead)
         self.output.flush()
 

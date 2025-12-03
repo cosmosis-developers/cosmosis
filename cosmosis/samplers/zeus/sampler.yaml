@@ -1,0 +1,42 @@
+name: "zeus"
+version: "1.0"
+parallel: parallel
+purpose: "Zeus ensemble MCMC sampling"
+url: "https://zeus-mcmc.readthedocs.io/"
+attribution: ["Minas Karamanis and contributors"]
+cite:
+    - "Karamanis, M., et al. \"zeus: A Python implementation of ensemble slice sampling for efficient Bayesian parameter inference\", MNRAS, 508, 3589-3603, 2021"
+
+explanation: >
+    Zeus is a pure-Python implementation of the Ensemble Slice Sampling method. 
+    It can be used to sample from multimodal and highly correlated distributions 
+    that are difficult for traditional MCMC methods.
+
+    Zeus uses an ensemble of walkers that explore the parameter space using slice 
+    sampling, which automatically adapts to the local structure of the distribution. 
+    This makes it particularly effective for complex posterior distributions.
+
+    The total number of samples generated will be walkers * samples.
+
+installation: >
+    Zeus needs to be installed separately:
+
+    pip install zeus-mcmc  # to install centrally, may require sudo
+    
+    pip install zeus-mcmc --user  # to install just for you
+
+# List of configuration options for this sampler
+params:
+    walkers: "(int) Number of walkers in the ensemble"
+    samples: "(int) Number of samples to generate per walker"
+    nsteps: "(int; default=50) Number of sample steps taken in between writing output"
+    random_start: "(bool; default=False) Whether to start walkers at random points in the prior"
+    start_points: "(string; default='') File containing starting points for the walkers"
+    covmat: "(string; default='') File containing covariance matrix for initializing walkers"
+    moves: "(string; default='differential') Type of moves to use for sampling"
+    tune: "(bool; default=True) Whether to tune the sampler parameters during burn-in"
+    tolerance: "(float; default=0.05) Tolerance for tuning convergence"
+    maxsteps: "(int; default=10000) Maximum number of steps for tuning"
+    patience: "(int; default=5) Patience parameter for tuning convergence"
+    maxiter: "(int; default=10000) Maximum number of iterations for sampling"
+    verbose: "(bool; default=False) Whether to print verbose output during sampling"

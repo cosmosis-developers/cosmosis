@@ -108,6 +108,7 @@ class KombineSampler(ParallelSampler):
 
         for (pos, post, prop, extra_info) in outputs:
             self.output_samples(pos, post, extra_info)
+            self.distribution_hints.set_from_sample(pos, post)
 
         # Set the starting positions for the next chunk of samples
         # to the last ones for this chunk

@@ -94,7 +94,7 @@ class MetropolisHastingsProcessor(PostProcessor):
 
 
 class PocoProcessor(MetropolisHastingsProcessor):
-	sampler = "poco"
+	sampler = "pocomc"
 	def reduced_col(self, name, stacked=True):
 		# PocoMC has the burn-in removed already,
 		# so there is nothing to remove here.

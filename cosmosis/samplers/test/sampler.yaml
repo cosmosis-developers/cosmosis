@@ -41,3 +41,5 @@ params:
     fatal_errors:  (bool; default=N)Any errors in the pipeline trigger an immediate failure so you can diagnose errors
     save_dir: (string; default='') Save all the data computed in the pipeline to this directory (can also end with .tgz to get a zipped form)
     graph: (string; default='') Requires pygraphviz.  Save a dot file describing the pipeline
+    analyze_fast_slow: (bool; default=False) Whether to analyze fast/slow parameter subspaces
+    print_log: (bool; default=False) Whether to print log information during execution

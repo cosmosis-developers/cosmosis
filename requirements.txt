@@ -13,4 +13,5 @@ mpi4py
 dulwich
 urllib3
 scikit-learn
-nautilus-sampler == 0.6.*
+nautilus-sampler >= 1.0.1
+Py-BOBYQA

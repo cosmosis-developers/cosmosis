@@ -31,6 +31,7 @@ class TextColumnOutput(OutputBase):
         dirname, _ = os.path.split(self._filename)
         mkdir(dirname)
 
+        self._any_written = False
         if resume and utils.file_exists_and_is_empty(self._filename):
             print("* You set resume=T but the file {} is empty so I will start afresh".format(self._filename))
             self._file = open(self._filename, "w")
@@ -41,6 +42,8 @@ class TextColumnOutput(OutputBase):
             # Jump to the end of the file
             self._file.seek(0,2)
             self.resumed = True
+            self._any_written = True
+
         else:
             if resume:
                 print("* Note: You set resume=T but the file {} does not exist so I will start a new one".format(self._filename))
@@ -112,12 +115,14 @@ In the last case you can set lock=F in the [output] section to disable this feat
                        "_%d" % (len(self._metadata))] = (comment,None)
 
     def _write_parameters(self, params):
+        self._any_written = True
         line = self.delimiter.join(str(x) for x in params) + '\n'
         self._file.write(line)
 
     def _write_final(self, key, value, comment=''):
         #I suppose we can put this at the end - why not?
-        self._final_metadata[key]= (value, comment)
+        if self._any_written:
+            self._final_metadata[key]= (value, comment)
 
     def _flush(self):
         self._file.flush()

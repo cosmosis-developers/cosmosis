@@ -20,13 +20,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [3.7, 3.8, 3.9, "3.10", 3.11]
-        os: [ubuntu-20.04, macos-latest]
+        python-version: [3.9, "3.10", 3.11, 3.12]
+        # macos13 runs on until and macos14 now runs on arm64
+        os: [ubuntu-latest, macos-latest]
         include:
-          - os: ubuntu-20.04
-            INSTALL_DEPS: sudo apt-get update && sudo apt-get -y install gfortran-7 swig libopenmpi-dev openmpi-bin libopenblas-dev && sudo ln -s `which gfortran-7` /usr/local/bin/gfortran
+          - os: ubuntu-latest
+            INSTALL_DEPS: sudo apt-get update && sudo apt-get -y install gfortran-11 swig libopenmpi-dev openmpi-bin libopenblas-dev && sudo ln -s `which gfortran-11` /usr/local/bin/gfortran
           - os: macos-latest
-            INSTALL_DEPS: brew update-reset && HOMEBREW_NO_AUTO_UPDATE=1  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install gcc swig libomp open-mpi openblas && if [ ! -f /usr/local/bin/gfortran ]; then ln -s /usr/local/bin/gfortran-$(brew list --versions gcc | awk '{print $2}' | cut -d. -f1) /usr/local/bin/gfortran; fi
+            # Different versions of homebrew put the gfortran in different
+            INSTALL_DEPS: >
+              brew update-reset 
+              && HOMEBREW_NO_AUTO_UPDATE=1  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install gcc swig libomp open-mpi openblas 
+              && COSMOSIS_GCC_VER=$(brew list --versions gcc | awk '{print $2}' | cut -d. -f1)
+              && GFORTRAN_PATH1=/usr/local/bin/gfortran
+              && GFORTRAN_PATH2=/usr/local/bin/gfortran-${COSMOSIS_GCC_VER}
+              && GFORTRAN_PATH3=/opt/homebrew/bin/gfortran
+              && GFORTRAN_PATH4=/opt/homebrew/bin/gfortran-${COSMOSIS_GCC_VER}
+              && if ! which -s gfortran
+              ; then if [ -f $GFORTRAN_PATH2 ]; then ln -s $GFORTRAN_PATH2 $GFORTRAN_PATH1; echo Linking gfortran from /usr/local
+              ;      elif [ -f $GFORTRAN_PATH4 ]; then ln -s $GFORTRAN_PATH4 $GFORTRAN_PATH3; echo Linking gfortran from /opt/homebrew
+              ;      else echo "gfortran not found" && exit 1
+              ;      fi
+              ; fi
+              && echo "gfortran now at $(which -a gfortran)"
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
@@ -34,35 +51,33 @@ jobs:
         submodules: true
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+        cache: 'pip' # caching pip dependencies
+        cache-dependency-path: 'setup.py'
 
     - name: Install dependencies
       run: ${{ matrix.INSTALL_DEPS }}
-
-    - uses: actions/cache@v3
-      name: Load pip cache
-      id: cache-pip
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/setup.py') }}
 
 
     - name: Install python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -v .
-        pip install --no-binary=mpi4py mpi4py astropy pocomc pytest pytest-cov
+        pip install -vv .
+        pip install --no-binary=mpi4py mpi4py astropy pytest pytest-cov getdist derivative numdifftools pocomc==1.2.6
 
     - name: Test with pytest
       run: |
         cosmosis --version
-        mkdir tmp && cd tmp && pytest --pyargs cosmosis --cov cosmosis --cov-report=xml
+        # This changes the logging behaviour to prevent an unwanted interaction
+        # with how pytest deals with logs:
+        export COSMOSIS_TESTING=1
+        mkdir tmp && cd tmp && pytest --pyargs cosmosis --cov cosmosis --cov-report=xml --durations=0
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v3
-      if: matrix.python-version == '3.9' && matrix.os == 'ubuntu-20.04'
+      if: matrix.python-version == '3.9' && matrix.os == 'ubuntu-latest'
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 

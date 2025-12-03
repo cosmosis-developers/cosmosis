@@ -31,11 +31,11 @@ params:
     n_networks: (integer; default=4) number of neural networks in each network ensemble
     n_batch: (integer; default=100) number of likelihood evaluations that are performed at each step
     seed: (integer, default=-1) random seed, no fixed seed is used if negative
-    random_state: (int; default=-1) random seed, negative values give a random random seed
     filepath: (string; default='None') file used for checkpointing, must have .hdf5 ending
     resume: (bool; default=False) if True, resume from previous run stored in `filepath`
     f_live: (float; default=0.01) live set evidence fraction when exploration phase terminates
     n_shell: (int; default=n_batch) minimum number of points in each shell
     n_eff: (float; default=10000.0) minimum effective sample size
+    n_like_max: (int; default=-1) maximum number of likelihood calls, negative values are interpreted as infinity
     discard_exploration: (bool; default=False) whether to discard points drawn in the exploration phase
     verbose: (bool; default=False) If true, print information about sampler progress

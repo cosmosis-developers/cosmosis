@@ -3,7 +3,6 @@
 u"""Definition of the :class:`DataBlock` class."""
 
 import ctypes as ct
-from . import lib
 from . import errors
 from . import dbt_types as types
 from ...utils import mkdir
@@ -15,6 +14,19 @@ import tarfile
 import io
 from io import StringIO, BytesIO
 import sys
+
+
+
+try:
+	from . import lib
+except:
+	_allow_unbuilt_import = os.environ.get("COSMOSIS_ALLOW_UNBUILT_IMPORT", "0") == "1"
+	if _allow_unbuilt_import:
+		print("Warning: importing cosmosis datablock without compiled library. "
+			  "You cannot use CosmoSIS properly; this is designed for building "
+			  "documentation", file=sys.stderr)
+	else:
+		raise
 
 
 
@@ -1311,17 +1323,34 @@ class DataBlock(object):
 				params.remove((section,name))
 		#Return a list of lists of parameter first used in each section
 		return params_by_module
+	
+	def get_all_parameter_use(self, params_of_interest):
+		u"""Analyze the log and figure out which parameter is in use in specific module"""
+		params_by_module = collections.OrderedDict()
+		current_module = []
+		#make a copy of the parameter list
+		params = [(p.section,p.name) for p in params_of_interest]
+		#now actually parse the log
+		current_module = None
+		current_name = "None"
+		for i in range(self.get_log_count()):
+			ptype, section, name, _ = self.get_log_entry(i)
+			if ptype=="MODULE-START":
+				# The previous current_module is already the
+				#last element in params_by_module (unless it's the
+				#very first one in which case we discard it because
+				#it is the parameters being set in the sampler)
+				current_module = []
+				current_name = section
+				params_by_module[current_name] = current_module
+			elif ptype=="READ-OK" and (section, name) in params and (section, name) not in current_module:
+				current_module.append((section, name))
+		#Return a list of lists of parameter used in each module
+		return params_by_module
 
 	@classmethod
 	def from_yaml(cls, filename_or_stream):
 		import yaml
-
-		# work around problem with py2 yaml on unicode
-		# https://stackoverflow.com/questions/27518976/how-can-i-get-pyyaml-safe-load-to-handle-python-unicode-tag
-		if sys.version_info[0]==2:
-			def constructor(loader, node):
-				return node.value
-			yaml.SafeLoader.add_constructor("tag:yaml.org,2002:python/unicode", constructor)
 
 		block = cls()
 		if isinstance(filename_or_stream, str):
@@ -1361,6 +1390,31 @@ class DataBlock(object):
 		yaml.dump(data, stream)
 
 	@classmethod
+	def from_pickle(cls, filename):
+		import pickle
+
+		block = cls()
+		with open(filename + ".pkl", 'rb') as f:
+			data = pickle.load(f)
+		for section, values in data.items():
+			for key, value in values.items():
+				block[section, key] = value
+		return block
+
+	def to_pickle(self, filename):
+		import pickle
+
+		data = {}
+		for section in self.sections():
+			data[section] = {}
+			for (_, key) in self.keys(section):
+				value = self[section, key]
+				data[section][key] = value
+
+		with open(filename + ".pkl", 'wb') as f:
+			pickle.dump(data, f)
+
+	@classmethod
 	def from_dict(cls, d):
 		b = cls()
 		for section, values in d.items():
@@ -1380,7 +1434,7 @@ class DataBlock(object):
 		return sio.read()
 
 	def __reduce__(self):
-		return (datablock_from_string, (self.to_string(),))
+		return (DataBlock.from_string, (self.to_string(),))
 	
 	def put_derivative(self, out_section, out_key, in_section, in_key, deriv):
 		sec = f"{out_section}_derivative"
@@ -1407,19 +1461,6 @@ class DataBlock(object):
 		sec = f"{out_section}_derivative"
 		key = f"{out_key}_wrt_{in_section}-{in_key}"
 		return self.has_value(sec, key)
-				
-
-
-
-
-# This is not needed under python 3, where, the __reduce__ method
-# above can return the class method, but it is under python 2.
-def datablock_from_string(s):
-	return DataBlock.from_string(s)
-
-
-
-
 
 
 class SectionOptions(object):

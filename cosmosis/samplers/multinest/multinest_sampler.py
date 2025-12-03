@@ -223,6 +223,10 @@ class MultinestSampler(ParallelSampler):
         self.log_z = ins_log_z if self.importance else log_z
         self.log_z_err = log_z_err
         data = np.array([posterior[i] for i in range(n*(self.npar+2))]).reshape((self.npar+2, n))
+
+        self.distribution_hints.set_from_sample(data[:self.ndim].T, data[self.npar - 1], weights=data[self.npar+1])
+
+        # Note the transposition here to get the right shape
         for row in data.T:
             params = row[:self.ndim]
             extra_vals = row[self.ndim:self.npar-2]

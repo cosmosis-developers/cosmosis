@@ -22,6 +22,8 @@ from .star.star_sampler import StarSampler
 from .apriori.apriori_sampler import AprioriSampler
 from .dynesty.dynesty_sampler import DynestySampler
 from .zeus.zeus_sampler import ZeusSampler
-from .poco.poco_sampler import PocoSampler
+from .poco.poco_sampler import PocoMCSampler
 from .nautilus.nautilus_sampler import NautilusSampler
 from .nuts.nuts_sampler import NUTSSampler
+from .latin_hypercube.latin_hypercube import LatinHypercubeSampler
+from .cosmopower_train.cosmopower_train import CosmoPowerSampler

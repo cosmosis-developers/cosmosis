@@ -49,6 +49,9 @@ class NautilusSampler(ParallelSampler):
             self.f_live = self.read_ini("f_live", float, 0.01)
             self.n_shell = self.read_ini("n_shell", int, self.n_batch)
             self.n_eff = self.read_ini("n_eff", float, 10000.0)
+            self.n_like_max = self.read_ini("n_like_max", int, -1)
+            if self.n_like_max < 0:
+                self.n_like_max = np.inf
             self.discard_exploration = self.read_ini(
                 "discard_exploration", bool, False)
             self.verbose = self.read_ini("verbose", bool, False)
@@ -92,21 +95,33 @@ class NautilusSampler(ParallelSampler):
         sampler.run(f_live=self.f_live,
                     n_shell=self.n_shell,
                     n_eff=self.n_eff,
+                    n_like_max=self.n_like_max,
                     discard_exploration=self.discard_exploration,
                     verbose=self.verbose)
 
-        for sample, logwt, logl, blob in zip(*sampler.posterior(return_blobs=True)):
-            blob = np.atleast_1d(blob)
-            prior = blob[0]
-            extra = blob[1:]
-            logp = logl + prior
-            self.output.parameters(sample, extra, logwt, prior, logp)
+        results = sampler.posterior(return_blobs=True)
+        if isinstance(results[3][0], float):
+            priors = results[3]
+        else:
+            priors = np.array([r[0] for r in results[3]])
 
-        self.output.final(
-            "efficiency", sampler.effective_sample_size() / sampler.n_like)
-        self.output.final("neff", sampler.effective_sample_size())
+        posts = results[2] + priors
+        self.distribution_hints.set_from_sample(results[0], posts, log_weights=results[1])
+
+        for sample, logwt, logl, blob in zip(*results):
+            if isinstance(blob, float):
+                prior = blob
+                self.output.parameters(sample, logwt, prior, logl + prior)
+            else:
+                prior = blob[0]
+                extra = list(blob)[1:]
+                self.output.parameters(sample, extra, logwt, prior, logl + prior)
+
+        self.output.final("efficiency", sampler.n_eff / sampler.n_like)
+        self.output.final("neff", sampler.n_eff)
         self.output.final("nsample", len(sampler.posterior()[0]))
-        self.output.final("log_z", sampler.evidence())
+        self.output.final("log_z", sampler.log_z)
+        self.output.final("log_z_error", 1.0 / np.sqrt(sampler.n_eff))
         self.converged = True
 
     def is_converged(self):

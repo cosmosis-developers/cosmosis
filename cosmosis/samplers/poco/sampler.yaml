@@ -1,22 +1,23 @@
-name: "poco"
-version: "0.1.1"
+name: "pocomc"
+version: "1.2.1"
 parallel: parallel
-purpose: "Preconditioned Monte Carlo with normalizing flows"
-url: "https://pocomc.readthedocs.io/"
+purpose: "Preconditioned Monte Carlo for Accelerated Bayesian Computation"
+url: "https://github.com/minaskar/pocomc"
 attribution: ["Minas Karamanis, David Nabergoj, Florian Beutler, John Peacock, Uros Seljak"]
 cite:
     - "https://arxiv.org/abs/2207.05660"
     - "https://arxiv.org/abs/2207.05652"
 
 explanation: >
-    pocoMC relies on the Preconditioned Monte Carlo algorithm which utilises a Normalising Flow 
-    in order to decorrelate the parameters of the posterior, and facilitates efficient sampling 
-    of probability distributions with non-trivial geometries.
+    pocoMC is a Python package for fast Bayesian posterior and model evidence estimation. It 
+    leverages the Preconditioned Monte Carlo (PMC) algorithm, offering significant speed 
+    improvements over traditional methods like MCMC and Nested Sampling. Ideal for large-scale 
+    scientific problems with expensive likelihood evaluations, non-linear correlations, and 
+    multimodality, pocoMC provides efficient and scalable posterior sampling and model evidence 
+    estimation. Widely used in cosmology and astronomy, pocoMC is user-friendly, flexible, and 
+    actively maintained.
 
     It generates both posterior samples and Bayesian evidences.
-
-    PocoMC does not currently support checkpointing (all the output appears at the end of the run)
-    or derived parameters.
     
 
 installation: >
@@ -27,14 +28,15 @@ installation: >
 
 # List of configuration options for this sampler
 params:
-    n_particles: (integer) Number of particles/walkers
-    nsample_add: (integer; default=0) Number of extra posterior samples to draw at the end 
-    threshold: (float; default=1.0) The threshold value for the (normalised) proposal scale parameter below which normalising flow preconditioning (NFP) is enabled. Default is to always enable.
-    scale: (bool; default=N) Whether to scale the distribution of particles to have zero mean and unit variance
-    rescale: (bool; default=N) Whether to rescale the distribution of particles to have zero mean and unit variance in every iteration
-    diagonal: (bool; default=T) Use a diagonal covariance matrix when rescaling instead of a full covariance
-    ess: (float; default=0.95) The effective sample size maintained during the run
-    gamma: (float; default=0.75) Threshold for the correlation coefficient that is used to adaptively determine the number of MCMC steps
-    n_min: (int; default=ndim/2) Minimum number of MCMC steps per iteration
-    n_max: (int; default=ndim*10) Maximum number of MCMC steps per iteration
+    n_effective: (integer, default=512) Number of effective particles/walkers. It should be at least twice the number of active particles.
+    n_active: (integer, default=256) Number of active particles/walkers. It should no more than half of the number of effective particles. It is recommended to be a multiple of the number of CPUs for optimal performance.
+    flow: (string) The type of normalizing flow to use. Default is "nsf6" (Neural Spline Flow with 6 transforms). Other options include "nsf3", "nsf12", "maf3", "maf6", "maf12" (Masked Autoregressive Flow).
+    precondition: (bool, default=True) Whether to use Normalizing Flow Preconditioning to accelerate sampling.
+    dynamic: (bool, default=True) Whether to use dynamic particle allocation.
+    n_total: (integer, default=4096) Total number of effective samples to generate. Higher values will increase the accuracy of the posterior estimate (recommended ~10000 for publication quality corner plots).
+    n_evidence: (integer, default=4096) Number of samples to generate for the Bayesian evidence calculation.
+    n_steps: (integer, default=None) Number of MCMC steps. This will be automatically adjusted based on the sampling efficiency. Default is `n_steps=n_dim`. Larger values will provide more robust results at higher computational cost.
+    n_max_steps: (integer, default=None) Maximum number of MCMC steps. Default is `n_max_steps=10*n_dim`. This should be greater than `n_steps`.
+    save_every: (int, default=None) Save the state of the sampler every `save_every` iterations. If not provided, the sampler will not save intermediate states.
     seed: (int; default=0) A random seed for reproducibility. Default is to generate automatically.
+    progress: (bool, default=True) Whether to show a progress bar during sampling.

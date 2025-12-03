@@ -24,5 +24,5 @@ params:
     samples: (integer) total sample steps taken 
     nsteps: (integer) number of sample steps taken in between writing output
     update_interval: (integer) number of steps taken in between updating the posterior 
-    start_file: (string; default='') a file containing starting points for the walkers. If not specified walkers are initialized randomly from the prior distribution.
+    start_points: (string; default='') a file containing starting points for the walkers. If not specified walkers are initialized randomly from the prior distribution.
     random_start: (bool, default=False) whether to start points randomly thooughout the prior instead of a ball

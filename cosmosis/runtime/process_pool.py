@@ -25,6 +25,8 @@ class Pool(object):
     def gather(self, data):
         return self.data
 
+    def allreduce(self, data):
+        return self.data
 
     def __enter__(self):
         return self

@@ -1,0 +1,7 @@
+runs:
+  - name: broken-campaign
+    base: cosmosis/test/example.ini
+    params:
+      - pipeline.debug = T
+    params:
+      - pipeline.debug = F

@@ -1,6 +1,6 @@
 from ..runtime.attribution import PipelineAttribution
 from ..runtime.utils import get_git_revision
-from ..runtime import Inifile
+from ..runtime import Inifile, logs
 from ..output import InMemoryOutput
 import datetime
 import platform
@@ -54,19 +54,23 @@ class Sampler(metaclass=RegisteredSampler):
         self.distribution_hints = Hints()
         self.write_header()
 
-    def write_header(self):
-        if self.output:
-            for p in self.pipeline.output_names():
-                self.output.add_column(p, float)
-            for p,ptype in self.sampler_outputs:
-                self.output.add_column(p, ptype)
-            self.output.metadata("n_varied", len(self.pipeline.varied_params))
-            self.attribution.write_output(self.output)
-            for key, value in self.collect_run_metadata().items():
-                self.output.metadata(key, value)
+    def write_header(self, output=None):
+        if output is None:
+            output = self.output
+        if output is None:
+            return
+
+        for p in self.pipeline.output_names():
+            output.add_column(p, float)
+        for p,ptype in self.sampler_outputs:
+            output.add_column(p, ptype)
+        output.metadata("n_varied", len(self.pipeline.varied_params))
+        self.attribution.write_output(output)
+        for key, value in self.collect_run_metadata().items():
+            output.metadata(key, value)
         blinding_header = self.ini.getboolean("output","blinding-header", fallback=False)
-        if blinding_header and self.output:
-            self.output.blinding_header()
+        if blinding_header:
+            output.blinding_header()
 
     def collect_run_metadata(self):
         info = {
@@ -154,7 +158,7 @@ class Sampler(metaclass=RegisteredSampler):
     @classmethod
     def get_sampler(cls, name):
         try:
-            cls.registry[name.lower()]
+            return cls.registry[name.lower()]
         except KeyError:
             raise KeyError(f"Unknown sampler {name}")
 
@@ -165,11 +169,135 @@ class Sampler(metaclass=RegisteredSampler):
     def is_converged(self):
         return False
     
-    def start_estimate(self):
+
+
+    def start_estimate(self, method=None, input_source=None, prefer_random=False, quiet=False):
+        """
+        Select a starting parameter set for the sampler.
+
+        The method is chosen by looking at the start_method and start_input
+        options in the sampler's ini file.
+
+        This can be:
+        - the peak from a previous sampler (default if available)
+        - the defined starting position in the values file (if start_method not set)
+        - a random point in the prior (if start_method is "prior")
+        - a random point from a chain file (if start_method "chain-sample")
+        - the last point from a chain file (if start_method is "chain-last")
+        - a point from a covariance matrix (if start_method is "cov")
+
+        Returns
+        -------
+        start : np.ndarray
+        """
+        if method is None:
+            method = self.read_ini("start_method", str, "")
+        if input_source is None:
+            input_source = self.read_ini("start_input", str, "")
+
+        if method.startswith("chain"):
+            if not input_source:
+                raise ValueError("If you set the start_method to 'chain-best' you should not also set start_input to the name of a chain file")
+
+            with open(input_source) as f:
+                maybe_colnames = f.readline().strip('#').split()
+                has_post = 'post' in maybe_colnames
+                has_like = 'like' in maybe_colnames
+
+            # User can just specify "chain" and we will try to guess.
+            # We may want to draw a sample if we are using an ensemble-based
+            # sampling method like emcee.
+            if method == "chain" and not self.distribution_hints.has_peak():
+                if prefer_random:
+                    method = "chain-sample"
+                elif has_post:
+                    method = "chain-maxpost"
+                elif has_like:
+                    method = "chain-maxlike"
+                else:
+                    method = "chain-last"
+
+        # Option 1: if the user is chaining samplers then we always start at the peak
+        # from the previous sampler, if available.  Otherwise, why was the user chaining samplers?
         if self.distribution_hints.has_peak():
+            if not quiet:
+                logs.overview("Starting at max-posterior point from previous sampler")
             start = self.distribution_hints.get_peak()
+            if prefer_random:
+                covmat = self.distribution_hints.get_cov()
+                start = sample_ellipsoid(start, covmat)
+
+        # Option 2: start from a random point following the prior distribution
+        elif method == "prior":
+            print("Starting at a random point in the prior")
+            if not quiet:
+                logs.overview("Starting at a random point in the prior")
+            start = self.pipeline.randomized_start()
+
+        # Option 3: start from the last point in a previous chain.
+        elif method == "chain-last":
+            if not quiet:
+                logs.overview(f"Starting from last point in file {input_source}")
+            start = np.genfromtxt(input_source, invalid_raise=False)[-1, :self.pipeline.nvaried]
+
+        # Option 4: start from a random sample of points in a previous chain.  This only
+        # works if we want an ensemble of points. Should really check that.
+        elif method == "chain-sample":
+            if not quiet:
+                logs.overview(f"Starting at random sample of points from chain file {input_source}")
+            # assume the chain file has a header. check for weight or log_weight columns
+            # otherwise assume that the columns match the varied parameters
+            data = np.genfromtxt(input_source, invalid_raise=False)
+            with open(input_source) as f:
+                maybe_colnames = f.readline().strip('#').split()
+            if 'weight' in maybe_colnames:
+                weight_index = maybe_colnames.index('weight')
+                weight = data[:, weight_index]
+            elif 'log_weight' in maybe_colnames:
+                log_weight_index = maybe_colnames.index('log_weight')
+                weight = np.exp(data[:, log_weight_index] - data[:, log_weight_index].max())
+            else:
+                weight = np.ones(len(data))
+            weight /= weight.sum()
+            index = np.random.choice(len(data), p=weight)
+            start = data[index, :self.pipeline.nvaried]
+
+        # Option 5: start from a random sample of points drawn from the covariance of a
+        # previous chain.
+        elif method == "cov":
+            if not quiet:
+                logs.overview(f"Starting at a random sample of points from the covariance of chain {input_source}")
+            if not input_source:
+                raise ValueError("If you set the start_method to 'cov' you should not also set start_input to the name of a covariance file")
+            covmat = np.loadtxt(input_source)[:self.pipeline.nvaried, :self.pipeline.nvaried]
+            start = sample_ellipsoid(self.pipeline.start_vector(), covmat)[0]
+
+        # Option 6: start from the best-fitting point in a previous chain
+        elif method in ["chain-maxpost", "chain-maxlike"]:
+            data = np.genfromtxt(input_source, invalid_raise=False)
+
+            # read the column names again.  A bit wasteful as we may
+            # have done it already, but it's only a single line.
+            with open(input_source) as f:
+                maybe_colnames = f.readline().strip('#').split()
+
+            if method == "chain-maxpost":
+                if not quiet:
+                    logs.overview(f"Starting at best posterior point from chain file {input_source}")
+                col_index = maybe_colnames.index('post')
+            else:
+                if not quiet:
+                    logs.overview(f"Starting at best likelihood point from chain file {input_source}")
+                col_index = maybe_colnames.index('like')
+
+            best_row = data[:, col_index].argmax()
+            start = data[best_row, :self.pipeline.nvaried]
+
+        # Fallback option 7: just start at the point specified in the parameter file.
         else:
+            # default method is just to use a single starting point
             start = self.pipeline.start_vector()
+
         return start
 
     def cov_estimate(self):

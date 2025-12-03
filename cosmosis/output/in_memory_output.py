@@ -38,5 +38,8 @@ class InMemoryOutput(OutputBase):
     @classmethod
     def load_from_options(cls, options):
         raise ValueError("No output was saved from this run")
+    
+    def reset_to_chain_start(self):
+        self.rows = []
 
 

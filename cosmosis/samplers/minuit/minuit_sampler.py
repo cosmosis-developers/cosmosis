@@ -28,15 +28,16 @@ libname=os.path.join(os.path.split(__file__)[0],"minuit_wrapper.so")
 class MinuitSampler(ParallelSampler):
     needs_output = True
     needs_parallel_output = False
+    libminuit_name = libname
     libminuit = None
     sampler_outputs = [("prior", float), ("post", float)]
 
     def config(self):
         self.converged = False
         if MinuitSampler.libminuit is None:
-            if not os.path.exists(libname):
+            if not os.path.exists(self.libminuit_name):
                 raise ValueError("The CosmoSIS minuit2 wrapper was not compiled.  If you installed CosmoSIS manually you need the library minuit2 to use this sampler. See the wiki for more details.")
-            MinuitSampler.libminuit = ct.cdll.LoadLibrary(libname)
+            MinuitSampler.libminuit = ct.cdll.LoadLibrary(self.libminuit_name)
         self.maxiter = self.read_ini("maxiter", int, 1000)
         self.save_dir = self.read_ini("save_dir", str, "")
         self.save_cov = self.read_ini("save_cov", str, "")
@@ -51,7 +52,7 @@ class MinuitSampler(ParallelSampler):
         self.width_estimate = self.read_ini("width_estimate", float, 0.05)
         self.tolerance = self.read_ini("tolerance", float, 50.0)
         self.neval = 0
-        self.param_vector = self.pipeline.start_vector()  #initial value
+        self.param_vector = None
 
         strategy = {
             "fast":0,
@@ -98,6 +99,9 @@ class MinuitSampler(ParallelSampler):
 
 
     def execute(self):
+        if self.param_vector is None:
+            self.param_vector = self.start_estimate()
+
         #Run an iteration of minuit
         param_vector, param_names, results, status, made_cov, cov_vector = self.sample()
 
@@ -110,7 +114,7 @@ class MinuitSampler(ParallelSampler):
             logs.overview("SUCCESS: Minuit has converged!")
             self.save_results(param_vector, param_names, results)
             self.converged = True
-            self.distribution_hints.set_peak(param_vector)
+            self.distribution_hints.set_peak(param_vector, results.post)
 
             if made_cov:
                 cov_matrix = cov_vector.reshape((self.ndim, self.ndim))
