@@ -8,6 +8,7 @@ include ${COSMOSIS_SRC_DIR}/config/subdirs.mk
 
 SUBDIRS=datablock samplers
 
-ifneq (${COSMOSIS_JULIA_FLAGS},"")
+ifneq (${COSMOSIS_JULIA_FLAGS},)
+$(info Including Julia modules in build)
 SUBDIRS+=runtime/julia_modules
 endif

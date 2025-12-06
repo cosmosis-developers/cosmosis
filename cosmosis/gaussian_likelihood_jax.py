@@ -1,4 +1,5 @@
 from .jax import tools as jax_tools
+from jax.tree_util import register_pytree_node_class
 import jax.numpy as jnp
 from functools import partial
 import jax
@@ -46,6 +47,7 @@ def _do_likelihood(theory_x, theory_y, data_x, data_y, inv_cov, log_det):
 _do_likelihood_jac = jax.jacrev(_do_likelihood, argnums=[1])
 
 
+@register_pytree_node_class
 class GaussianLikelihood:
     """
     Gaussian likelihood with a fixed covariance.  
@@ -63,46 +65,68 @@ class GaussianLikelihood:
     #each cosmology instead of once at the start
     constant_covariance = True
 
-    def __init__(self, options):
-        self.options=options
-        self.data_x, self.data_y = self.build_data()
-        self.likelihood_only = options.get_bool('likelihood_only', False)
+    def __init__(self, data_x, data_y, cov, inv_cov, log_det_constant, kind, likelihood_only=False, **kwargs):
+        self.data_x = jnp.array(data_x)
+        self.data_y = jnp.array(data_y)
+        self.cov = jnp.array(cov)
+        self.inv_cov = jnp.array(inv_cov)
+        self.log_det_constant = log_det_constant
+        self.kind = kind
+        self.likelihood_only = likelihood_only
+        for key in ["x_section", "x_name", "y_section", "y_name", "like_name"]:
+            if key in kwargs:
+                setattr(self, key, kwargs[key])
 
-        if self.constant_covariance:
-            self.cov = self.build_covariance()
-            self.inv_cov = self.build_inverse_covariance()
+    @classmethod
+    def build(cls, options):
+        data_x, data_y = cls.build_data(options)
+        likelihood_only = options.get_bool('likelihood_only', False)
 
-            if not self.likelihood_only:
-                self.chol = jnp.linalg.cholesky(self.cov)
+        if cls.constant_covariance:
+            cov = cls.build_covariance(options)
+            inv_cov = cls.build_inverse_covariance(options)
+
+            if not likelihood_only:
+                chol = jnp.linalg.cholesky(cov)
 
 
             # We may want to include the normalization of the likelihood
             # via the log |C| term.
-            include_norm = self.options.get_bool("include_norm", False)
+            include_norm = options.get_bool("include_norm", False)
             if include_norm:
                 # We have no datablock here so we don't want to call any subclass method
-                self.log_det_constant = GaussianLikelihood.extract_covariance_log_determinant(self,None)
-                print("Including -0.5*|C| normalization in {} likelihood where |C| = {}".format(self.like_name, self.log_det_constant))
+                _, log_inv_det = jnp.linalg.slogdet(inv_cov)
+                log_det_constant = -log_inv_det
+                print("Including -0.5*|C| normalization in {} likelihood where |C| = {}".format(cls.like_name, log_det_constant))
             else:
-                self.log_det_constant = 0.0
+                log_det_constant = 0.0
+        else:
+            raise ValueError("You have set constant_covariance=False in a Gaussian likelihood. This does not work for JAX yet.")
 
         #Interpolation type, when interpolating into theory vectors
-        self.kind = self.options.get_string("kind", "cubic")
+        kind = options.get_string("kind", "cubic")
 
         #Allow over-riding where the inputs come from in 
         #the options section
+        overrides = {}
         if options.has_value("x_section"):
-            self.x_section = options['x_section']
+            overrides["x_section"] = options['x_section']
         if options.has_value("y_section"):
-            self.y_section = options['y_section']
+            overrides["y_section"] = options['y_section']
         if options.has_value("x_name"):
-            self.x_name = options['x_name']
+            overrides["x_name"] = options['x_name']
         if options.has_value("y_name"):
-            self.y_name = options['y_name']
+            overrides["y_name"] = options['y_name']
         if options.has_value("like_name"):
-            self.like_name = options['like_name']
+            overrides["like_name"] = options['like_name']
 
+        likelihood = cls(
+            data_x, data_y, cov, inv_cov, log_det_constant, kind,
+            likelihood_only=likelihood_only,
+            **overrides
+        )
 
+        return likelihood
 
     def build_data(self):
         """
@@ -112,11 +136,7 @@ class GaussianLikelihood:
         raise RuntimeError("Your Gaussian covariance code needs to "
             "over-ride the build_data method so it knows how to "
             "load the observed data")
-        #using info in self.options,
-        #like filenames etc,
-        #build x to which we must interpolate
-        #return x, y
-    
+
     def build_covariance(self):
         """
         Override the build_covariance method to read or generate 
@@ -127,9 +147,7 @@ class GaussianLikelihood:
             "load the data covariance (or set constant_covariance=False and "
             "over-ride the extract_covariance method)")
 
-        #using info in self.options,
-        #like filenames etc,
-        #build covariance
+
 
     def build_inverse_covariance(self):
         """
@@ -234,6 +252,8 @@ class GaussianLikelihood:
         block[names.data_vector, self.like_name + "_data"] = np.array(self.data_y)
         block[names.data_vector, self.like_name + "_inverse_covariance"] = np.array(inv_cov)
 
+        return block
+
 
     def simulate_data_vector(self, x):
         "Simulate a data vector by adding a realization of the covariance to the mean"
@@ -254,7 +274,7 @@ class GaussianLikelihood:
 
         def setup(options):
             options = SectionOptions(options)
-            likelihoodCalculator = cls(options)
+            likelihoodCalculator = cls.build(options)
             return likelihoodCalculator
 
         def execute(block, config):
@@ -274,64 +294,32 @@ class GaussianLikelihood:
         return FunctionModule(name, setup, execute, cleanup)
 
 
-# class SingleValueGaussianLikelihood(GaussianLikelihood):
-#     """
-#     A Gaussian likelihood whos input is a single calculated value
-#     not a vector
-#     """
-#     name = MISSING
-#     section = MISSING
-#     like_name = MISSING
-#     mean = None
-#     sigma = None
-#     def __init__(self, options):
-#         self.options=options
 
-#         #First try getting the value from the class itself
-#         mean, sigma = self.build_data()
+    def tree_flatten(self):
+        children = (self.data_x, self.data_y, self.cov, self.inv_cov)
+        aux_data = {
+            "log_det_constant": self.log_det_constant,
+            "likelihood_only": self.likelihood_only,
+            "kind": self.kind,
+            "x_section": self.x_section,
+            "x_name": self.x_name,
+            "y_section": self.y_section,
+            "y_name": self.y_name,
+            "like_name": self.like_name
+        }
+        return children, aux_data
 
-#         if options.has_value("mean"):
-#             mean = options["mean"]
-#         if options.has_value("sigma"):
-#             sigma = options["sigma"]
-
-#         if sigma is None or mean is None:
-#             raise ValueError("Need to specify Gaussian mean/sigma for '{0}' \
-#                 either in class definition, build_data method, or in the ini \
-#                 file".format(self.like_name))
-#         if options.has_value("like_name"):
-#             self.like_name = options["like_name"]
-#         print('Likelihood "{0}" will be Gaussian {1} +/- {2} '.format(self.like_name, mean, sigma))
-#         self.data_y = np.array([mean])
-#         self.cov = np.array([[sigma**2]])
-#         self.inv_cov = np.array([[sigma**-2]])
-
-#         include_norm = self.options.get_bool("include_norm", False)
-#         if include_norm:
-#             # We have no datablock here so we don't want to call any subclass method
-#             self.log_det_constant = GaussianLikelihood.extract_covariance_log_determinant(self,None)
-#             print("Including -0.5*|C| normalization in {} likelihood where log|C| = {}".format(self.like_name, self.log_det_constant))
-#         else:
-#             self.log_det_constant = 0.0
-
-#         self.likelihood_only = options.get_bool('likelihood_only', False)
-
-#         if not self.likelihood_only:
-#             self.chol = sigma
-
-
-#     def build_data(self):
-#         """Sub-classes can over-ride this if they wish, to generate 
-#         the data point in a more complex way"""
-#         return self.mean, self.sigma
-
-#     def build_covariance(self):
-#         """This method is only defined here to satisfy the superclass requirements. 
-#         There is no point over-riding it"""
-#         raise RuntimeError("Internal cosmosis error in SingleValueGaussianLikelihood")
-
-#     def extract_theory_points(self, block):
-#         "Extract relevant theory from block and get theory at data x values"
-#         return np.atleast_1d(block[self.section, self.name])
-
-
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        data_x, data_y, cov, inv_cov = children
+        return cls(
+            data_x, data_y, cov, inv_cov, 
+            aux_data["log_det_constant"],
+            aux_data["kind"],
+            likelihood_only=aux_data["likelihood_only"],
+            x_section=aux_data["x_section"],
+            x_name=aux_data["x_name"],
+            y_section=aux_data["y_section"],
+            y_name=aux_data["y_name"],
+            like_name=aux_data["like_name"]
+        )
