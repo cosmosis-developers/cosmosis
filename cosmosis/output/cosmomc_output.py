@@ -9,7 +9,7 @@ PARAM_NAME = '.paramnames'
 
 
 class CosmoMCOutput(TextColumnOutput):
-    def __init__(self, filename, rank=0, nchain=1, delimiter='    ', lock=True, resume=False):
+    def __init__(self, filename, rank=0, nchain=1, delimiter='    ', lock=True, resume=False, blinding_offset_file=None):
         super(CosmoMCOutput, self).__init__(filename, rank, nchain, '', lock=lock, resume=resume)
         if filename.endswith(self.FILE_EXTENSION):
             filename = filename[:-len(self.FILE_EXTENSION)]
@@ -19,6 +19,10 @@ class CosmoMCOutput(TextColumnOutput):
             self._paramfile = None
         self._last_params = None
         self._multiplicity = 0
+        if blinding_offset_file is not None:
+            self._blinding_offsets = np.load(blinding_offset_file)
+        else:
+            self._blinding_offsets = None
 
     def _close(self):
         self._write_parameters_multiplicity()
@@ -97,5 +101,6 @@ class CosmoMCOutput(TextColumnOutput):
     def from_options(cls, options, resume=False):
         if resume:
             raise ValueError("Cannot resume from cosmomc files yet")
-        return super(CosmoMCOutput,cls).from_options(options, resume=False)
+        blinding_offset_file = options.get('blinding_offsets', None)
+        return super(CosmoMCOutput,cls).from_options(options, resume=False, blinding_offset_file=blinding_offset_file)
 
