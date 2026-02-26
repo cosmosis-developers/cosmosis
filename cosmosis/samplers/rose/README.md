@@ -2,7 +2,9 @@
 
 **ROSE** (Rapid Online Sampling Emulator) is an emulator-accelerated MCMC sampler for CosmoSIS that uses neural networks to speed up cosmological parameter estimation by 10–1000×.
 
-![LSST 3×2pt: σ₈–Ωₘ constraints with ROSE](draft/s8_omegam_lsst_3x2pt_rose.png)
+<div align="center">
+<img src="draft/s8_omegam_lsst_3x2pt_rose.png" width="50%" alt="LSST 3×2pt: σ₈–Ωₘ constraints with ROSE" />
+</div>
 
 ## Quick Start
 
