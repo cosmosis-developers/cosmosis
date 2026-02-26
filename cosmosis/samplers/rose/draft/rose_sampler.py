@@ -1,5 +1,5 @@
 """
-EmugenSampler: An emulator-accelerated MCMC sampler for CosmoSIS
+ROSE: Rapid Online Sampling Emulator for CosmoSIS
 
 This module implements an iterative emulator-based sampler that uses neural networks
 to accelerate cosmological parameter estimation. The sampler alternates between:
@@ -28,6 +28,8 @@ from ...output.text_output import TextColumnOutput
 from .. import ParallelSampler
 from cosmosis.gaussian_likelihood import GaussianLikelihood
 from ...runtime import LikelihoodPipeline, ClassModule
+
+from .nn_emulator import NNEmulator
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -81,18 +83,12 @@ def task(p: np.ndarray, return_all: bool = False) -> Optional[Union[Tuple, Any]]
                            inv_covariance, error_vectors, block)
         None if pipeline execution failed
     """
-    try:
-        r = sampler.pipeline.run_results(p)
-        block = r.block
-        
-        if block is None:
-            logger.warning(f"Pipeline execution failed for parameters: {p}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Pipeline execution error for parameters {p}: {e}")
+    r = sampler.pipeline.run_results(p)
+    block = r.block
+    if block is None:
+        logger.warning(f"(Within Task) Pipeline execution failed for parameters: {p}")
         return None
-    
+
     data_vectors_theory = []
     data_vectors = []
     error_vectors = []
@@ -148,7 +144,7 @@ def task(p: np.ndarray, return_all: bool = False) -> Optional[Union[Tuple, Any]]
 
 
 def log_probability_function(u: np.ndarray, tempering: float) -> Tuple[float, Tuple[float, List[float]]]:
-    """Log probability function for emcee sampler using emulated pipeline.
+    """Log probability function using emulated pipeline.
     
     Args:
         u: Parameter vector in unit hypercube [0,1]^ndim
@@ -164,17 +160,11 @@ def log_probability_function(u: np.ndarray, tempering: float) -> Tuple[float, Tu
         p = sampler.pipeline.denormalize_vector_from_prior(u)
     except ValueError:
         # Parameters outside prior bounds
-        n_extra = sampler.pipeline.number_extra
-        return (-np.inf, (-np.inf, [np.nan] * n_extra))
-    
-    try:
-        # Run emulated pipeline
-        r = sampler.emu_pipeline.run_results(p)
-        return tempering * r.post, (r.prior, r.extra)
-    except Exception as e:
-        logger.error(f"Emulated pipeline execution failed for parameters {p}: {e}")
-        n_extra = sampler.pipeline.number_extra
-        return (-np.inf, (-np.inf, [np.nan] * n_extra))
+        return (-np.inf, (-np.inf, [np.nan for i in range(sampler.pipeline.number_extra)]))
+    # Run emulated pipeline
+    r = sampler.emu_pipeline.run_results(p)
+    return tempering * r.post, (r.prior, r.extra)
+
 
 
 class EmulatorModule(ClassModule):
@@ -186,19 +176,7 @@ class EmulatorModule(ClassModule):
     """
     
     def __init__(self, options: Dict[str, Any]) -> None:
-        """Initialize emulator module.
-        
-        Args:
-            options: Configuration options (currently unused)
-        """
-        super().__init__(options)
-        self.emulator = None
-        self.pipeline = None
-        self.fixed_inputs = {}
-        self.inputs = []
-        self.outputs = []
-        self.sizes = []
-        self.nn_model = None
+        pass
 
     def set_emulator_info(self, info: Dict[str, Any]) -> None:
         """Set emulator configuration information.
@@ -240,37 +218,34 @@ class EmulatorModule(ClassModule):
         """
         if self.emulator is None:
             raise RuntimeError("Emulator not set - call set_emulator() first")
+
+        # Prepare input dictionary for emulator
+        # Use '--' separator to avoid conflicts with parameter names
+        p_dict = {f"{sec}--{key}": block[sec, key] for (sec, key) in self.inputs}
         
-        try:
-            # Prepare input dictionary for emulator
-            # Use '--' separator to avoid conflicts with parameter names
-            p_dict = {f"{sec}--{key}": block[sec, key] for (sec, key) in self.inputs}
-            
-            # Get emulator prediction
-            prediction = self.emulator.predict(p_dict)[0]
-            
-            # Populate outputs
-            if not self.outputs:  # Empty outputs means full data vector
-                block["data_vector", "theory_emulated"] = prediction
-            else:
-                # Split prediction into specified output components
-                start_idx = 0
-                for (sec, key), size in zip(self.outputs, self.sizes):
-                    block[sec, key] = prediction[start_idx:start_idx + size]
-                    start_idx += size
+        # Get emulator prediction
+        prediction = self.emulator.predict(p_dict)[0]
+        
+        # Populate outputs
+        if self.outputs==[]:  # Empty outputs means full data vector
+            block["data_vector", "theory_emulated"] = prediction
+        else:
+            # Split prediction into specified output components
+            start_idx = 0
+            for (sec, key), size in zip(self.outputs, self.sizes):
+                block[sec, key] = prediction[start_idx:start_idx + size]
+                start_idx += size
 
-            # Set fixed inputs that don't vary during emulation
-            for (sec, key), val in self.fixed_inputs.items():
-                block[sec, key] = val
-                
-            return 0
+        # Set fixed inputs that don't vary during emulation
+        for (sec, key), val in self.fixed_inputs.items():
+            block[sec, key] = val
             
-        except Exception as e:
-            logger.error(f"Emulator execution failed: {e}")
-            raise RuntimeError(f"Emulator prediction failed: {e}")
+        return 0
+            
 
 
-class EmugenSampler(ParallelSampler):
+
+class RoseSampler(ParallelSampler):
     """Emulator-accelerated MCMC sampler for CosmoSIS.
     
     This sampler uses neural network emulators to speed up cosmological parameter
@@ -469,7 +444,7 @@ class EmugenSampler(ParallelSampler):
         # Neural network options (currently fixed)
         self.data_trafo = self.read_ini("data_trafo", str, "log_norm")
         self.n_pca = self.read_ini("n_pca", int, 32)
-        self.loss_function = self.read_ini("loss_function", str, "default")
+        self.loss_function = self.read_ini("loss_function", str, "standard")
         
         if self.loss_function.startswith("weighted") and self.keys:
             raise ValueError("Weighted loss function can only be used with full data vector "
@@ -484,9 +459,8 @@ class EmugenSampler(ParallelSampler):
                 self.output.add_column("log_weight", float)
         
         # Neural network architecture
-        self.nn_model = 'MLP'  # Could be made configurable in future
-        if self.nn_model not in ['MLP', 'ResMLP']:
-            raise ValueError(f"Unknown nn_model '{self.nn_model}' - should be 'MLP' or 'ResMLP'")
+        self.nn_model = self.read_ini("nn_model", str, 'MLP')  # Could be made configurable in future
+        
 
     def generate_initial_sample(self) -> None:
         """Generate initial training sample using Latin Hypercube sampling.
@@ -591,7 +565,7 @@ class EmugenSampler(ParallelSampler):
         3. Trains the neural network
         4. Updates the emulated pipeline
         """
-        from .cosmopower import CPEmulator
+        
         
         n_samp, n_in = self.unit_sample.shape
         n_out = self.sample_data_vectors.shape[1]
@@ -611,10 +585,11 @@ class EmugenSampler(ParallelSampler):
         model_parameters = [str(param) for param in self.pipeline.varied_params]
         logger.info(f"Model parameters: {model_parameters}")
         
-        emu = CPEmulator(
+        emu = NNEmulator(
             model_parameters, 
             np.arange(n_out), 
             self.nn_model, 
+            self.loss_function,
             self.iterations + 1,
             self.data_trafo, 
             self.n_pca, 
@@ -646,53 +621,38 @@ class EmugenSampler(ParallelSampler):
         Expected file structure:
         - Base model: {load_emu_filename} (e.g., emumodel_5)
         - Info file: {load_emu_filename}.npz (e.g., emumodel_5.npz)
-        - Means file: {load_emu_filename}_means.pkl (e.g., emumodel_5_means.pkl)
         """
-        from .cosmopower import CPEmulator
         
         # Check for required files
         info_file = self.load_emu_filename + ".npz"
-        means_file = self.load_emu_filename + "_means.pkl"
         
         if not os.path.exists(info_file):
             raise FileNotFoundError(f"Emulator info file not found: {info_file}")
-        if not os.path.exists(means_file):
-            raise FileNotFoundError(f"Emulator means file not found: {means_file}")
-        
+
         logger.info(f"Loading pre-trained emulator from {self.load_emu_filename}")
         
         # Load info to get the correct output size and parameters
-        try:
-            with np.load(info_file) as data:
-                # Get the actual parameters used in training
-                if 'parameters' in data:
-                    model_parameters = list(data['parameters'])
-                    logger.info(f"Using parameters from trained model: {model_parameters}")
-                else:
-                    # Fallback to pipeline parameters
-                    model_parameters = [str(param) for param in self.pipeline.varied_params]
-                    logger.warning("Could not find parameters in info file, using pipeline parameters")
-                
-                # Get output size from modes
-                if 'modes' in data:
-                    output_size = len(data['modes'])
-                    logger.info(f"Output size from modes: {output_size}")
-                elif 'output_size' in data:
-                    output_size = int(data['output_size'])
-                elif 'n_out' in data:
-                    output_size = int(data['n_out'])
-                elif 'n_modes' in data:
-                    output_size = int(data['n_modes'])
-                else:
-                    # Fallback: try to infer from other data
-                    logger.warning("Could not determine output size from info file, using default")
-                    output_size = 1000  # Default fallback
-        except Exception as e:
-            logger.warning(f"Could not load info file {info_file}: {e}, using defaults")
-            model_parameters = [str(param) for param in self.pipeline.varied_params]
-            output_size = 1000
+        with np.load(info_file) as data:
+            # Get the actual parameters used in training
+            if 'parameters' in data:
+                model_parameters = list(data['parameters'])
+                logger.info(f"Using parameters from trained model: {model_parameters}")
+            else:
+                # Fallback to pipeline parameters
+                model_parameters = [str(param) for param in self.pipeline.varied_params]
+                logger.warning("Could not find parameters in info file, using pipeline parameters")
+            
+            # Get output size from modes
+            if 'modes' in data:
+                output_size = len(data['modes'])
+                logger.info(f"Output size from modes: {output_size}")
+            else:
+                # Fallback: try to infer from other data
+                logger.warning("Could not determine output size from info file, using default")
+                output_size = 1000  # Default fallback
+
         
-        emu = CPEmulator(model_parameters, np.ones(output_size))
+        emu = NNEmulator(model_parameters, np.ones(output_size))
         
         # Load trained model - CosmoPowerNN expects the .npz file
         emu.load(self.load_emu_filename)
@@ -714,20 +674,16 @@ class EmugenSampler(ParallelSampler):
         original_setup = module.setup_function
 
         def setup_wrapper(config):
-            # Call original setup to get instance
+            # Step 1: Call the original setup to get the instance
             instance = original_setup(config)
-            
-            # Monkey-patch the extract_theory_points method
+            # Step 2: (Monkey) Patch the method
             def emulated_extract_theory_points(self, block):
-                return block["data_vector", "theory_emulated"]
-            
-            instance.extract_theory_points = types.MethodType(
-                emulated_extract_theory_points, instance
-            )
-            
+                data_vector = block["data_vector", "theory_emulated"]
+                return data_vector
+            instance.extract_theory_points = types.MethodType(emulated_extract_theory_points, instance)
+            # Step 3: Return the patched instance
             return instance
-
-        # Replace the setup function
+        # Replace the setup_function with our wrapper
         module.setup_function = setup_wrapper
 
     def compute_fiducial_setup_emu_pipeline(self) -> None:
@@ -1334,15 +1290,4 @@ class EmugenSampler(ParallelSampler):
         return self.iterations >= self.max_iterations
 
 
-# Legacy function for compatibility
-def extract_theory_points_with_emu(self) -> np.ndarray:
-    """Legacy function for emulator theory point extraction.
-    
-    This function is kept for backward compatibility but should not be used
-    in new code. Use the EmulatorModule class instead.
-    
-    Returns:
-        Zero array (placeholder implementation)
-    """
-    logger.warning("extract_theory_points_with_emu is deprecated - use EmulatorModule instead")
-    return np.zeros(self.data_x.size)
+

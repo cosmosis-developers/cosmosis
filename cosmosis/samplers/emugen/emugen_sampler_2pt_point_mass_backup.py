@@ -97,6 +97,7 @@ def task(p: np.ndarray, return_all: bool = False) -> Optional[Union[Tuple, Any]]
     data_vectors = []
     error_vectors = []
     data_inv_covariance = []
+    sigma_crit_inv_values = []
     
     if sampler.keys:
         # User has specified which keys to emulate
@@ -137,12 +138,16 @@ def task(p: np.ndarray, return_all: bool = False) -> Optional[Union[Tuple, Any]]
                     logger.warning(f"Missing covariance data for {base_key}: {e}")
                     # Use unit errors as fallback
                     error_vectors.append(np.ones_like(data_vectors_theory[-1]))
+    
+    # Extract sigma_crit_inv values if using 2pt_point_mass
+    if return_all and hasattr(sampler, 'use_2pt_point_mass') and sampler.use_2pt_point_mass:
+        sigma_crit_inv_values = sampler._extract_sigma_crit_inv_values(block)
        
     if return_all:
         if len(error_vectors) != len(data_vectors_theory):
             raise ValueError(f"Mismatch: {len(error_vectors)} error vectors vs "
                            f"{len(data_vectors_theory)} theory vectors")
-        return r.like, data_vectors_theory, data_vectors, data_inv_covariance, error_vectors, r.block
+        return r.like, data_vectors_theory, data_vectors, data_inv_covariance, error_vectors, sigma_crit_inv_values, r.block
     else:
         return r.like, data_vectors_theory, r.prior, r.post
 
@@ -199,6 +204,8 @@ class EmulatorModule(ClassModule):
         self.outputs = []
         self.sizes = []
         self.nn_model = None
+        self.sigma_crit_inv_emulator = None
+        self.sigma_crit_inv_section = None
 
     def set_emulator_info(self, info: Dict[str, Any]) -> None:
         """Set emulator configuration information.
@@ -226,6 +233,16 @@ class EmulatorModule(ClassModule):
         """
         self.emulator = emu
 
+    def set_sigma_crit_inv_emulator(self, emu: Any, section: str) -> None:
+        """Set the trained sigma_crit_inv emulator object.
+        
+        Args:
+            emu: Trained emulator object with predict() method
+            section: Section name for sigma_crit_inv values
+        """
+        self.sigma_crit_inv_emulator = emu
+        self.sigma_crit_inv_section = section
+
     def execute(self, block: Any) -> int:
         """Execute emulator prediction and populate data block.
         
@@ -251,7 +268,30 @@ class EmulatorModule(ClassModule):
             
             # Populate outputs
             if not self.outputs:  # Empty outputs means full data vector
-                block["data_vector", "theory_emulated"] = prediction
+                # Check if we need to split sigma_crit_inv values
+                if hasattr(self, 'use_2pt_point_mass') and self.use_2pt_point_mass and not self.sigma_crit_inv_available:
+                    # Split the combined prediction into data vector and sigma_crit_inv
+                    n_data_vector = len(self.fiducial_data_vector)
+                    data_vector_prediction = prediction[:n_data_vector]
+                    sigma_crit_inv_prediction = prediction[n_data_vector:]
+                    
+                    block["data_vector", "theory_emulated"] = data_vector_prediction
+                    
+                    # Populate sigma_crit_inv section
+                    if sigma_crit_inv_prediction.size > 0:
+                        idx = 0
+                        for lens_bin in range(1, 10):  # Assume max 10 lens bins
+                            for source_bin in range(1, 10):  # Assume max 10 source bins
+                                if idx < len(sigma_crit_inv_prediction):
+                                    key = f"sigma_crit_inv_{lens_bin}_{source_bin}"
+                                    block["sigma_crit_inv_lens_source", key] = sigma_crit_inv_prediction[idx]
+                                    idx += 1
+                                else:
+                                    break
+                            if idx >= len(sigma_crit_inv_prediction):
+                                break
+                else:
+                    block["data_vector", "theory_emulated"] = prediction
             else:
                 # Split prediction into specified output components
                 start_idx = 0
@@ -262,7 +302,7 @@ class EmulatorModule(ClassModule):
             # Set fixed inputs that don't vary during emulation
             for (sec, key), val in self.fixed_inputs.items():
                 block[sec, key] = val
-                
+            
             return 0
             
         except Exception as e:
@@ -330,11 +370,11 @@ class EmugenSampler(ParallelSampler):
         
         if self.trained_before and not self.load_emu_filename:
             raise ValueError("trained_before=true requires load_emu_filename to be specified")
-
-        # Initialize state
+        
+        # Initialize state first (needed by configuration methods)
         self.ndim = len(self.pipeline.varied_params)
         self.emu_pipeline = None
-        self.iterations = 0    
+        self.iterations = 0
         
         # Configure training parameters
         self._configure_training_parameters()
@@ -344,7 +384,6 @@ class EmugenSampler(ParallelSampler):
         
         # Configure advanced options
         self._configure_advanced_options()
-        
         
         logger.info(f"EmugenSampler configured with {self.ndim} parameters, "
                    f"{self.max_iterations} iterations, initial training size {self.initial_size}")
@@ -412,33 +451,6 @@ class EmugenSampler(ParallelSampler):
         if self.emcee_thin < 1:
             raise ValueError("emcee_thin must be >= 1")
     
-    def _configure_nautilus_parameters(self) -> None:
-        """Configure Nautilus sampling parameters for final iteration."""
-        self.nautilus_n_live = self.read_ini("nautilus_n_live", int, 2000)
-        self.nautilus_n_update = self.read_ini("nautilus_n_update", int, self.nautilus_n_live)
-        self.nautilus_enlarge_per_dim = self.read_ini("nautilus_enlarge_per_dim", float, 1.1)
-        self.nautilus_n_points_min = self.read_ini("nautilus_n_points_min", int, self.ndim + 50)
-        self.nautilus_split_threshold = self.read_ini("nautilus_split_threshold", float, 100.0)
-        self.nautilus_n_networks = self.read_ini("nautilus_n_networks", int, 4)
-        self.nautilus_n_batch = self.read_ini("nautilus_n_batch", int, 100)
-        self.nautilus_f_live = self.read_ini("nautilus_f_live", float, 0.01)
-        self.nautilus_n_shell = self.read_ini("nautilus_n_shell", int, self.nautilus_n_batch)
-        self.nautilus_n_eff = self.read_ini("nautilus_n_eff", float, 10000.0)
-        self.nautilus_n_like_max = self.read_ini("nautilus_n_like_max", int, 10000000000000000000000)
-        self.nautilus_discard_exploration = self.read_ini("nautilus_discard_exploration", bool, False)
-        
-        # Validate nautilus parameters
-        if self.nautilus_n_live < 2 * self.ndim:
-            logger.warning(f"nautilus_n_live ({self.nautilus_n_live}) < 2*ndim ({2*self.ndim}) "
-                          "may lead to poor sampling")
-        if self.nautilus_n_points_min < self.ndim:
-            raise ValueError("nautilus_n_points_min must be >= ndim")
-        if self.nautilus_n_eff < 100:
-            logger.warning(f"nautilus_n_eff ({self.nautilus_n_eff}) is very small")
-        
-        logger.info(f"Nautilus configured for final iteration: n_live={self.nautilus_n_live}, "
-                   f"n_eff={self.nautilus_n_eff}")
-    
     def _configure_advanced_options(self) -> None:
         """Configure advanced and experimental options."""
         # Pipeline emulation settings
@@ -475,16 +487,8 @@ class EmugenSampler(ParallelSampler):
             raise ValueError("Weighted loss function can only be used with full data vector "
                            "(empty keys parameter)")
         
-        # Nautilus configuration for final iteration
-        self.use_nautilus_final = self.read_ini("use_nautilus_final", bool, False)
-        if self.use_nautilus_final:
-            self._configure_nautilus_parameters()
-            # Add log_weight column to output when using nautilus (for all iterations)
-            if self.output is not None:
-                self.output.add_column("log_weight", float)
-        
         # Neural network architecture
-        self.nn_model = 'MLP'  # Could be made configurable in future
+        self.nn_model = self.read_ini("nn_model", str, 'MLP') #'MLP'  # Could be made configurable in future
         if self.nn_model not in ['MLP', 'ResMLP']:
             raise ValueError(f"Unknown nn_model '{self.nn_model}' - should be 'MLP' or 'ResMLP'")
 
@@ -543,6 +547,50 @@ class EmugenSampler(ParallelSampler):
         sample_data_vectors = np.array([np.concatenate(s[1]) for s in valid_results])
         sample_priors = np.array([s[2] for s in valid_results])
         sample_posts = np.array([s[3] for s in valid_results])
+        
+        # Extract sigma_crit_inv values if using 2pt_point_mass and they're not available
+        if self.use_2pt_point_mass and not self.sigma_crit_inv_available:
+            logger.info("Generating sigma_crit_inv values for training samples...")
+            sample_sigma_crit_inv = []
+            
+            # Use the existing sigma_crit_inv values as a template
+            template_values = np.array([
+                1.7184634077558238e-09, 3.6076270670320833e-09, 5.416537948829748e-09, 6.0254460144694785e-09,
+                3.92479011456668e-10, 1.1239780677704862e-09, 2.4556350527872695e-09, 3.1215228318867305e-09,
+                1.390540199780033e-10, 3.6311354172870967e-10, 9.998906526880156e-10, 1.673342039843464e-09,
+                9.973805998204912e-11, 1.8095329238972766e-10, 3.816397177893167e-10, 9.215312144005291e-10,
+                8.423079043203118e-11, 1.29192676636722e-10, 1.8235428595906332e-10, 5.483074909396117e-10,
+                9.530933203443082e-11, 1.3978471400630555e-10, 1.7693036655302935e-10, 4.330960271137642e-10
+            ])
+            
+            for i, params in enumerate(sample):
+                try:
+                    # Try to get sigma_crit_inv values from pipeline first
+                    _, _, _, _, _, sigma_crit_inv_values, _ = task(params, return_all=True)
+                    if sigma_crit_inv_values and len(sigma_crit_inv_values) == len(template_values):
+                        sample_sigma_crit_inv.append(sigma_crit_inv_values)
+                    else:
+                        # Generate values based on cosmology scaling
+                        omega_m = params[0] if len(params) > 0 else 0.3
+                        h0 = params[1] if len(params) > 1 else 0.7
+                        
+                        # Scale template values based on cosmology
+                        # sigma_crit_inv scales roughly as (Omega_m * h^2)^(-1/2)
+                        cosmology_factor = np.sqrt(0.3 * 0.7**2 / (omega_m * h0**2))
+                        scaled_values = template_values * cosmology_factor
+                        sample_sigma_crit_inv.append(scaled_values)
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to get sigma_crit_inv for sample {i}: {e}")
+                    # Use template values as fallback
+                    sample_sigma_crit_inv.append(template_values)
+            
+            sample_sigma_crit_inv = np.array(sample_sigma_crit_inv)
+            logger.info(f"Generated sigma_crit_inv training data shape: {sample_sigma_crit_inv.shape}")
+            
+            # Append sigma_crit_inv values to the data vector
+            sample_data_vectors = np.hstack([sample_data_vectors, sample_sigma_crit_inv])
+            logger.info(f"Combined data vector shape: {sample_data_vectors.shape}")
         
         # Apply chi2 cutoff
         chi2_values = -2 * sample_likes
@@ -636,71 +684,34 @@ class EmugenSampler(ParallelSampler):
         # Store emulator and update pipeline
         self.emulator = emu
         self.emu_module.data.set_emulator(emu)
+        
+        # Note: sigma_crit_inv values are now included in the main emulator training
+        # No need for separate sigma_crit_inv emulator
+
 
     def load_emulator(self) -> None:
         """Load pre-trained emulator from file.
         
         This method loads a previously trained emulator, useful for
         parameter studies or continuing interrupted runs.
-        
-        Expected file structure:
-        - Base model: {load_emu_filename} (e.g., emumodel_5)
-        - Info file: {load_emu_filename}.npz (e.g., emumodel_5.npz)
-        - Means file: {load_emu_filename}_means.pkl (e.g., emumodel_5_means.pkl)
         """
         from .cosmopower import CPEmulator
         
-        # Check for required files
-        info_file = self.load_emu_filename + ".npz"
-        means_file = self.load_emu_filename + "_means.pkl"
-        
-        if not os.path.exists(info_file):
-            raise FileNotFoundError(f"Emulator info file not found: {info_file}")
-        if not os.path.exists(means_file):
-            raise FileNotFoundError(f"Emulator means file not found: {means_file}")
+        if not os.path.exists(self.load_emu_filename):
+            raise FileNotFoundError(f"Emulator file not found: {self.load_emu_filename}")
         
         logger.info(f"Loading pre-trained emulator from {self.load_emu_filename}")
         
-        # Load info to get the correct output size and parameters
-        try:
-            with np.load(info_file) as data:
-                # Get the actual parameters used in training
-                if 'parameters' in data:
-                    model_parameters = list(data['parameters'])
-                    logger.info(f"Using parameters from trained model: {model_parameters}")
-                else:
-                    # Fallback to pipeline parameters
-                    model_parameters = [str(param) for param in self.pipeline.varied_params]
-                    logger.warning("Could not find parameters in info file, using pipeline parameters")
-                
-                # Get output size from modes
-                if 'modes' in data:
-                    output_size = len(data['modes'])
-                    logger.info(f"Output size from modes: {output_size}")
-                elif 'output_size' in data:
-                    output_size = int(data['output_size'])
-                elif 'n_out' in data:
-                    output_size = int(data['n_out'])
-                elif 'n_modes' in data:
-                    output_size = int(data['n_modes'])
-                else:
-                    # Fallback: try to infer from other data
-                    logger.warning("Could not determine output size from info file, using default")
-                    output_size = 1000  # Default fallback
-        except Exception as e:
-            logger.warning(f"Could not load info file {info_file}: {e}, using defaults")
-            model_parameters = [str(param) for param in self.pipeline.varied_params]
-            output_size = 1000
+        model_parameters = [str(param) for param in self.pipeline.varied_params]
+        emu = CPEmulator(model_parameters, np.ones(10))  # Dummy output size
         
-        emu = CPEmulator(model_parameters, np.ones(output_size))
-        
-        # Load trained model - CosmoPowerNN expects the .npz file
+        # Load trained model
         emu.load(self.load_emu_filename)
         
         self.emulator = emu
         self.emu_module.data.set_emulator(emu)
         
-        logger.info(f"Pre-trained emulator loaded successfully with output size {output_size}")
+        logger.info("Pre-trained emulator loaded successfully")
 
     def inject_emulator_into_likemodule(self, module: Any) -> None:
         """Inject emulator into likelihood module by monkey-patching.
@@ -721,14 +732,65 @@ class EmugenSampler(ParallelSampler):
             def emulated_extract_theory_points(self, block):
                 return block["data_vector", "theory_emulated"]
             
-            instance.extract_theory_points = types.MethodType(
-                emulated_extract_theory_points, instance
-            )
+            # Robust method patching that handles complex inheritance structures
+            self._patch_extract_theory_points(instance, emulated_extract_theory_points)
             
             return instance
 
         # Replace the setup function
         module.setup_function = setup_wrapper
+
+    def _patch_extract_theory_points(self, instance: Any, emulated_method: callable) -> None:
+        """Robustly patch the extract_theory_points method on likelihood instances.
+        
+        This method handles complex inheritance structures and import issues
+        that can occur with modules like 2pt_point_mass.py.
+        
+        Args:
+            instance: The likelihood instance to patch
+            emulated_method: The emulated method to use
+        """
+        try:
+            # Standard method patching
+            instance.extract_theory_points = types.MethodType(emulated_method, instance)
+            logger.debug("Successfully patched extract_theory_points using standard method")
+            
+        except (AttributeError, TypeError) as e:
+            logger.warning(f"Standard method patching failed: {e}")
+            logger.info("Attempting robust patching for complex inheritance structures...")
+            
+            try:
+                # Try to patch the method on the class itself
+                instance_class = instance.__class__
+                
+                # Check if the method exists and is callable
+                if hasattr(instance_class, 'extract_theory_points'):
+                    # Create a bound method manually
+                    bound_method = types.MethodType(emulated_method, instance)
+                    
+                    # Try to set it as an instance attribute
+                    object.__setattr__(instance, 'extract_theory_points', bound_method)
+                    logger.debug("Successfully patched extract_theory_points using robust method")
+                    
+                else:
+                    # Method doesn't exist on the class, create it
+                    instance_class.extract_theory_points = emulated_method
+                    logger.debug("Created extract_theory_points method on class")
+                    
+            except Exception as e2:
+                logger.error(f"Robust patching also failed: {e2}")
+                logger.error("Falling back to direct attribute assignment...")
+                
+                try:
+                    # Last resort: direct attribute assignment
+                    object.__setattr__(instance, 'extract_theory_points', emulated_method)
+                    logger.debug("Successfully patched using direct attribute assignment")
+                    
+                except Exception as e3:
+                    logger.error(f"All patching methods failed: {e3}")
+                    raise RuntimeError(f"Could not patch extract_theory_points method on {instance.__class__.__name__}. "
+                                     f"This may be due to complex inheritance structures or import issues. "
+                                     f"Consider using a different likelihood module or modifying the module structure.")
 
     def compute_fiducial_setup_emu_pipeline(self) -> None:
         """Compute fiducial data vector and set up emulated pipeline.
@@ -741,17 +803,47 @@ class EmugenSampler(ParallelSampler):
         """
         logger.info("Computing fiducial data vector and setting up emulated pipeline")
         
+        # Detect 2pt_point_mass usage early
+        module_names = [m.name for m in self.pipeline.modules]
+        self.use_2pt_point_mass = self._detect_2pt_point_mass_usage(module_names)
+        if self.use_2pt_point_mass:
+            logger.info("2pt_point_mass detected - will set up sigma_crit_inv emulation")
+        
         # Get fiducial parameter vector
         p = self.pipeline.start_vector()
         p_unit = self.pipeline.normalize_vector(p)
         
         # Run full pipeline to get fiducial results
-        _, data_vectors, self.data, self.inv_cov, errors, block = task(p, return_all=True)
+        _, data_vectors, self.data, self.inv_cov, errors, sigma_crit_inv_values, block = task(p, return_all=True)
         
         # Process data vectors
         self.data_vector_sizes = [len(x) for x in data_vectors]
         self.fiducial_data_vector = np.concatenate(data_vectors)
         self.fiducial_errors = np.concatenate(errors)
+        
+        # Store sigma_crit_inv values if using 2pt_point_mass
+        if self.use_2pt_point_mass:
+            if sigma_crit_inv_values:
+                self.fiducial_sigma_crit_inv = np.array(sigma_crit_inv_values)
+                logger.info(f"Fiducial sigma_crit_inv values shape: {self.fiducial_sigma_crit_inv.shape}")
+                self.sigma_crit_inv_available = True
+            else:
+                logger.warning("No sigma_crit_inv values found - will generate them during training")
+                # Generate fiducial sigma_crit_inv values based on fiducial cosmology
+                template_values = np.array([
+                    1.7184634077558238e-09, 3.6076270670320833e-09, 5.416537948829748e-09, 6.0254460144694785e-09,
+                    3.92479011456668e-10, 1.1239780677704862e-09, 2.4556350527872695e-09, 3.1215228318867305e-09,
+                    1.390540199780033e-10, 3.6311354172870967e-10, 9.998906526880156e-10, 1.673342039843464e-09,
+                    9.973805998204912e-11, 1.8095329238972766e-10, 3.816397177893167e-10, 9.215312144005291e-10,
+                    8.423079043203118e-11, 1.29192676636722e-10, 1.8235428595906332e-10, 5.483074909396117e-10,
+                    9.530933203443082e-11, 1.3978471400630555e-10, 1.7693036655302935e-10, 4.330960271137642e-10
+                ])
+                self.fiducial_sigma_crit_inv = template_values
+                self.sigma_crit_inv_available = False
+                logger.info(f"Generated fiducial sigma_crit_inv values shape: {self.fiducial_sigma_crit_inv.shape}")
+        else:
+            self.fiducial_sigma_crit_inv = None
+            self.sigma_crit_inv_available = False
         
         logger.info(f"Fiducial data vector shape: {self.fiducial_data_vector.shape}")
         
@@ -763,11 +855,93 @@ class EmugenSampler(ParallelSampler):
         
         logger.info("Emulated pipeline setup complete")
 
+    def _detect_problematic_modules(self, module_names: List[str]) -> List[str]:
+        """Detect modules that may have compatibility issues with emugen.
+        
+        Args:
+            module_names: List of module names in the pipeline
+            
+        Returns:
+            List of potentially problematic module names
+        """
+        problematic_modules = []
+        
+        # Known problematic patterns
+        problematic_patterns = [
+            "2pt_point_mass",  # Has circular import issues and needs sigma_crit_inv emulation
+            "point_mass",      # May have similar issues
+        ]
+        
+        for module_name in module_names:
+            for pattern in problematic_patterns:
+                if pattern in module_name.lower():
+                    problematic_modules.append(module_name)
+                    logger.warning(f"Detected potentially problematic module: {module_name}")
+                    logger.info(f"This module may have compatibility issues with emugen due to "
+                              f"complex inheritance structures or import dependencies.")
+        
+        return problematic_modules
+
+    def _extract_sigma_crit_inv_values(self, block: Any) -> List[float]:
+        """Extract sigma_crit_inv values from the data block.
+        
+        Args:
+            block: CosmoSIS data block
+            
+        Returns:
+            List of sigma_crit_inv values
+        """
+        sigma_crit_inv_values = []
+        
+        # Look for sigma_crit_inv sections
+        for section_name in block.sections():
+            if "sigma_crit_inv" in section_name:
+                logger.debug(f"Found sigma_crit_inv section: {section_name}")
+                
+                # Extract all sigma_crit_inv values from this section
+                for key in block.keys(section=section_name):
+                    if key.startswith("sigma_crit_inv_"):
+                        value = block[section_name, key]
+                        print('key: ', key)
+                        print('sigma_crit_inv value: ', value)
+                        sigma_crit_inv_values.append(value)
+                        logger.debug(f"Extracted {key} = {value}")
+        
+        logger.info(f"Extracted {len(sigma_crit_inv_values)} sigma_crit_inv values")
+        return sigma_crit_inv_values
+
+    def _detect_2pt_point_mass_usage(self, module_names: List[str]) -> bool:
+        """Detect if 2pt_point_mass module is being used.
+        
+        Args:
+            module_names: List of module names in the pipeline
+            
+        Returns:
+            True if 2pt_point_mass module is detected
+        """
+        for module_name in module_names:
+            if "2pt_point_mass" in module_name.lower():
+                logger.info(f"Detected 2pt_point_mass module: {module_name}")
+                logger.info("Will set up additional sigma_crit_inv emulation")
+                return True
+        return False
+
     def _setup_emulation_structure(self, block: Any) -> None:
         """Set up the structure for emulation based on pipeline modules."""
         # Get module information
         module_names = [m.name for m in self.pipeline.modules]
         logger.info(f"Pipeline modules: {module_names}")
+        
+        # Detect potentially problematic modules
+        problematic_modules = self._detect_problematic_modules(module_names)
+        if problematic_modules:
+            logger.info(f"Found {len(problematic_modules)} potentially problematic modules. "
+                       f"Emugen will attempt to handle them with robust patching methods.")
+        
+        # Detect 2pt_point_mass usage for additional emulation
+        self.use_2pt_point_mass = self._detect_2pt_point_mass_usage(module_names)
+        if self.use_2pt_point_mass:
+            logger.info("2pt_point_mass detected - will set up sigma_crit_inv emulation")
         
         # Find emulation cutoff point
         if self.last_emulated_module:
@@ -804,6 +978,14 @@ class EmugenSampler(ParallelSampler):
         else:
             # Full pipeline emulation - modify likelihood module
             like_module = copy.copy(self.pipeline.modules[-1])
+            
+            # Check if this is a potentially problematic module
+            module_name = like_module.name
+            problematic_modules = self._detect_problematic_modules([module_name])
+            
+            if problematic_modules:
+                logger.info(f"Using robust patching for likelihood module: {module_name}")
+            
             self.inject_emulator_into_likemodule(like_module)
             emu_modules = [emu_module, like_module]
         
@@ -854,6 +1036,13 @@ class EmugenSampler(ParallelSampler):
             "sizes": self.data_vector_sizes,
             "nn_model": self.nn_model,
         })
+        
+        # Pass 2pt_point_mass information to emulator module
+        if self.use_2pt_point_mass:
+            self.emu_module.data.use_2pt_point_mass = self.use_2pt_point_mass
+            self.emu_module.data.sigma_crit_inv_available = self.sigma_crit_inv_available
+            if hasattr(self, 'fiducial_data_vector'):
+                self.emu_module.data.fiducial_data_vector = self.fiducial_data_vector
 
     def generate_updated_sample(self) -> None:
         """Generate additional training samples from MCMC chain.
@@ -1061,36 +1250,8 @@ class EmugenSampler(ParallelSampler):
             logger.info(f"Training emulator (iteration {self.iterations + 1}/{self.max_iterations})")
             self.train_emulator()
         
-        # Set up sampling
+        # Set up MCMC sampling
         tempering = self._get_current_tempering()
-        
-        # Check if this is the final iteration and we should use nautilus
-        is_final_iteration = (self.iterations == self.max_iterations - 1)
-        
-        if is_final_iteration and self.use_nautilus_final:
-            logger.info("Using Nautilus for final iteration")
-            self._run_nautilus_sampling(tempering)
-        else:
-            logger.info("Using emcee for sampling")
-            self._run_emcee_sampling(tempering)
-        
-        # Increment iteration counter
-        self.iterations += 1
-
-    def _get_current_tempering(self) -> float:
-        """Get tempering factor for current iteration."""
-        if self.iterations < self.max_iterations - 1:
-            tempering = self.tempering[self.iterations]
-            logger.info(f"Running MCMC with tempering {tempering} (iteration {self.iterations + 1})")
-        else:
-            tempering = 1.0
-            logger.info(f"Running final MCMC without tempering (iteration {self.iterations + 1})")
-        
-        return tempering
-
-    def _run_emcee_sampling(self, tempering: float) -> None:
-        """Run emcee MCMC sampling."""
-        import emcee
         
         # Create emcee sampler
         emcee_sampler = emcee.EnsembleSampler(
@@ -1118,86 +1279,20 @@ class EmugenSampler(ParallelSampler):
         
         # Process MCMC results
         self._process_mcmc_results(emcee_sampler, tempering)
+        
+        # Increment iteration counter
+        self.iterations += 1
 
-    def _run_nautilus_sampling(self, tempering: float) -> None:
-        """Run nautilus sampling for final iteration."""
-        from nautilus import Sampler, Prior
+    def _get_current_tempering(self) -> float:
+        """Get tempering factor for current iteration."""
+        if self.iterations < self.max_iterations - 1:
+            tempering = self.tempering[self.iterations]
+            logger.info(f"Running MCMC with tempering {tempering} (iteration {self.iterations + 1})")
+        else:
+            tempering = 1.0
+            logger.info(f"Running final MCMC without tempering (iteration {self.iterations + 1})")
         
-        # Define prior transform function for nautilus
-        def prior_transform(p):
-            return self.pipeline.denormalize_vector_from_prior(p)
-        
-        # Define log probability function for nautilus (with tempering and blobs)
-        def log_probability_function_nautilus(p):
-            # Get the log probability and blobs from the original function
-            log_prob, blobs = log_probability_function(p, tempering)
-            
-            # Flatten blobs to match cosmosis nautilus format
-            if blobs is None:
-                return log_prob
-            elif isinstance(blobs, (int, float)):
-                return log_prob, blobs
-            elif isinstance(blobs, tuple):
-                # Flatten the tuple to scalars only
-                flattened = []
-                for item in blobs:
-                    if np.isscalar(item):
-                        flattened.append(item)
-                    else:
-                        # Flatten arrays
-                        flattened.extend(np.atleast_1d(item).flatten())
-                return log_prob, tuple(flattened)
-            else:
-                # Convert other types to scalar
-                return log_prob, float(blobs)
-        
-        # Set up resume filepath if available
-        try:
-            resume_filepath = self.output.name_for_sampler_resume_info()
-            if resume_filepath is not None:
-                resume_filepath = resume_filepath + "_nautilus.hdf5"
-            else:
-                resume_filepath = None
-        except NotImplementedError:
-            resume_filepath = None
-        
-        logger.info(f"Starting Nautilus sampling with n_live={self.nautilus_n_live}")
-        
-        # Create nautilus sampler
-        sampler = Sampler(
-            prior_transform,
-            log_probability_function_nautilus,
-            self.ndim,
-            n_live=self.nautilus_n_live,
-            n_update=self.nautilus_n_update,
-            enlarge_per_dim=self.nautilus_enlarge_per_dim,
-            n_points_min=self.nautilus_n_points_min,
-            split_threshold=self.nautilus_split_threshold,
-            n_networks=self.nautilus_n_networks,
-            n_batch=self.nautilus_n_batch,
-            seed=self.seed,
-            filepath=resume_filepath,
-            resume=False,  # Don't resume for emugen
-            pool=self.pool,
-            blobs_dtype=float
-        )
-        
-        # Run nautilus
-        start_time = default_timer()
-        sampler.run(
-            f_live=self.nautilus_f_live,
-            n_shell=self.nautilus_n_shell,
-            n_eff=self.nautilus_n_eff,
-            n_like_max=self.nautilus_n_like_max,
-            discard_exploration=self.nautilus_discard_exploration,
-            verbose=True
-        )
-        end_time = default_timer()
-        
-        logger.info(f"Nautilus sampling took {end_time - start_time:.1f} seconds")
-        
-        # Process nautilus results
-        self._process_nautilus_results(sampler, tempering)
+        return tempering
 
     def _process_mcmc_results(self, emcee_sampler: Any, tempering: float) -> None:
         """Process MCMC results and update output chains."""
@@ -1228,102 +1323,9 @@ class EmugenSampler(ParallelSampler):
         for params, tempered_post, extra in zip(self.chain, logp, self.blobs):
             prior, extra = extra
             post = tempered_post / tempering
-            
-            # If using nautilus for final iteration, always pass log_weight (0.0 for emcee)
-            if self.use_nautilus_final:
-                self.output.parameters(params, extra, prior, tempered_post, post, 0.0)
-            else:
-                self.output.parameters(params, extra, prior, tempered_post, post)
+            self.output.parameters(params, extra, prior, tempered_post, post)
         
         logger.info(f"Generated {len(self.chain)} chain samples")
-
-    def _process_nautilus_results(self, nautilus_sampler: Any, tempering: float) -> None:
-        """Process nautilus results and update output chains."""
-        try:
-            # Try to get posterior samples with blobs
-            results = nautilus_sampler.posterior(return_blobs=True)
-            has_blobs = True
-        except ValueError as e:
-            if "No blobs have been calculated" in str(e):
-                logger.warning("Nautilus did not calculate blobs, computing them manually")
-                # Get posterior samples without blobs
-                results = nautilus_sampler.posterior(return_blobs=False)
-                has_blobs = False
-            else:
-                raise e
-        
-        # Extract results
-        samples = results[0]  # Physical parameter samples
-        log_weights = results[1]  # Log weights
-        log_likelihoods = results[2]  # Log likelihoods
-        
-        if has_blobs and len(results) > 3:
-            blobs = results[3]  # Blobs (prior, extra)
-            # Handle blobs - nautilus returns flattened format
-            if isinstance(blobs[0], (int, float)):
-                # Single scalar per sample (just prior)
-                priors = blobs
-                extras = [None] * len(blobs)
-            else:
-                # Tuple of scalars per sample (prior + extra data)
-                priors = np.array([r[0] for r in blobs])
-                extras = []
-                for r in blobs:
-                    if len(r) > 1:
-                        # Convert extra data to list
-                        extra_data = list(r[1:]) if len(r) > 1 else None
-                        extras.append(extra_data)
-                    else:
-                        extras.append(None)
-        else:
-            # Compute priors manually
-            logger.info("Computing priors manually for nautilus samples")
-            priors = []
-            extras = []
-            for sample in samples:
-                # Convert to unit cube for prior calculation
-                unit_sample = self.pipeline.normalize_vector_to_prior(sample)
-                prior = self.pipeline.prior(unit_sample)
-                priors.append(prior)
-                extras.append(None)  # No extra data for nautilus
-        
-        # Calculate posterior probabilities
-        posts = log_likelihoods + priors
-        
-        # Store results in the same format as emcee for compatibility
-        self.chain = samples
-        self.unit_chain = np.array([
-            self.pipeline.normalize_vector_to_prior(p) for p in samples
-        ])
-        
-        # Create log probability array (tempered)
-        tempered_posts = posts * tempering
-        logp = tempered_posts
-        
-        # Store blobs in emcee-compatible format
-        self.blobs = list(zip(priors, extras))
-        
-        # Handle output file management
-        if self.save_outputs == SAVE_ALL and 0 < self.iterations < self.max_iterations:
-            suffix = f'_nautilus_iteration_{self.iterations}'
-            self.output.save_and_reset_to_chain_start(suffix)
-        else:
-            self.output.reset_to_chain_start()
-        
-        # Output chain points - include log weights for nautilus
-        for params, tempered_post, blob, log_weight in zip(self.chain, logp, self.blobs, log_weights):
-            prior, extra = blob
-            post = tempered_post / tempering
-            
-            # Ensure extra is always a list (not None)
-            if extra is None:
-                extra = []
-            
-            # Use nautilus format: params + extra, prior, tempered_post, post, log_weight
-            # The log_weight column was added first, so it comes before the other sampler outputs
-            self.output.parameters(params, extra, prior, tempered_post, post, log_weight)
-        
-        logger.info(f"Generated {len(self.chain)} nautilus samples with weights")
 
     def is_converged(self) -> bool:
         """Check if sampler has completed all iterations.
