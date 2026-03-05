@@ -90,3 +90,11 @@ def test_header_update():
         print(output.comments)
 
         assert 'p1 = -2.0  0.0  2.0' in output.comments
+
+def test_items():
+    ini = Inifile(None)
+    ini.add_section("parameters")
+    ini.set("parameters", "p1", "-3.0  0.0  3.0")
+    ini.set("parameters", "p2", "-3.0  0.0  3.0")
+    ini.items("parameters", defaults=True)
+    ini.items("parameters", defaults=False)

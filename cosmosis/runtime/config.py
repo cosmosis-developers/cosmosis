@@ -195,8 +195,18 @@ class Inifile(IncludingConfigParser):
                 return [(option, d[option])
                         for option in options]
             else:
-                return [(option, self._interpolate(section, option, d[option], d))
+                return [(option, self._interpolate_compatibility(section, option, d[option], d))
                         for option in options]
+
+    def _interpolate_compatibility(self, section, option, value, d):
+        # More recent versions of python have an object called _interpolation to customize interpolation
+        # behaviour, instead of the old _interpolate method. We support both here.
+        if self.no_expand_vars:
+            return value
+        elif hasattr(self, "_interpolate"):
+            return self._interpolate(section, option, value, d)
+        else:
+            return self._interpolation.before_get(self, section, option, value, d)
 
 
     def get(self, section, option, raw=False, vars=None, fallback=configparser._UNSET):
