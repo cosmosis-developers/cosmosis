@@ -4,6 +4,7 @@ from cosmosis.output import InMemoryOutput
 import numpy as np
 import tempfile
 import os
+import io
 
 def test_override_new():
     with tempfile.NamedTemporaryFile('w') as values:
@@ -98,3 +99,16 @@ def test_items():
     ini.set("parameters", "p2", "-3.0  0.0  3.0")
     ini.items("parameters", defaults=True)
     ini.items("parameters", defaults=False)
+
+def test_items_with_defaults():
+    sio = io.StringIO("""
+[DEFAULT]
+x = 1
+[parameters]
+y = 2
+""")
+    ini = Inifile(sio)
+    assert ini.getint("parameters", "y") == 2
+    assert ini.getint("parameters", "x") == 1
+    assert dict(ini.items("parameters", defaults=True)) == {"x": "1", "y": "2"}
+    assert dict(ini.items("parameters", defaults=False)) == {"y": "2"}
