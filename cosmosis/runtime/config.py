@@ -206,6 +206,7 @@ class Inifile(IncludingConfigParser):
         elif hasattr(self, "_interpolate"):
             return self._interpolate(section, option, value, d)
         else:
+            d = self._unify_values(section, {})
             return self._interpolation.before_get(self, section, option, value, d)
 
 
