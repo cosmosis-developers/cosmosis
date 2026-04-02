@@ -99,7 +99,7 @@ class RoseConfigMixin:
         self.nautilus_n_shell = self.read_ini("nautilus_n_shell", int, self.nautilus_n_batch)
         self.nautilus_n_eff = self.read_ini("nautilus_n_eff", float, 10000.0)
         self.nautilus_n_like_max = self.read_ini("nautilus_n_like_max", int, 10000000000000000000000)
-        self.nautilus_discard_exploration = self.read_ini("nautilus_discard_exploration", bool, False)
+        self.nautilus_discard_exploration = self.read_ini("nautilus_discard_exploration", bool, True)
         
         # Validate nautilus parameters
         if self.nautilus_n_live < 2 * self.ndim:
@@ -126,6 +126,9 @@ class RoseConfigMixin:
         self.nuts_num_burnin_steps = self.read_ini("nuts_num_burnin_steps", int, 1000)
         self.nuts_num_results = self.read_ini("nuts_num_results", int, 2000)
         self.nuts_num_chains = self.read_ini("nuts_num_chains", int, 1)
+        self.nuts_target_accept_prob = self.read_ini("nuts_target_accept_prob", float, 0.75)
+        self.nuts_sample_unit_space = self.read_ini("nuts_sample_unit_space", bool, True)
+        self.nuts_progress_interval = self.read_ini("nuts_progress_interval", int, 500)
         
         # Validate NUTS parameters
         if self.nuts_step_size <= 0:
@@ -136,15 +139,23 @@ class RoseConfigMixin:
             logger.warning(f"nuts_num_results ({self.nuts_num_results}) is very small")
         if self.nuts_num_chains < 1:
             raise ValueError("nuts_num_chains must be >= 1")
+        if not (0.5 <= self.nuts_target_accept_prob <= 0.99):
+            raise ValueError("nuts_target_accept_prob should be in (0.5, 0.99), e.g. 0.65-0.8 for better exploration")
+        if self.nuts_progress_interval < 0:
+            raise ValueError("nuts_progress_interval must be >= 0 (use 0 to disable progress output)")
         
         logger.info(f"NUTS configured for final iteration: step_size={self.nuts_step_size}, "
-                   f"max_tree_depth={self.nuts_max_tree_depth}, num_results={self.nuts_num_results}")
+                   f"max_tree_depth={self.nuts_max_tree_depth}, num_results={self.nuts_num_results}, "
+                   f"target_accept_prob={self.nuts_target_accept_prob}, sample_unit_space={self.nuts_sample_unit_space}")
     
     def _configure_advanced_options(self) -> None:
         """Configure advanced and experimental options."""
         # Pipeline emulation settings
         self.last_emulated_module = self.read_ini("last_emulated_module", str, "")
         
+        # Prior module settings
+        self.prior_module = self.read_ini("prior_module", str, "")
+
         # Tempering settings
         tempering = self.read_ini("tempering", float, 0.05)
         self.tempering = np.full(self.max_iterations, tempering)

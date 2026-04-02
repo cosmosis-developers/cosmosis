@@ -38,6 +38,8 @@ DTYPE = tf.float32
 tf.get_logger().setLevel('ERROR')
 warnings.filterwarnings('ignore', category=FutureWarning)
 
+s = 1e-7
+
 # Device detection with better error handling
 def get_device() -> str:
     """Detect and return the best available compute device.
@@ -645,11 +647,11 @@ class CosmoPowerNN(tf.keras.Model):
                         self.update_emulator_parameters()
                     # Custom stopping condition
                     #TODO: Make this a parameter
-                    elif best_val_loss < 5e-4:
-                        best_val_loss = val_loss
-                        patience_counter = 0
-                        # Save best model
-                        self.update_emulator_parameters()   
+                    #elif best_val_loss < 5e-4:
+                    #    best_val_loss = val_loss
+                    #    patience_counter = 0
+                    #    # Save best model
+                    #    self.update_emulator_parameters()   
                     else:
                         patience_counter += 1
                     
@@ -872,6 +874,8 @@ class NNEmulator:
         """
         if self.data_trafo == 'log_norm':
             return self._log_norm_transform(model_datavector)
+        elif self.data_trafo == 'signed_log_norm':
+            return self._signed_log_norm_transform(model_datavector)
         elif self.data_trafo == 'norm':
             return self._norm_transform(model_datavector)
         elif self.data_trafo == 'PCA':
@@ -893,6 +897,20 @@ class NNEmulator:
               
         return (y - self.y_mean) / self.y_std
 
+    def _signed_log_norm_transform(self, data: np.ndarray) -> np.ndarray:
+        """Apply signed log-normalization transformation."""
+        # Handle potential zeros or negative values
+        y = np.sign(data) * np.log10(np.abs(data)/s + 1.)
+        
+        self.y_mean = np.mean(y, axis=0)
+        self.y_std = np.std(y, axis=0)
+        
+        # Avoid division by zero
+        self.y_std = np.maximum(self.y_std, 1e-10)
+          
+        return (y - self.y_mean) / self.y_std
+
+        
     def _norm_transform(self, data: np.ndarray) -> np.ndarray:
         """Apply standard normalization transformation."""
         self.y_mean = np.mean(data, axis=0)
@@ -943,6 +961,8 @@ class NNEmulator:
         """
         if self.data_trafo == 'log_norm':
             return 10 ** model_datavector
+        elif self.data_trafo == 'signed_log_norm':
+            return np.sign(model_datavector) * s * (10.0 ** np.abs(model_datavector) - 1.)
         elif self.data_trafo == 'norm':
             return model_datavector
         elif self.data_trafo == 'PCA':
@@ -1102,6 +1122,21 @@ class NNEmulator:
         logger.info("Emulator loaded successfully")
             
 
+    def save_to(self, filename: str) -> None:
+        """Save current emulator state to filename so workers can load it from disk.
+        
+        Used when running with a pool (e.g. Nautilus) and the model may not have been
+        written to this path yet (e.g. save_outputs is not 'all'). Call this before
+        passing the path to worker processes.
+        
+        Args:
+            filename: Base filename to save to (no .npz extension).
+        """
+        if not self.trained or not hasattr(self, 'cp_nn'):
+            raise RuntimeError("Emulator must be trained before saving")
+        self.cp_nn.save(filename, {})
+        self._save_attributes(filename)
+        logger.info(f"Emulator saved to {filename} for worker processes")
 
     def predict(self, X: Dict[str, Union[float, np.ndarray]]) -> np.ndarray:
         """Make predictions using the trained emulator.
@@ -1248,6 +1283,8 @@ class NNEmulator:
             # Apply backtransform (e.g., from log10 space to original space)
             if self.data_trafo == 'log_norm':
                 pred_original = tf.pow(10.0, pred_intermediate)
+            elif self.data_trafo == 'signed_log_norm':
+                pred_original = tf.sign(pred_intermediate) * tf.multiply(s, tf.subtract(tf.pow(10.0, tf.abs(pred_intermediate)), 1.0))
             elif self.data_trafo == 'norm':
                 pred_original = pred_intermediate
             elif self.data_trafo == 'PCA':

@@ -122,8 +122,11 @@ class RoseDataProcessingMixin:
         self.points_per_iteration = np.array([n_kept])
         # For the case of rejected points due to additional priors, for instance, w0+wa<0
         if n_kept < 0.8*self.initial_size:
-            raise RuntimeError(f"Only {n_kept} samples passed chi2 filter, but need "
-                             f"at least {0.8*self.initial_size} (80% of initial size) --> increase the initial size")
+            #raise RuntimeError(f"Only {n_kept} samples passed chi2 filter, but need "
+            #                 f"at least {0.8*self.initial_size} (80% of initial size) --> increase the initial size")
+            logger.warning(f"Only {n_kept} samples passed chi2 filter, but need "
+                           f"at least {0.8*self.initial_size} (80% of initial size) --> increase the initial size")
+        
         
         self.initial_size_cut = n_kept
 
@@ -207,9 +210,10 @@ class RoseDataProcessingMixin:
         
         # For the case of rejected points due to additional priors, for instance, w0+wa<0
         if len(valid_results) < 0.8*self.resample_size:
-            raise RuntimeError(f"Only {len(valid_results)} samples passed chi2 filter, but need "
-                             f"at least {0.8*self.resample_size} (80% of resample size) --> increase the resample size")
-        
+            #raise RuntimeError(f"Only {len(valid_results)} samples passed chi2 filter, but need "
+            #                 f"at least {0.8*self.resample_size} (80% of resample size) --> increase the resample size")
+            logger.warning(f"Only {len(valid_results)} samples passed chi2 filter, but need "
+                           f"at least {0.8*self.resample_size} (80% of resample size) --> increase the resample size")
         # Extract new data
         new_data_vectors = np.array([np.concatenate(s[1]) for s in valid_results])
         new_likes = np.array([s[0] for s in valid_results])

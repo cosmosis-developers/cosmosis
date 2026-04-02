@@ -38,6 +38,7 @@ class EmulatorModule(ClassModule):
         self.outputs = info["outputs"]
         self.sizes = info["sizes"]
         self.nn_model = info["nn_model"]
+        self.output_indices = info.get("output_indices")
 
     def set_emulator(self, emu: Any) -> None:
         """Set the trained emulator object.
@@ -68,6 +69,8 @@ class EmulatorModule(ClassModule):
         
         # Get emulator prediction
         prediction = self.emulator.predict(p_dict)[0]
+        if self.output_indices is not None:
+            prediction = prediction[self.output_indices]
         
         # Populate outputs
         if self.outputs==[]:  # Empty outputs means full data vector

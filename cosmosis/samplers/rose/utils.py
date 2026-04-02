@@ -162,18 +162,15 @@ def log_probability_function(u: np.ndarray, tempering: float):
     return tempering * r.post, (r.prior, r.extra)
     #return tempering * r.like, (r.prior, r.extra)
 
-def log_probability_function_nautilus(p):
+def log_probability_function_nautilus(p, model_path=None):
     global _sampler
     if _sampler is None:
         raise RuntimeError("Global sampler not set. This should be set in RoseSampler.config()")
     # Check if emu_pipeline is initialized
     if _sampler.emu_pipeline is None:
-        #raise RuntimeError("emu_pipeline is not initialized. This may happen if execute() "
-        #                    "hasn't been called yet, or if compute_fiducial_setup_emu_pipeline() "
-        #                    "failed on this process.")
         logger.warning("emu_pipeline is not initialized, setting it up now")
         _sampler.compute_fiducial_setup_emu_pipeline()
-        _sampler.load_emulator()
+        _sampler.load_emulator(model_path)
     sampler = _sampler
     r = sampler.emu_pipeline.run_results(p)
     log_prob, blobs =  r.post, (r.prior, r.extra)
@@ -196,7 +193,7 @@ def log_probability_function_nautilus(p):
         # Convert other types to scalar
         return log_prob, float(blobs)
 
-def prior_transform(p):
+def prior_transform(p, model_path=None):
     global _sampler
     if _sampler is None:
         raise RuntimeError("Global sampler not set. This should be set in RoseSampler.config()")
@@ -204,7 +201,7 @@ def prior_transform(p):
     if _sampler.emu_pipeline is None:
         logger.warning("emu_pipeline is not initialized, setting it up now")
         _sampler.compute_fiducial_setup_emu_pipeline()
-        _sampler.load_emulator()
+        _sampler.load_emulator(model_path)
     sampler = _sampler
     return sampler.pipeline.denormalize_vector_from_prior(p)
 

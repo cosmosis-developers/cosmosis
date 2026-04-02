@@ -23,6 +23,39 @@ logger = logging.getLogger(__name__)
 
 class RosePipelineSetupMixin:
     """Mixin class providing pipeline setup methods for RoseSampler."""
+
+    def _extract_vector_metadata(self, block: Any) -> list[dict[str, Any]]:
+        """Extract per-vector metadata from data_vector block entries.
+
+        The metadata is aligned with the ordering used in utils.task when
+        sampler.keys is not set, i.e. scanning all ``*_theory`` entries.
+        """
+        metadata = []
+        for sec, key in block.keys(section="data_vector"):
+            if not key.endswith("_theory"):
+                continue
+            base_key = key[:-7]
+            angle_key = base_key + "_angle"
+            bin1_key = base_key + "_bin1"
+            bin2_key = base_key + "_bin2"
+
+            item = {
+                "base_key": base_key,
+                "size": int(np.asarray(block[sec, key]).size),
+            }
+
+            if (
+                block.has_value(sec, angle_key)
+                and block.has_value(sec, bin1_key)
+                and block.has_value(sec, bin2_key)
+            ):
+                item["angle"] = np.asarray(block[sec, angle_key]).astype(float)
+                item["bin1"] = np.asarray(block[sec, bin1_key]).astype(int)
+                item["bin2"] = np.asarray(block[sec, bin2_key]).astype(int)
+
+            metadata.append(item)
+
+        return metadata
     
     def inject_emulator_into_likemodule(self, module: Any) -> None:
         """Inject emulator into likelihood module by monkey-patching.
@@ -70,6 +103,8 @@ class RosePipelineSetupMixin:
         self.data_vector_sizes = [len(x) for x in data_vectors]
         self.fiducial_data_vector = np.concatenate(data_vectors)
         self.fiducial_errors = np.concatenate(errors)
+        self.fiducial_vector_metadata = self._extract_vector_metadata(block)
+        self.emulator_output_indices = None
         
         logger.info(f"Fiducial data vector shape: {self.fiducial_data_vector.shape}")
         
@@ -124,6 +159,18 @@ class RosePipelineSetupMixin:
             like_module = copy.copy(self.pipeline.modules[-1])
             self.inject_emulator_into_likemodule(like_module)
             emu_modules = [emu_module, like_module]
+
+        # Add prior modules if they exist
+        logger.info(f"Emulated modules: {[m.name for m in emu_modules]}")
+        if self.prior_module:
+            try:
+                prior_index = module_names.index(self.prior_module)
+                emu_modules.insert(0, self.pipeline.modules[prior_index])
+            except ValueError:
+                raise ValueError(f"Module '{self.prior_module}' not found in pipeline")
+            logger.info(f"Emulated modules: {[m.name for m in emu_modules]}")
+        else:
+            logger.warning("No prior module found")
         
         self.emu_modules = emu_modules
         self.fixed_inputs = fixed_inputs
@@ -171,6 +218,7 @@ class RosePipelineSetupMixin:
             "outputs": self.keys,
             "sizes": self.data_vector_sizes,
             "nn_model": self.nn_model,
+            "output_indices": self.emulator_output_indices,
         })
         utils_module._sampler = self
 

@@ -12,6 +12,8 @@ License: BSD 2-Clause
 """
 
 import logging
+import os
+import time
 from typing import Any
 
 from .. import ParallelSampler
@@ -86,6 +88,7 @@ class RoseSampler(
         
         # Configure output saving
         self._configure_output_saving()
+        self._timing_file = os.path.join(self.save_outputs_dir, "rose_timing.txt")
         
         # Configure emulator loading
         self.load_emu_filename = self.read_ini("load_emu_filename", str, "")
@@ -123,6 +126,9 @@ class RoseSampler(
         2. MCMC sampling with current emulator
         3. Output processing and chain storage
         """
+        time_training_set_s = 0.0
+        time_train_emulator_s = 0.0
+
         # Handle pre-trained emulator case
         if self.trained_before:
             self.compute_fiducial_setup_emu_pipeline()
@@ -130,7 +136,8 @@ class RoseSampler(
             self.load_emulator()
             self.iterations = self.max_iterations - 1
         else:
-            # Normal training workflow
+            # Normal training workflow: time training set generation
+            t0 = time.perf_counter()
             if self.iterations == 0:
                 # First iteration: setup and initial training
                 self.compute_fiducial_setup_emu_pipeline()
@@ -138,10 +145,13 @@ class RoseSampler(
             else:
                 # Subsequent iterations: update training set
                 self.generate_updated_sample()
-            
+            time_training_set_s = time.perf_counter() - t0
+
             # Train emulator
             logger.info(f"Training emulator (iteration {self.iterations + 1}/{self.max_iterations})")
+            t1 = time.perf_counter()
             self.train_emulator()
+            time_train_emulator_s = time.perf_counter() - t1
         
         # Set up sampling
         tempering = self._get_current_tempering()
@@ -149,6 +159,7 @@ class RoseSampler(
         # Check if this is the final iteration and we should use nautilus or NUTS
         is_final_iteration = (self.iterations == self.max_iterations - 1)
         
+        t2 = time.perf_counter()
         if is_final_iteration and self.use_nuts_final:
             logger.info("Using NUTS for final iteration")
             self._run_nuts_sampling(tempering)
@@ -158,6 +169,15 @@ class RoseSampler(
         else:
             logger.info("Using emcee for sampling")
             self._run_emcee_sampling(tempering)
+        time_sampling_s = time.perf_counter() - t2
+
+        # Save timing for this iteration to file
+        write_header = not os.path.isfile(self._timing_file)
+        with open(self._timing_file, "a") as f:
+            if write_header:
+                f.write("iteration\ttime_training_set_s\ttime_train_emulator_s\ttime_sampling_s\n")
+            f.write(f"{self.iterations + 1}\t{time_training_set_s:.6f}\t{time_train_emulator_s:.6f}\t{time_sampling_s:.6f}\n")
+        logger.info(f"Timing saved to {self._timing_file} (training_set={time_training_set_s:.1f}s, train_emu={time_train_emulator_s:.1f}s, sampling={time_sampling_s:.1f}s)")
         
         # Increment iteration counter
         self.iterations += 1

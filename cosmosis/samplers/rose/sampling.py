@@ -6,6 +6,8 @@ and processing the resulting chains.
 """
 
 import logging
+import os
+from functools import partial
 from timeit import default_timer
 from typing import Any, Tuple
 
@@ -17,7 +19,7 @@ from ...runtime.prior import GaussianPrior, UniformPrior
 
 logger = logging.getLogger(__name__)
 
-
+s = 1e-7
 class RoseSamplingMixin:
     """Mixin class providing MCMC sampling methods for RoseSampler."""
     
@@ -54,14 +56,16 @@ class RoseSamplingMixin:
             pool=self.pool,
         )
         
-        # Get starting positions
+        # Get starting positions (emcee samples in unit cube [0,1]^ndim)
         if self.trained_before:
-            start_pos = [self.pipeline.randomized_start() for _ in range(self.emcee_walkers)]
+            start_pos = [
+                self.pipeline.normalize_vector_to_prior(self.pipeline.randomized_start())
+                for _ in range(self.emcee_walkers)
+            ]
         else:
             start_pos = self.get_emcee_start()
         
         logger.info(f"Starting MCMC with {len(start_pos)} walkers")
-        
         # Run MCMC
         start_time = default_timer()
         #emcee_sampler.run_mcmc(start_pos, self.emcee_samples, progress=True)
@@ -122,10 +126,29 @@ class RoseSamplingMixin:
         
         logger.info(f"Starting Nautilus sampling with n_live={self.nautilus_n_live}")
         
+        # Capture current model path so workers (which never run execute()) load the same emulator
+        # when the pool pickles these callables.
+        current_model_path = os.path.join(self.save_outputs_dir, f'emumodel_{self.iterations + 1}')
+        # When using a pool, workers load from disk; ensure the current model is saved there
+        # even if save_outputs is not "all" (train_emulator always saves, but this covers
+        # any case where the file might be missing).
+        if self.pool is not None and self.emulator is not None:
+            info_file = current_model_path + ".npz"
+            if not os.path.exists(info_file):
+                logger.info("Saving current emulator to disk so worker processes can load it")
+                self.emulator.save_to(current_model_path)
+        # Module-level callables + partial(model_path=...) pickle for MPI; nested defs do not.
+        prior_transform_with_path = partial(
+            prior_transform, model_path=current_model_path
+        )
+        log_prob_nautilus_with_path = partial(
+            log_probability_function_nautilus, model_path=current_model_path
+        )
+
         # Create nautilus sampler
         nautilus_sampler = Sampler(
-            prior_transform,
-            log_probability_function_nautilus,
+            prior_transform_with_path,
+            log_prob_nautilus_with_path,
             self.ndim,
             n_live=self.nautilus_n_live,
             n_update=self.nautilus_n_update,
@@ -350,44 +373,104 @@ class RoseSamplingMixin:
                                      X_mean_tf, X_std_tf, y_mean_tf, y_std_tf, 
                                      data_vector_tf, inv_covariance_tf, DTYPE)
 
-        def log_prob_nuts(physical_params_tf):
-            """Log probability for NUTS - TensorFlow will compute gradients automatically.
-            
-            This function must be fully differentiable for NUTS to work correctly.
-            TensorFlow will automatically compute gradients using autodiff.
-            """
-            return self._log_prob_nuts_impl(physical_params_tf, emulator, X_mean_tf, X_std_tf, 
-                                            y_mean_tf, y_std_tf, data_vector_tf, 
-                                            inv_covariance_tf, tempering, DTYPE)
+        # Optionally sample in unit (prior) space for better exploration of Omega_m, w, wa.
+        # In unit space all parameters are on [0,1], so geometry is better for HMC/NUTS.
+        if self.nuts_sample_unit_space:
+            param_low = np.array([p.limits[0] for p in self.pipeline.varied_params], dtype=np.float32)
+            param_high = np.array([p.limits[1] for p in self.pipeline.varied_params], dtype=np.float32)
+            low_tf = tf.constant(param_low, dtype=DTYPE)
+            high_tf = tf.constant(param_high, dtype=DTYPE)
+            log_jacobian_const = tf.constant(
+                np.sum(np.log(param_high - param_low)), dtype=DTYPE
+            )
+            logger.info("NUTS sampling in unit (prior) space for better exploration of correlated parameters")
+
+            def log_prob_nuts(state_tf):
+                # state_tf is in [0,1]^d; transform to physical and add log Jacobian
+                state_1d = tf.reshape(state_tf, [-1])
+                physical = low_tf + state_1d * (high_tf - low_tf)
+                log_prob_physical = self._log_prob_nuts_impl(
+                    physical, emulator, X_mean_tf, X_std_tf,
+                    y_mean_tf, y_std_tf, data_vector_tf, inv_covariance_tf, tempering, DTYPE
+                )
+                return log_prob_physical + log_jacobian_const
+        else:
+            def log_prob_nuts(physical_params_tf):
+                return self._log_prob_nuts_impl(
+                    physical_params_tf, emulator, X_mean_tf, X_std_tf,
+                    y_mean_tf, y_std_tf, data_vector_tf,
+                    inv_covariance_tf, tempering, DTYPE
+                )
     
-        # Initialize NUTS kernel
-        # Convert initial state to TensorFlow constant
-        initial_state = tf.constant(initial_state_physical, dtype=DTYPE)
-        
-        # Create NUTS kernel
+        # Initialize NUTS kernel: use unit or physical state depending on option
+        if self.nuts_sample_unit_space:
+            initial_state = tf.constant(np.asarray(initial_state_unit, dtype=np.float32), dtype=DTYPE)
+        else:
+            initial_state = tf.constant(initial_state_physical, dtype=DTYPE)
+    
+        # Create NUTS kernel (use configured values so ini tuning has effect)
         nuts_kernel = tfp.mcmc.NoUTurnSampler(
             target_log_prob_fn=log_prob_nuts,
-            step_size=0.05, #self.nuts_step_size,
-            max_tree_depth=12, #elf.nuts_max_tree_depth,
-            max_energy_diff=1000.0, #self.nuts_max_energy_diff,
-            #unrolled_leapfrog_steps=self.nuts_unrolled_leapfrog_steps,
-            #parallel_iterations=self.nuts_parallel_iterations,
+            step_size=self.nuts_step_size,
+            max_tree_depth=self.nuts_max_tree_depth,
+            max_energy_diff=self.nuts_max_energy_diff,
             name='nuts_kernel'
         )
         logger.info(f"NUTS kernel initialized with step_size={self.nuts_step_size}, "
                    f"max_tree_depth={self.nuts_max_tree_depth}")
         
-        # Adaptive step size
-        # target_accept_prob is critical for proper adaptation!
-        # Use a lower target (0.65) for better exploration in high dimensions
+        # Adaptive step size: lower target_accept_prob (e.g. 0.65–0.75) often improves exploration
         adaptive_kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
             inner_kernel=nuts_kernel,
-            num_adaptation_steps=1000,#self.nuts_num_adaptation_steps,
-            target_accept_prob=0.8,  
+            num_adaptation_steps=self.nuts_num_adaptation_steps,
+            target_accept_prob=self.nuts_target_accept_prob,
         )
-        logger.info(f"Adaptive kernel initialized with {self.nuts_num_adaptation_steps} adaptation steps")
+        logger.info(f"Adaptive kernel: {self.nuts_num_adaptation_steps} adaptation steps, "
+                   f"target_accept_prob={self.nuts_target_accept_prob}")
         # Run sampling
         start_time = default_timer()
+
+        # Progress reporting: trace_fn is called every step; we print every N steps so the run is not silent.
+        # Without this, the first @tf.function trace runs the full chain with no output (appears to freeze).
+        progress_interval = max(1, int(self.nuts_progress_interval)) if self.nuts_progress_interval > 0 else 0
+        step_counter = tf.Variable(0, dtype=tf.int32) if progress_interval > 0 else None
+
+        if progress_interval > 0:
+            def trace_fn(_, pkr):
+                step_counter.assign_add(1)
+                tf.cond(
+                    tf.equal(tf.math.mod(step_counter, progress_interval), 0),
+                    lambda: (tf.print("ROSE NUTS progress:", step_counter, "steps"), tf.constant(0, dtype=tf.int32))[1],
+                    lambda: tf.constant(0, dtype=tf.int32),
+                )
+                return pkr
+        else:
+            def trace_fn(_, pkr):
+                return pkr
+
+        # Define once outside the loop so we only trace the graph once (first call is slow, then reuse).
+        @tf.function
+        def run_chain(chain_initial, chain_idx_tensor):
+            return tfp.mcmc.sample_chain(
+                num_results=self.nuts_num_results,
+                num_burnin_steps=self.nuts_num_burnin_steps,
+                current_state=chain_initial,
+                kernel=adaptive_kernel,
+                trace_fn=trace_fn,
+                seed=self.seed + int(chain_idx_tensor) if self.seed is not None else None,
+            )
+
+        if progress_interval > 0:
+            logger.info(
+                f"Running {self.nuts_num_chains} chain(s) with {self.nuts_num_results} samples each "
+                f"(burnin={self.nuts_num_burnin_steps}). First run may take 5–15 min while TensorFlow compiles; "
+                f"progress every {progress_interval} steps."
+            )
+        else:
+            logger.info(
+                f"Running {self.nuts_num_chains} chain(s) with {self.nuts_num_results} samples each "
+                f"(burnin={self.nuts_num_burnin_steps}). First run may take 5–15 min while TensorFlow compiles."
+            )
         
         # Run multiple chains if requested
         all_chains = []
@@ -398,77 +481,70 @@ class RoseSamplingMixin:
         for chain_idx in range(self.nuts_num_chains):
             if self.nuts_num_chains > 1:
                 # Slightly perturb initial state for each chain
-                # Use larger perturbation to ensure different starting points
-                perturbation_scale = 0.1 * tf.reduce_max(tf.abs(initial_state))
+                #perturbation_scale = 0.0001 * tf.reduce_max(tf.abs(initial_state)) + 1e-8
+                perturbation_scale = 0.1 * tf.reduce_max(tf.abs(initial_state)) 
                 chain_initial = initial_state + tf.random.normal(
                     shape=initial_state.shape,
                     stddev=perturbation_scale,
                     dtype=tf.float32,
                     seed=self.seed + chain_idx if self.seed is not None else None
                 )
-                logger.info(f"Chain {chain_idx + 1}: perturbed initial state by ~{perturbation_scale:.4f}")
+                logger.info(f"Chain {chain_idx + 1}: perturbed initial state by ~{float(perturbation_scale):.4f}")
             else:
                 chain_initial = initial_state
-                logger.info(f"Chain {chain_idx + 1}: using initial state {chain_initial.numpy()}")    
-        # Run MCMC
-        @tf.function
-        def run_chain():
-            return tfp.mcmc.sample_chain(
-                num_results=2000, #self.nuts_num_results,
-                num_burnin_steps=1000, #self.nuts_num_burnin_steps,
-                current_state=chain_initial,
-                kernel=adaptive_kernel,
-                #trace_fn=None,  # Don't trace kernel results (we'll compute log probs separately)
-                trace_fn=lambda _, pkr: pkr,
-                seed=self.seed + chain_idx if self.seed is not None else None,
-            )
-        
-        samples, trace = run_chain()
+                logger.info(f"Chain {chain_idx + 1}: using initial state")
 
-            
-        # Convert to numpy
-        samples_np = samples.numpy()
-        if len(samples_np.shape) == 1:
-            samples_np = samples_np.reshape(-1, 1)
+            if step_counter is not None:
+                step_counter.assign(0)
+            samples, trace = run_chain(chain_initial, tf.constant(chain_idx, dtype=tf.int32))
+
+            # Convert to numpy (per chain)
+            samples_np = samples.numpy()
+            if len(samples_np.shape) == 1:
+                samples_np = samples_np.reshape(-1, 1)
+
+            # If we sampled in unit space, convert to physical for run_results and storage
+            if self.nuts_sample_unit_space:
+                samples_physical = np.array([
+                    self.pipeline.denormalize_vector_from_prior(samples_np[i])
+                    for i in range(len(samples_np))
+                ])
+            else:
+                samples_physical = samples_np
+
+            chain_log_probs = []
+            chain_blobs = []
+            for sample in samples_physical:
+                try:
+                    r = self.emu_pipeline.run_results(sample)
+                    chain_log_probs.append(r.post * tempering)
+                    chain_blobs.append((r.prior, r.extra))
+                except Exception:
+                    chain_log_probs.append(-np.inf)
+                    chain_blobs.append((-np.inf, [np.nan] * self.pipeline.number_extra))
+
+            all_chains.append(samples_physical)
+            all_log_probs.append(chain_log_probs)
+            all_blobs.append(chain_blobs)
         
-        # Compute log probabilities and blobs for each sample
-        chain_log_probs = []
-        chain_blobs = []
-        for sample in samples_np:
-            try:
-                r = self.emu_pipeline.run_results(sample)
-                chain_log_probs.append(r.post * tempering)
-                chain_blobs.append((r.prior, r.extra))
-            except Exception:
-                chain_log_probs.append(-np.inf)
-                chain_blobs.append((-np.inf, [np.nan] * self.pipeline.number_extra))
-        
-        all_chains.append(samples_np)
-        all_log_probs.append(chain_log_probs)
-        all_blobs.append(chain_blobs)
-        
-        # Combine chains
+        # Combine chains (after loop)
         if self.nuts_num_chains > 1:
             self.chain = np.vstack(all_chains)
             self.nuts_logp = np.concatenate(all_log_probs)
             self.blobs = [item for sublist in all_blobs for item in sublist]
         else:
             # For single chain, use the results from the loop
-            self.chain = all_chains[0] if all_chains else samples_np
+            self.chain = all_chains[0] if all_chains else np.array([])
             self.nuts_logp = np.array(all_log_probs[0]) if all_log_probs else np.array([])
             self.blobs = all_blobs[0] if all_blobs else []
         
-        # Convert to unit cube
+        # Convert to unit cube for output consistency
         self.unit_chain = np.array([
             self.pipeline.normalize_vector_to_prior(p) for p in self.chain
         ])
         
         end_time = default_timer()
         logger.info(f"NUTS sampling took {end_time - start_time:.1f} seconds")
-        logger.info(f"HERE:")
-        logger.info(f"Is accepted: {trace.inner_results.is_accepted}")
-        logger.info(f"Step size: {trace.inner_results.step_size}")
-        logger.info(f"Has divergence: {trace.inner_results.has_divergence}")
         
         # Process NUTS results
         self._process_nuts_results(tempering)
@@ -511,6 +587,8 @@ class RoseSamplingMixin:
         
         if emulator.data_trafo == 'log_norm':
             predictions = tf.pow(10.0, pred_intermediate)
+        elif emulator.data_trafo == 'signed_log_norm':
+            predictions = tf.sign(pred_intermediate) * tf.multiply(s, tf.subtract(tf.pow(10.0, tf.abs(pred_intermediate)), 1.0))
         elif emulator.data_trafo == 'norm':
             predictions = pred_intermediate
         elif emulator.data_trafo == 'PCA':
@@ -636,8 +714,6 @@ class RoseSamplingMixin:
         log_prior = tf.reshape(log_prior, [])
         
         # Log posterior with tempering
-        # Both log_like and log_prior are now fully differentiable
-        print(r"Tempering: ", tempering)
         log_post = (log_like + log_prior) * tempering
         # Ensure final result is a scalar
         log_post = tf.reshape(log_post, [])
@@ -691,6 +767,10 @@ class RoseSamplingMixin:
         else:
             burn = int(self.emcee_burn)
         
+        # Ensure we keep at least one sample (e.g. when convergence broke early)
+        #n_iterations = emcee_sampler.get_chain().shape[0]
+        #burn = min(burn, max(0, n_iterations - 1))
+        
         # Extract chains
         self.unit_chain = emcee_sampler.get_chain(discard=burn, thin=self.emcee_thin, flat=True)
         logp = emcee_sampler.get_log_prob(discard=burn, thin=self.emcee_thin, flat=True)
@@ -701,7 +781,9 @@ class RoseSamplingMixin:
             self.pipeline.denormalize_vector_from_prior(p) for p in self.unit_chain
         ])
         
-        # Handle output file management
+        # Final iteration (e.g. trained_before=True or last of multi-iteration): write to main file only.
+        # Intermediate iterations: save current chain to suffixed file and reset main for next chain.
+        #is_final_chain = (self.iterations == self.max_iterations - 1)
         if self.save_outputs == SAVE_ALL and 0 < self.iterations < self.max_iterations:
             suffix = f'_tempering_{self.tempering[self.iterations-1]}_iteration_{self.iterations}'
             self.output.save_and_reset_to_chain_start(suffix)
