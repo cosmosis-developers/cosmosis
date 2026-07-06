@@ -771,6 +771,10 @@ class RoseSamplingMixin:
         self.unit_chain = self.unit_chain[burn::thin]
         logp = self.nuts_logp[burn::thin]
         self.blobs = self.blobs[burn::thin]
+
+        # Store the (untempered) posterior per chain point for credible-region
+        # test-point selection in the next iteration.
+        self.chain_logpost = np.asarray(logp) / tempering
         
         # Handle output file management
         if self.save_outputs == SAVE_ALL and 0 < self.iterations < self.max_iterations:
@@ -819,6 +823,11 @@ class RoseSamplingMixin:
         self.chain = np.array([
             self.pipeline.denormalize_vector_from_prior(p) for p in self.unit_chain
         ])
+
+        # Store the (untempered) posterior per chain point, aligned with
+        # self.chain/self.unit_chain, so the next iteration can select test
+        # points from the 1-sigma credible region of this chain.
+        self.chain_logpost = np.asarray(logp) / tempering
         
         # Final iteration (e.g. trained_before=True or last of multi-iteration): write to main file only.
         # Intermediate iterations: save current chain to suffixed file and reset main for next chain.
@@ -902,6 +911,10 @@ class RoseSamplingMixin:
         self.unit_chain = np.array([
             self.pipeline.normalize_vector_to_prior(p) for p in samples
         ])
+
+        # Store the (untempered) posterior per chain point for credible-region
+        # test-point selection in the next iteration.
+        self.chain_logpost = np.asarray(posts)
         
         # Create log probability array (tempered)
         tempered_posts = posts * tempering

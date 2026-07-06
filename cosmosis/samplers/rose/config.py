@@ -112,6 +112,30 @@ class RoseConfigMixin:
         self.initial_size = self.read_ini("initial_size", int, 9600)
         self.resample_size = self.read_ini("resample_size", int, 4800)
         self.chi2_cut_off = self.read_ini("chi2_cut_off", float)
+        # Number of test points collected once, in the last training iteration,
+        # from the 1-sigma or 2-sigma (credible) region of the one-before-last MCMC chain.
+        self.final_test_size = self.read_ini(
+            "final_test_size", int, int(0.5 * self.resample_size)
+        )
+        # Fraction of the chain (ranked by posterior) that defines the
+        # "1-sigma"/68% credible region from which test points are drawn;
+        # should be 0.95 for 2-sigma/95% credible region.
+        self.test_credible_fraction = self.read_ini(
+            "test_credible_fraction", float, 0.95 
+        )
+        # Convergence (KL divergence) settings. This test is opt-in: set
+        # kl_convergence = T in the ini file to enable it. When enabled, before
+        # the final sampling stage the test points are folded into the training
+        # set, the emulator is retrained, and the KL divergence between the
+        # emulated posteriors of two consecutive iterations is computed. If it
+        # exceeds kl_threshold, extra training points are added and the emulator
+        # is retrained until the criterion is met or kl_max_retrain attempts are
+        # exhausted.
+        self.kl_convergence = self.read_ini("kl_convergence", bool, False)
+        self.kl_threshold = self.read_ini("kl_threshold", float, 0.1)
+        self.kl_max_retrain = self.read_ini("kl_max_retrain", int, 5)
+        self.kl_extra_size = self.read_ini("kl_extra_size", int, self.resample_size)
+        self.kl_n_samples = self.read_ini("kl_n_samples", int, 2000)
         self.batch_size = _parse_per_likelihood(
             self.read_ini("batch_size", str, "32"), int
         )
@@ -126,6 +150,18 @@ class RoseConfigMixin:
             raise ValueError("initial_size must be >= 10")
         if self.resample_size < 1:
             raise ValueError("resample_size must be >= 1")
+        if self.final_test_size < 0:
+            raise ValueError("final_test_size must be >= 0 (use 0 to disable test collection)")
+        if not (0.0 < self.test_credible_fraction <= 1.0):
+            raise ValueError("test_credible_fraction must be in (0, 1]")
+        if self.kl_threshold <= 0:
+            raise ValueError("kl_threshold must be > 0")
+        if self.kl_max_retrain < 0:
+            raise ValueError("kl_max_retrain must be >= 0")
+        if self.kl_extra_size < 1:
+            raise ValueError("kl_extra_size must be >= 1")
+        if self.kl_n_samples < 10:
+            raise ValueError("kl_n_samples must be >= 10")
         if any(v < 1 for v in _setting_values(self.batch_size)):
             raise ValueError("batch_size must be >= 1 (for every likelihood)")
         if any(v < 1 for v in _setting_values(self.training_iterations)):

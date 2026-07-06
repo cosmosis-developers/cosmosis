@@ -191,31 +191,50 @@ class RoseDataProcessingMixin:
         
         unit_sample = self.unit_chain[random_indices]
         sample = self.chain[random_indices]
-        
-        # Select test samples (20% of resample size)
-        test_size = max(1, int(0.2 * self.resample_size))
-        test_indices = self._select_non_overlapping_indices(chain_length, random_indices, test_size)
-        
-        unit_sample_test = self.unit_chain[test_indices]
-        sample_test = self.chain[test_indices]
-        
-        logger.info(f"Running exact pipeline on {len(sample)} training + {len(sample_test)} test samples")
+
+        # Test points are collected only once, during the last training
+        # iteration (i.e. just before the final sampling stage), drawn from the
+        # 1-sigma / credible region of the one-before-last MCMC chain (the chain
+        # currently stored in self.chain). In all earlier iterations no test
+        # points are evaluated.
+        collect_test = (
+            self.iterations == (self.max_iterations - 1)
+            and self.final_test_size > 0
+        )
+        sample_test = None
+        unit_sample_test = None
+        if collect_test:
+            test_indices = self._select_credible_region_indices(self.final_test_size)
+            unit_sample_test = self.unit_chain[test_indices]
+            sample_test = self.chain[test_indices]
+            logger.info(
+                f"Collecting {len(sample_test)} test points from the "
+                f"{self.test_credible_fraction:.0%} credible region of the "
+                "one-before-last MCMC chain (final training iteration)"
+            )
+
+        n_test = len(sample_test) if collect_test else 0
+        logger.info(f"Running exact pipeline on {len(sample)} training + {n_test} test samples")
         
         # Evaluate samples with exact pipeline
         start_time = default_timer()
+        sample_results_test = None
         if self.pool:
             sample_results = self.pool.map(_task_wrapper, sample)
-            sample_results_test = self.pool.map(_task_wrapper, sample_test)
+            if collect_test:
+                sample_results_test = self.pool.map(_task_wrapper, sample_test)
         else:
             sample_results = [task(p, self) for p in sample]
-            sample_results_test = [task(p, self) for p in sample_test]
+            if collect_test:
+                sample_results_test = [task(p, self) for p in sample_test]
         
         end_time = default_timer()
         logger.info(f"Sample evaluation took {end_time - start_time:.1f} seconds")
         
-        # Update training and test sets
+        # Update training set (every iteration) and test set (final iteration only)
         self._update_training_set(sample_results, sample, unit_sample)
-        self._update_test_set(sample_results_test, sample_test, unit_sample_test)
+        if collect_test:
+            self._update_test_set(sample_results_test, sample_test, unit_sample_test)
         
         # Save datasets if requested
         if self.save_outputs == SAVE_ALL and self.iterations == (self.max_iterations - 1):
@@ -233,6 +252,54 @@ class RoseDataProcessingMixin:
             n_select = len(available_indices)
         
         return np.random.choice(available_indices, size=n_select, replace=False)
+
+    def _select_credible_region_indices(self, n_select: int) -> np.ndarray:
+        """Select chain indices inside the 1-sigma (credible) region.
+
+        The one-before-last MCMC chain is ranked by its posterior value and the
+        highest-posterior fraction (``test_credible_fraction``, default 0.95) is
+        taken as the 1-sigma credible region. For an equal-weight MCMC sample,
+        keeping the top 68% of points by posterior density is equivalent to the
+        68% highest-posterior-density (HPD) credible region, and is robust in any
+        number of dimensions. ``n_select`` points are then drawn uniformly from
+        that region.
+
+        Args:
+            n_select: Number of test points to draw from the credible region.
+
+        Returns:
+            Array of indices into ``self.chain`` / ``self.unit_chain``.
+        """
+        logpost = getattr(self, "chain_logpost", None)
+        if logpost is None or len(logpost) != len(self.chain):
+            logger.warning(
+                "Chain posterior values unavailable; drawing test points from "
+                "the full chain instead of the 1-sigma credible region."
+            )
+            region_indices = np.arange(len(self.chain))
+        else:
+            logpost = np.asarray(logpost)
+            finite = np.isfinite(logpost)
+            n_finite = int(finite.sum())
+            if n_finite == 0:
+                logger.warning(
+                    "No finite posterior values in chain; using full chain for "
+                    "test-point selection."
+                )
+                region_indices = np.arange(len(self.chain))
+            else:
+                # Rank by posterior (descending) and keep the top fraction.
+                order = np.argsort(logpost)[::-1][:n_finite]
+                n_region = max(1, int(np.ceil(self.test_credible_fraction * n_finite)))
+                region_indices = order[:n_region]
+
+        replace = len(region_indices) < n_select
+        if replace:
+            logger.warning(
+                f"Credible region has only {len(region_indices)} points, fewer "
+                f"than requested {n_select}; sampling with replacement."
+            )
+        return np.random.choice(region_indices, size=n_select, replace=replace)
 
     def _update_training_set(self, sample_results: List, sample: np.ndarray, 
                            unit_sample: np.ndarray) -> None:

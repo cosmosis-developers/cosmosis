@@ -24,6 +24,7 @@ import cosmosis.samplers.rose.data_processing as data_processing_module
 from .pipeline_setup import RosePipelineSetupMixin
 from .emulator_management import RoseEmulatorManagementMixin
 from .sampling import RoseSamplingMixin
+from .convergence import RoseConvergenceMixin
 import cosmosis.samplers.rose.utils as utils_module
 
 # Configure logging
@@ -36,7 +37,8 @@ class RoseSampler(
     RoseDataProcessingMixin,
     RosePipelineSetupMixin,
     RoseEmulatorManagementMixin,
-    RoseSamplingMixin
+    RoseSamplingMixin,
+    RoseConvergenceMixin
 ):
     """Emulator-accelerated MCMC sampler for CosmoSIS.
     
@@ -158,6 +160,12 @@ class RoseSampler(
         
         # Check if this is the final iteration and we should use nautilus or NUTS
         is_final_iteration = (self.iterations == self.max_iterations - 1)
+
+        # Run convergence diagnostics on the test points collected from the
+        # 1-sigma region of the one-before-last chain, using the freshly trained
+        # emulator, just before entering the final sampling stage.
+        if is_final_iteration:
+            self.run_convergence_tests()
         
         t2 = time.perf_counter()
         if is_final_iteration and self.use_nuts_final:
