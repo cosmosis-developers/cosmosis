@@ -54,12 +54,6 @@ def task(p: np.ndarray, sampler: Any, return_all: bool = False) -> Optional[Unio
     and extracts the theory predictions, data vectors, and likelihood information
     needed for emulator training or MCMC sampling.
     
-    The theory/data vectors are grouped per-likelihood so that independent
-    emulators can be trained for each likelihood. The grouping key is:
-    - the ``base_key`` (likelihood name) when scanning ``data_vector/*_theory``
-      entries (e.g. ``desi_bao``, ``lsst``);
-    - the ``key`` string when ``sampler.keys`` is set (user-specified outputs).
-    
     Args:
         p: Parameter vector to evaluate
         sampler: RoseSampler instance (needed for pipeline and keys)
@@ -68,12 +62,8 @@ def task(p: np.ndarray, sampler: Any, return_all: bool = False) -> Optional[Unio
                    
     Returns:
         If return_all=False: (likelihood, data_vectors_theory, prior, posterior)
-          where data_vectors_theory is a dict {likelihood_name: np.ndarray}
-        If return_all=True: (likelihood, data_vectors_theory, data_vectors,
+        If return_all=True: (likelihood, data_vectors_theory, data_vectors, 
                            inv_covariance, error_vectors, block)
-          where all four vector containers are dicts keyed by likelihood name.
-          data_vectors and inv_covariance only contain entries for likelihoods
-          whose {base_key}_data / {base_key}_inverse_covariance blocks were found.
         None if pipeline execution failed
     """
     r = sampler.pipeline.run_results(p)
@@ -82,56 +72,55 @@ def task(p: np.ndarray, sampler: Any, return_all: bool = False) -> Optional[Unio
         logger.warning(f"(Within Task) Pipeline execution failed for parameters: {p}")
         return None
 
-    data_vectors_theory: dict[str, np.ndarray] = {}
-    data_vectors: dict[str, np.ndarray] = {}
-    error_vectors: dict[str, np.ndarray] = {}
-    data_inv_covariance: dict[str, np.ndarray] = {}
-
+    data_vectors_theory = []
+    data_vectors = []
+    error_vectors = []
+    data_inv_covariance = []
+    
     if sampler.keys:
-        # User has specified which keys to emulate: use `key` as the likelihood id
+        # User has specified which keys to emulate
         for sec, key in sampler.keys:
             value = block[sec, key]
+            # Ensure value is always an array for consistency
             if isinstance(value, (int, float)):
-                data_vectors_theory[key] = np.array([value])
+                data_vectors_theory.append(np.array([value]))
             else:
-                data_vectors_theory[key] = np.asarray(value)
-
+                data_vectors_theory.append(np.asarray(value))
+                
         if return_all:
             if sampler.error_keys:
-                if len(sampler.error_keys) != len(sampler.keys):
-                    raise ValueError(
-                        f"error_keys length ({len(sampler.error_keys)}) must match "
-                        f"keys length ({len(sampler.keys)})"
-                    )
-                for (_, out_key), (sec, err_key) in zip(sampler.keys, sampler.error_keys):
-                    error_vectors[out_key] = np.asarray(block[sec, err_key])
+                for sec, key in sampler.error_keys:
+                    error_vectors.append(np.asarray(block[sec, key]))
             else:
-                for name, d in data_vectors_theory.items():
-                    error_vectors[name] = np.ones_like(d)
+                # Default to unit errors if none specified
+                for d in data_vectors_theory:
+                    error_vectors.append(np.ones_like(d))
     else:
-        # Group by likelihood (base_key) from the data_vector section
+        # Use all theory predictions from data_vector section
         for sec, key in block.keys(section="data_vector"):
             if not key.endswith("_theory"):
                 continue
-            base_key = key[:-7]  # Remove '_theory' suffix
-            data_vectors_theory[base_key] = np.asarray(r.block[sec, key])
-
+            print(f"key: {key}")
+            data_vectors_theory.append(r.block[sec, key])
+            
             if return_all:
+                # Extract corresponding data and covariance
+                base_key = key[:-7]  # Remove '_theory' suffix
                 try:
                     covmat = block[sec, base_key + "_covariance"]
-                    error_vectors[base_key] = np.sqrt(np.diag(covmat))
-                    data_inv_covariance[base_key] = block[sec, base_key + "_inverse_covariance"]
-                    data_vectors[base_key] = block[sec, base_key + "_data"]
+                    sigma = np.sqrt(np.diag(covmat))
+                    error_vectors.append(sigma)
+                    data_inv_covariance.append(block[sec, base_key + "_inverse_covariance"])
+                    data_vectors.append(block[sec, base_key + "_data"])
                 except KeyError as e:
                     logger.warning(f"Missing covariance data for {base_key}: {e}")
-                    error_vectors[base_key] = np.ones_like(data_vectors_theory[base_key])
-
+                    # Use unit errors as fallback
+                    error_vectors.append(np.ones_like(data_vectors_theory[-1]))
+       
     if return_all:
-        if set(error_vectors.keys()) != set(data_vectors_theory.keys()):
-            raise ValueError(
-                f"Mismatch between error vectors ({sorted(error_vectors)}) "
-                f"and theory vectors ({sorted(data_vectors_theory)})"
-            )
+        if len(error_vectors) != len(data_vectors_theory):
+            raise ValueError(f"Mismatch: {len(error_vectors)} error vectors vs "
+                           f"{len(data_vectors_theory)} theory vectors")
         return r.like, data_vectors_theory, data_vectors, data_inv_covariance, error_vectors, r.block
     else:
         return r.like, data_vectors_theory, r.prior, r.post

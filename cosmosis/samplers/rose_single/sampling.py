@@ -126,24 +126,17 @@ class RoseSamplingMixin:
         
         logger.info(f"Starting Nautilus sampling with n_live={self.nautilus_n_live}")
         
-        # Capture current model directory so workers (which never run execute()) load the same
-        # per-likelihood emulators when the pool pickles these callables.
+        # Capture current model path so workers (which never run execute()) load the same emulator
+        # when the pool pickles these callables.
         current_model_path = os.path.join(self.save_outputs_dir, f'emumodel_{self.iterations + 1}')
-        # When using a pool, workers load from disk; ensure every per-likelihood
-        # emulator is on disk even if save_outputs is not "all".
-        if self.pool is not None and self.emulator:
-            emulators_dict = (
-                self.emulator if isinstance(self.emulator, dict)
-                else {self.likelihood_names[0]: self.emulator}
-            )
-            os.makedirs(current_model_path, exist_ok=True)
-            for name, emu in emulators_dict.items():
-                info_file = os.path.join(current_model_path, name) + ".npz"
-                if not os.path.exists(info_file):
-                    logger.info(
-                        f"Saving emulator for '{name}' to disk so workers can load it"
-                    )
-                    emu.save_to(os.path.join(current_model_path, name))
+        # When using a pool, workers load from disk; ensure the current model is saved there
+        # even if save_outputs is not "all" (train_emulator always saves, but this covers
+        # any case where the file might be missing).
+        if self.pool is not None and self.emulator is not None:
+            info_file = current_model_path + ".npz"
+            if not os.path.exists(info_file):
+                logger.info("Saving current emulator to disk so worker processes can load it")
+                self.emulator.save_to(current_model_path)
         # Module-level callables + partial(model_path=...) pickle for MPI; nested defs do not.
         prior_transform_with_path = partial(
             prior_transform, model_path=current_model_path
@@ -343,34 +336,20 @@ class RoseSamplingMixin:
             ])
             initial_state_unit = self.pipeline.normalize_vector_to_prior(initial_state_physical)
         
-        # Create TensorFlow-compatible log probability function with autodiff.
-        # ROSE now trains one emulator per likelihood; NUTS currently supports a
-        # single emulator in its autodiff path, so we pick the first likelihood
-        # here and fall back to the non-TF path for everything else.
-        # TODO: Extend NUTS to sum chi2 contributions across all likelihoods.
-        if not self.emulator:
-            raise RuntimeError("Emulators not set. This should be set during training or loading.")
-        if isinstance(self.emulator, dict):
-            nuts_likelihood_name = next(iter(self.emulator))
-            emulator = self.emulator[nuts_likelihood_name]
-            if len(self.emulator) > 1:
-                logger.warning(
-                    "NUTS autodiff path only supports one likelihood; using "
-                    f"'{nuts_likelihood_name}' and ignoring the rest for gradient "
-                    "computation. Other likelihoods remain active through the "
-                    "non-TF fallback path."
-                )
-        else:
-            nuts_likelihood_name = None
-            emulator = self.emulator
+        # Create TensorFlow-compatible log probability function with autodiff
+        # Similar to compute_gradients, but for log posterior
+        # Access emulator (stored in both self.emulator and self.emu_module.data.emulator)
+        emulator = self.emulator
+        if emulator is None:
+            raise RuntimeError("Emulator not set. This should be set during training or loading.")
         DTYPE = tf.float32
-
+        
         # Get normalization constants
         X_mean_tf = tf.constant([emulator.X_mean[key] for key in emulator.model_parameters], dtype=DTYPE)
         X_std_tf = tf.constant([emulator.X_std[key] for key in emulator.model_parameters], dtype=DTYPE)
         y_mean_tf = tf.constant(emulator.y_mean, dtype=DTYPE)
         y_std_tf = tf.constant(emulator.y_std, dtype=DTYPE)
-
+        
         # Get data vector and inverse covariance from pipeline for likelihood computation
         # Extract these from a sample run to use as TensorFlow constants
         data_vector_tf = None
@@ -378,20 +357,11 @@ class RoseSamplingMixin:
         logger.info(f"Initial state for NUTS: {initial_state_physical}")
         try:
             like, data_vectors_theory, data_vectors, data_inv_covariance, error_vectors, block = utils_module.task(initial_state_physical, self, True)
-            logger.info(
-                f"Extracted data vectors for likelihoods: {list(data_vectors.keys())} "
-                f"and covariance matrices for: {list(data_inv_covariance.keys())}"
-            )
-            if nuts_likelihood_name is not None and nuts_likelihood_name in data_vectors:
-                dv = data_vectors[nuts_likelihood_name]
-                icov = data_inv_covariance[nuts_likelihood_name]
-            else:
-                # Fallback: use whichever likelihood appears first
-                first_key = next(iter(data_vectors))
-                dv = data_vectors[first_key]
-                icov = data_inv_covariance[first_key]
-            data_vector_tf = tf.constant(np.atleast_1d(dv), dtype=DTYPE)
-            inv_covariance_tf = tf.constant(np.atleast_2d(icov), dtype=DTYPE)
+            logger.info(f"Extracted {len(data_vectors)} data vectors and {len(data_inv_covariance)} covariance matrices")
+            # For now let's test just one probe's data vector and inverse covariance
+            # TODO: Handle multiple probes properly
+            data_vector_tf = tf.constant(np.atleast_1d(data_vectors[0]), dtype=DTYPE)
+            inv_covariance_tf = tf.constant(np.atleast_2d(data_inv_covariance[0]), dtype=DTYPE)
             logger.info(f"Data vector shape: {data_vector_tf.shape}, Inv covariance shape: {inv_covariance_tf.shape}")
         except Exception as e:
             logger.warning(f"Could not get sample run for NUTS data extraction: {e}")
@@ -791,29 +761,20 @@ class RoseSamplingMixin:
 
     def _process_mcmc_results(self, emcee_sampler: Any, tempering: float) -> None:
         """Process MCMC results and update output chains."""
-        # Base the burn-in on the *actual* number of iterations run, not the
-        # configured maximum. Otherwise an early-converged chain (e.g. emcee
-        # stopping at 1500 / 5000 steps) would have every sample discarded
-        # when using a fractional burn-in, leaving `self.chain` empty and
-        # breaking downstream resampling.
-        n_iterations = emcee_sampler.get_chain().shape[0]
+        # Calculate burn-in
         if self.emcee_burn < 1:
-            burn = int(self.emcee_burn * n_iterations)
+            burn = int(self.emcee_burn * self.emcee_samples)
         else:
             burn = int(self.emcee_burn)
-        # Always keep at least one walker-step so the chain isn't empty.
-        burn = min(burn, max(0, n_iterations - 1))
-
+        
+        # Ensure we keep at least one sample (e.g. when convergence broke early)
+        #n_iterations = emcee_sampler.get_chain().shape[0]
+        #burn = min(burn, max(0, n_iterations - 1))
+        
         # Extract chains
         self.unit_chain = emcee_sampler.get_chain(discard=burn, thin=self.emcee_thin, flat=True)
         logp = emcee_sampler.get_log_prob(discard=burn, thin=self.emcee_thin, flat=True)
         self.blobs = emcee_sampler.get_blobs(discard=burn, thin=self.emcee_thin, flat=True)
-        if len(self.unit_chain) == 0:
-            raise RuntimeError(
-                f"emcee produced an empty chain after burn-in "
-                f"(iterations={n_iterations}, burn={burn}, thin={self.emcee_thin}). "
-                "Reduce emcee_burn or increase emcee_samples."
-            )
         
         # Transform to physical parameters
         self.chain = np.array([

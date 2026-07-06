@@ -92,23 +92,22 @@ class RoseDataProcessingMixin:
         
         # Extract components
         sample_likes = np.array([s[0] for s in valid_results])
-        sample_data_vectors = self._stack_per_likelihood([s[1] for s in valid_results])
+        sample_data_vectors = np.array([np.concatenate(s[1]) for s in valid_results])
         sample_priors = np.array([s[2] for s in valid_results])
         sample_posts = np.array([s[3] for s in valid_results])
         
         # Apply chi2 cutoff
         chi2_values = -2 * sample_likes
         cut = chi2_values < self.chi2_cut_off
-
-        shapes = {name: v.shape for name, v in sample_data_vectors.items()}
-        logger.info(f"Data vector shapes per likelihood: {shapes}")
+        
+        logger.info(f"Data vector shape: {sample_data_vectors.shape}")
         logger.info(f"Chi2 range: [{chi2_values.min():.1f}, {chi2_values.max():.1f}]")
         
         # Filter arrays
         self.sample_likes = sample_likes[cut]
         self.sample_priors = sample_priors[cut]
         self.sample_posts = sample_posts[cut]
-        self.sample_data_vectors = {name: v[cut] for name, v in sample_data_vectors.items()}
+        self.sample_data_vectors = sample_data_vectors[cut]
 
         
         # Filter corresponding parameter arrays
@@ -134,30 +133,12 @@ class RoseDataProcessingMixin:
     def _initialize_test_storage(self) -> None:
         """Initialize storage for test samples."""
         self.sample_test = np.array([]).reshape(0, self.ndim)
-        self.sample_data_vectors_test = {
-            name: np.empty((0, v.shape[1])) for name, v in self.sample_data_vectors.items()
-        }
+        self.sample_data_vectors_test = np.array([]).reshape(0, self.sample_data_vectors.shape[1])
         self.unit_sample_test = np.array([]).reshape(0, self.ndim)
         self.sample_likes_test = np.array([])
         self.sample_priors_test = np.array([])
         self.sample_posts_test = np.array([])
         self.points_per_iteration_test = np.array([])
-
-    @staticmethod
-    def _stack_per_likelihood(theory_dicts: List[dict]) -> dict:
-        """Stack a list of per-likelihood theory dicts into a dict of 2D arrays.
-
-        Assumes all dicts have the same set of likelihood keys in the same
-        (insertion) order, which is guaranteed by utils.task scanning block
-        entries deterministically.
-        """
-        if not theory_dicts:
-            return {}
-        names = list(theory_dicts[0].keys())
-        return {
-            name: np.array([np.asarray(d[name]) for d in theory_dicts])
-            for name in names
-        }
 
     def generate_updated_sample(self) -> None:
         """Generate additional training samples from MCMC chain.
@@ -169,25 +150,9 @@ class RoseDataProcessingMixin:
         
         # Select random samples from chain
         chain_length = len(self.chain)
-        if chain_length == 0:
-            raise RuntimeError(
-                "Cannot resample training points: the MCMC chain is empty. "
-                "This usually means the sampler converged before the configured "
-                "emcee_samples were reached and the burn-in then discarded "
-                "everything. Lower emcee_burn or increase emcee_samples."
-            )
-        if chain_length < self.resample_size:
-            logger.warning(
-                f"Chain has {chain_length} samples, fewer than resample_size="
-                f"{self.resample_size}; sampling with replacement."
-            )
-            random_indices = np.random.choice(
-                chain_length, size=self.resample_size, replace=True
-            )
-        else:
-            random_indices = np.random.choice(
-                chain_length, size=self.resample_size, replace=False
-            )
+        random_indices = np.random.choice(
+            chain_length, size=self.resample_size, replace=False
+        )
         
         unit_sample = self.unit_chain[random_indices]
         sample = self.chain[random_indices]
@@ -245,11 +210,12 @@ class RoseDataProcessingMixin:
         
         # For the case of rejected points due to additional priors, for instance, w0+wa<0
         if len(valid_results) < 0.8*self.resample_size:
+            #raise RuntimeError(f"Only {len(valid_results)} samples passed chi2 filter, but need "
+            #                 f"at least {0.8*self.resample_size} (80% of resample size) --> increase the resample size")
             logger.warning(f"Only {len(valid_results)} samples passed chi2 filter, but need "
                            f"at least {0.8*self.resample_size} (80% of resample size) --> increase the resample size")
-        if not valid_results:
-            return
-        new_data_vectors = self._stack_per_likelihood([s[1] for s in valid_results])
+        # Extract new data
+        new_data_vectors = np.array([np.concatenate(s[1]) for s in valid_results])
         new_likes = np.array([s[0] for s in valid_results])
         new_priors = np.array([s[2] for s in valid_results])
         new_posts = np.array([s[3] for s in valid_results])
@@ -261,8 +227,7 @@ class RoseDataProcessingMixin:
         
         # Append to existing arrays
         self.sample = np.vstack([self.sample, valid_sample])
-        for name, block in new_data_vectors.items():
-            self.sample_data_vectors[name] = np.vstack([self.sample_data_vectors[name], block])
+        self.sample_data_vectors = np.vstack([self.sample_data_vectors, new_data_vectors])
         self.unit_sample = np.vstack([self.unit_sample, valid_unit_sample])
         self.sample_likes = np.concatenate([self.sample_likes, new_likes])
         self.sample_priors = np.concatenate([self.sample_priors, new_priors])
@@ -278,7 +243,8 @@ class RoseDataProcessingMixin:
             logger.warning("No valid results in test sample update")
             return
         
-        new_data_vectors = self._stack_per_likelihood([s[1] for s in valid_results])
+        # Extract new test data
+        new_data_vectors = np.array([np.concatenate(s[1]) for s in valid_results])
         new_likes = np.array([s[0] for s in valid_results])
         new_priors = np.array([s[2] for s in valid_results])
         new_posts = np.array([s[3] for s in valid_results])
@@ -288,12 +254,11 @@ class RoseDataProcessingMixin:
         valid_sample = sample_test[valid_mask]
         valid_unit_sample = unit_sample_test[valid_mask]
 
+        
+        
         # Append to test arrays
         self.sample_test = np.vstack([self.sample_test, valid_sample])
-        for name, block in new_data_vectors.items():
-            self.sample_data_vectors_test[name] = np.vstack(
-                [self.sample_data_vectors_test[name], block]
-            )
+        self.sample_data_vectors_test = np.vstack([self.sample_data_vectors_test, new_data_vectors])
         self.unit_sample_test = np.vstack([self.unit_sample_test, valid_unit_sample])
         self.sample_likes_test = np.concatenate([self.sample_likes_test, new_likes])
         self.sample_priors_test = np.concatenate([self.sample_priors_test, new_priors])
@@ -321,41 +286,26 @@ class RoseDataProcessingMixin:
         np.savez(f'{self.save_outputs_dir}/total_testing_set.npz', **test_dict)
 
     def _build_dataset_dict(self, sample: np.ndarray, unit_sample: np.ndarray,
-                           data_vectors: Dict[str, np.ndarray], likes: np.ndarray,
+                           data_vectors: np.ndarray, likes: np.ndarray,
                            priors: np.ndarray, posts: np.ndarray,
                            points_per_iteration: np.ndarray) -> Dict[str, Any]:
-        """Build dataset dictionary for saving.
-
-        ``data_vectors`` is a per-likelihood dict. We save each likelihood's
-        2D array under ``features/{likelihood_name}`` and also write the
-        concatenated features for convenience, plus per-likelihood sizes.
-        """
+        """Build dataset dictionary for saving."""
         param_names = [str(param) for param in self.pipeline.varied_params]
         
         dataset_dict = {}
         
+        # Add parameter arrays
         for i, param in enumerate(param_names):
             dataset_dict[param] = sample[:, i]
             dataset_dict[f"{param}--norm"] = unit_sample[:, i]
-
-        likelihood_names = list(data_vectors.keys())
-        concatenated = (
-            np.concatenate([data_vectors[n] for n in likelihood_names], axis=1)
-            if likelihood_names and all(len(data_vectors[n]) for n in likelihood_names)
-            else np.empty((0, 0))
-        )
-        for name, block in data_vectors.items():
-            dataset_dict[f"features/{name}"] = block
-
+        
+        # Add metadata and results
         dataset_dict.update({
             'fixed_keys': [str(key) for key in self.fixed_keys] if self.fixed_keys else '',
             'fixed_features': self.fixed_vector,
             'output_keys': [str(key) for key in self.keys] if self.keys else 'data_vector',
-            'likelihood_names': likelihood_names,
-            'features_size': np.array(
-                [self.data_vector_sizes[n] for n in likelihood_names], dtype=int
-            ),
-            'features': concatenated,
+            'features_size': self.data_vector_sizes,
+            'features': data_vectors,
             'chi2': likes,
             'priors': priors,
             'posts': posts,

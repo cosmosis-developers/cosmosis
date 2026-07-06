@@ -2,89 +2,113 @@
 Emulator module for CosmoSIS pipeline integration.
 
 This module provides a CosmoSIS module class that replaces pipeline calculations
-with emulator predictions.
+with emulator predictions. One independent emulator is applied per likelihood;
+outputs are written both as per-likelihood block entries and as a concatenated
+vector for consumers that still expect the flat layout.
 """
 
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from ...runtime import ClassModule
 
 
 class EmulatorModule(ClassModule):
     """CosmoSIS module that replaces pipeline calculations with emulator predictions.
-    
-    This module intercepts the pipeline execution and replaces slow calculations
-    with fast neural network predictions. It handles parameter transformation,
-    emulator prediction, and output formatting.
+
+    Args:
+        options: CosmoSIS-style options (unused).
     """
-    
+
     def __init__(self, options: Dict[str, Any]) -> None:
-        pass
+        self.emulators: Dict[str, Any] = {}
+        self.output_indices: Dict[str, Optional[np.ndarray]] = {}
 
     def set_emulator_info(self, info: Dict[str, Any]) -> None:
         """Set emulator configuration information.
-        
-        Args:
-            info: Dictionary containing:
-                - pipeline: Original CosmoSIS pipeline object
-                - fixed_inputs: Parameters that don't vary during emulation
-                - outputs: List of (section, key) tuples for emulator outputs
-                - sizes: Sizes of each output vector
-                - nn_model: Neural network model type
+
+        Expected keys:
+            - pipeline: original CosmoSIS pipeline object
+            - fixed_inputs: dict of (section, key) -> fixed value
+            - outputs: list of (section, key) tuples (user-specified) or [] for
+              full-data-vector mode
+            - sizes: dict {likelihood_name: size}
+            - likelihood_names: ordered list of likelihood names (canonical order)
+            - nn_model: neural network model type string
+            - output_indices: optional dict {name: indices or None}
         """
         self.pipeline = info["pipeline"]
         self.fixed_inputs = info["fixed_inputs"]
         self.inputs = [(p.section, p.name) for p in self.pipeline.varied_params]
-        self.outputs = info["outputs"]
-        self.sizes = info["sizes"]
+        self.outputs: List = info.get("outputs", []) or []
+        self.sizes: Dict[str, int] = dict(info["sizes"])
+        self.likelihood_names: List[str] = list(
+            info.get("likelihood_names", list(self.sizes.keys()))
+        )
         self.nn_model = info["nn_model"]
-        self.output_indices = info.get("output_indices")
+        self.output_indices = info.get("output_indices") or {
+            n: None for n in self.likelihood_names
+        }
 
     def set_emulator(self, emu: Any) -> None:
-        """Set the trained emulator object.
-        
-        Args:
-            emu: Trained emulator object with predict() method
+        """Set the trained emulator(s).
+
+        Accepts either a dict ``{likelihood_name: emulator}`` or a single
+        emulator (backwards-compatible path used only when exactly one
+        likelihood is registered).
         """
-        self.emulator = emu
+        if isinstance(emu, dict):
+            self.emulators = emu
+        else:
+            if len(self.likelihood_names) != 1:
+                raise ValueError(
+                    "Single emulator provided but multiple likelihoods configured; "
+                    "pass a dict {likelihood_name: emulator} instead."
+                )
+            self.emulators = {self.likelihood_names[0]: emu}
 
     def execute(self, block: Any) -> int:
-        """Execute emulator prediction and populate data block.
-        
-        Args:
-            block: CosmoSIS data block to populate with predictions
-            
-        Returns:
-            0 on success (CosmoSIS convention)
-            
-        Raises:
-            RuntimeError: If emulator is not set or prediction fails
-        """
-        if self.emulator is None:
-            raise RuntimeError("Emulator not set - call set_emulator() first")
+        """Execute per-likelihood emulator predictions and populate data block."""
+        if not self.emulators:
+            raise RuntimeError("Emulators not set - call set_emulator() first")
 
-        # Prepare input dictionary for emulator
-        # Use '--' separator to avoid conflicts with parameter names
         p_dict = {f"{sec}--{key}": block[sec, key] for (sec, key) in self.inputs}
-        
-        # Get emulator prediction
-        prediction = self.emulator.predict(p_dict)[0]
-        if self.output_indices is not None:
-            prediction = prediction[self.output_indices]
-        
-        # Populate outputs
-        if self.outputs==[]:  # Empty outputs means full data vector
-            block["data_vector", "theory_emulated"] = prediction
-        else:
-            # Split prediction into specified output components
-            start_idx = 0
-            for (sec, key), size in zip(self.outputs, self.sizes):
-                block[sec, key] = prediction[start_idx:start_idx + size]
-                start_idx += size
 
-        # Set fixed inputs that don't vary during emulation
+        predictions: Dict[str, np.ndarray] = {}
+        for name in self.likelihood_names:
+            emu = self.emulators.get(name)
+            if emu is None:
+                raise RuntimeError(f"No emulator registered for likelihood '{name}'")
+
+            pred = emu.predict(p_dict)[0]
+            indices = self.output_indices.get(name) if self.output_indices else None
+            if indices is not None:
+                pred = pred[indices]
+            predictions[name] = pred
+
+        if not self.outputs:
+            # Full-data-vector mode: write per-likelihood slices so the patched
+            # likelihood modules can pick the right one, and also write the
+            # concatenated vector for any legacy consumers.
+            concatenated = np.concatenate(
+                [predictions[n] for n in self.likelihood_names]
+            )
+            block["data_vector", "theory_emulated"] = concatenated
+            for name, pred in predictions.items():
+                block["data_vector", f"{name}_theory_emulated"] = pred
+        else:
+            # User specified explicit output keys. We assume there is one key
+            # per likelihood in the same canonical order.
+            if len(self.outputs) != len(self.likelihood_names):
+                raise ValueError(
+                    f"Number of output keys ({len(self.outputs)}) does not match "
+                    f"number of likelihoods ({len(self.likelihood_names)})"
+                )
+            for (sec, key), name in zip(self.outputs, self.likelihood_names):
+                block[sec, key] = predictions[name]
+
         for (sec, key), val in self.fixed_inputs.items():
             block[sec, key] = val
-            
-        return 0
 
+        return 0

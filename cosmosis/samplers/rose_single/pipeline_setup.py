@@ -24,13 +24,13 @@ logger = logging.getLogger(__name__)
 class RosePipelineSetupMixin:
     """Mixin class providing pipeline setup methods for RoseSampler."""
 
-    def _extract_vector_metadata(self, block: Any) -> dict[str, dict[str, Any]]:
-        """Extract per-likelihood metadata from data_vector block entries.
+    def _extract_vector_metadata(self, block: Any) -> list[dict[str, Any]]:
+        """Extract per-vector metadata from data_vector block entries.
 
-        The metadata is keyed by likelihood name (``base_key``), aligned with
-        the dicts returned by ``utils.task`` when ``sampler.keys`` is not set.
+        The metadata is aligned with the ordering used in utils.task when
+        sampler.keys is not set, i.e. scanning all ``*_theory`` entries.
         """
-        metadata: dict[str, dict[str, Any]] = {}
+        metadata = []
         for sec, key in block.keys(section="data_vector"):
             if not key.endswith("_theory"):
                 continue
@@ -53,7 +53,7 @@ class RosePipelineSetupMixin:
                 item["bin1"] = np.asarray(block[sec, bin1_key]).astype(int)
                 item["bin2"] = np.asarray(block[sec, bin2_key]).astype(int)
 
-            metadata[base_key] = item
+            metadata.append(item)
 
         return metadata
     
@@ -61,10 +61,7 @@ class RosePipelineSetupMixin:
         """Inject emulator into likelihood module by monkey-patching.
         
         This method modifies the likelihood module to use emulator predictions
-        instead of extracting theory points from the pipeline. When multiple
-        independent emulators are trained (one per likelihood), the patched
-        ``extract_theory_points`` looks up the per-likelihood slice stored in
-        the block by :class:`EmulatorModule`.
+        instead of extracting theory points from the pipeline.
         
         Args:
             module: Likelihood module to modify
@@ -72,14 +69,16 @@ class RosePipelineSetupMixin:
         original_setup = module.setup_function
 
         def setup_wrapper(config):
+            # Step 1: Call the original setup to get the instance
             instance = original_setup(config)
+            # Step 2: (Monkey) Patch the method
             def emulated_extract_theory_points(self, block):
-                like_name = getattr(self, "like_name", None)
-                if like_name and block.has_value("data_vector", f"{like_name}_theory_emulated"):
-                    return block["data_vector", f"{like_name}_theory_emulated"]
-                return block["data_vector", "theory_emulated"]
+                data_vector = block["data_vector", "theory_emulated"]
+                return data_vector
             instance.extract_theory_points = types.MethodType(emulated_extract_theory_points, instance)
+            # Step 3: Return the patched instance
             return instance
+        # Replace the setup_function with our wrapper
         module.setup_function = setup_wrapper
 
     def compute_fiducial_setup_emu_pipeline(self) -> None:
@@ -97,25 +96,17 @@ class RosePipelineSetupMixin:
         p = self.pipeline.start_vector()
         p_unit = self.pipeline.normalize_vector(p)
         
-        # Run full pipeline to get fiducial results.
-        # Each returned container is a dict keyed by likelihood name so that we
-        # can train one emulator per likelihood downstream.
+        # Run full pipeline to get fiducial results
         _, data_vectors, self.data, self.inv_cov, errors, block = task(p, self, return_all=True)
-
-        # Canonical ordering for downstream concatenation (matches task() insertion order).
-        self.likelihood_names = list(data_vectors.keys())
-        self.data_vector_sizes = {name: int(len(v)) for name, v in data_vectors.items()}
-        self.fiducial_data_vector = {name: np.asarray(v) for name, v in data_vectors.items()}
-        self.fiducial_errors = {name: np.asarray(v) for name, v in errors.items()}
+        
+        # Process data vectors
+        self.data_vector_sizes = [len(x) for x in data_vectors]
+        self.fiducial_data_vector = np.concatenate(data_vectors)
+        self.fiducial_errors = np.concatenate(errors)
         self.fiducial_vector_metadata = self._extract_vector_metadata(block)
-        self.emulator_output_indices = {name: None for name in self.likelihood_names}
-
-        total_size = sum(self.data_vector_sizes.values())
-        logger.info(
-            f"Fiducial data vectors per likelihood: "
-            f"{[(n, self.data_vector_sizes[n]) for n in self.likelihood_names]} "
-            f"(total size={total_size})"
-        )
+        self.emulator_output_indices = None
+        
+        logger.info(f"Fiducial data vector shape: {self.fiducial_data_vector.shape}")
         
         # Determine emulation structure
         self._setup_emulation_structure(block)
@@ -161,23 +152,13 @@ class RosePipelineSetupMixin:
         
         # Configure emulated modules
         if emu_modules:
-            # Partial pipeline emulation: prepend emulator module and leave the
-            # remaining pipeline modules (including likelihoods) untouched.
+            # Partial pipeline emulation
             emu_modules.insert(0, emu_module)
         else:
-            # Full pipeline emulation: the emulator must supply the theory
-            # vector that each likelihood module would normally extract from
-            # the block. We copy + patch the trailing N modules, one per
-            # likelihood, so each consumes its own per-likelihood emulated
-            # slice written by :class:`EmulatorModule`.
-            n_like = max(1, len(self.likelihood_names))
-            trailing = self.pipeline.modules[-n_like:]
-            patched = []
-            for m in trailing:
-                m_copy = copy.copy(m)
-                self.inject_emulator_into_likemodule(m_copy)
-                patched.append(m_copy)
-            emu_modules = [emu_module, *patched]
+            # Full pipeline emulation - modify likelihood module
+            like_module = copy.copy(self.pipeline.modules[-1])
+            self.inject_emulator_into_likemodule(like_module)
+            emu_modules = [emu_module, like_module]
 
         # Add prior modules if they exist
         logger.info(f"Emulated modules: {[m.name for m in emu_modules]}")
@@ -230,17 +211,12 @@ class RosePipelineSetupMixin:
             values=self.pipeline.values_file
         )
         
-        # Configure emulator module. We pass the canonical ordered list of
-        # likelihood names and the per-likelihood sizes so the module can
-        # iterate emulators in a stable order and write per-likelihood slices
-        # (`data_vector/{name}_theory_emulated`) plus a concatenated fallback
-        # (`data_vector/theory_emulated`).
+        # Configure emulator module
         self.emu_module.data.set_emulator_info({
             "fixed_inputs": self.fixed_inputs,
             "pipeline": self.pipeline,
             "outputs": self.keys,
             "sizes": self.data_vector_sizes,
-            "likelihood_names": self.likelihood_names,
             "nn_model": self.nn_model,
             "output_indices": self.emulator_output_indices,
         })

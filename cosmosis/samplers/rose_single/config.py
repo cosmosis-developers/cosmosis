@@ -6,66 +6,11 @@ parameters from ini files.
 """
 
 import logging
-from typing import Any, Callable, Dict, Union
-
 import numpy as np
 
 from .utils import SAVE_NONE, SAVE_MODEL, SAVE_ALL, mkdir
 
 logger = logging.getLogger(__name__)
-
-
-def _parse_per_likelihood(
-    raw: str,
-    value_type: Callable[[str], Any] = str,
-    default: Any = None,
-) -> Union[Any, Dict[str, Any]]:
-    """Parse a setting that may be either global or per-likelihood.
-
-    Accepted syntaxes (whitespace-separated tokens)::
-
-        "log_norm"
-            → "log_norm"  (single value applied to every likelihood)
-
-        "lsst:signed_log_norm desi_bao:log_norm"
-            → {"lsst": "signed_log_norm", "desi_bao": "log_norm"}
-
-        "lsst:signed_log_norm default:log_norm"
-            → {"lsst": "signed_log_norm", "__default__": "log_norm"}
-            (``default:`` sets a fallback used by any likelihood not listed)
-
-    Values are run through ``value_type`` (e.g. ``int``, ``float``) so numeric
-    settings like ``n_pca`` or ``batch_size`` still type-check.
-    """
-    if raw is None or not str(raw).strip():
-        return default
-    tokens = str(raw).split()
-    if len(tokens) == 1 and ":" not in tokens[0]:
-        return value_type(tokens[0])
-    result: Dict[str, Any] = {}
-    for tok in tokens:
-        if ":" not in tok:
-            raise ValueError(
-                f"Per-likelihood setting token '{tok}' is missing a ':'. "
-                "Use either a single value (applied globally) or "
-                "'name:value' pairs, e.g. 'lsst:log_norm desi_bao:norm'."
-            )
-        name, val = tok.split(":", 1)
-        name = name.strip()
-        key = "__default__" if name.lower() in ("default", "*") else name
-        result[key] = value_type(val.strip())
-    return result
-
-
-def _setting_values(setting: Any) -> list:
-    """Return the list of concrete values inside a setting.
-
-    Works for both scalars and per-likelihood dicts so validation code can
-    iterate uniformly.
-    """
-    if isinstance(setting, dict):
-        return list(setting.values())
-    return [setting]
 
 
 class RoseConfigMixin:
@@ -101,23 +46,13 @@ class RoseConfigMixin:
                          f"but models will be saved to temporary directory: {self.save_outputs_dir}")
     
     def _configure_training_parameters(self) -> None:
-        """Configure neural network training parameters.
-
-        ``batch_size`` and ``training_iterations`` may be specified either as a
-        single integer (applied to all likelihoods) or with per-likelihood
-        overrides, e.g. ``batch_size = lsst:64 desi_bao:32`` or
-        ``training_iterations = lsst:8 default:5``.
-        """
+        """Configure neural network training parameters."""
         self.max_iterations = self.read_ini("iterations", int, 4)
         self.initial_size = self.read_ini("initial_size", int, 9600)
         self.resample_size = self.read_ini("resample_size", int, 4800)
         self.chi2_cut_off = self.read_ini("chi2_cut_off", float)
-        self.batch_size = _parse_per_likelihood(
-            self.read_ini("batch_size", str, "32"), int
-        )
-        self.training_iterations = _parse_per_likelihood(
-            self.read_ini("training_iterations", str, "5"), int
-        )
+        self.batch_size = self.read_ini("batch_size", int, 32)
+        self.training_iterations = self.read_ini("training_iterations", int, 5)
         
         # Validate training parameters
         if self.max_iterations < 1:
@@ -126,10 +61,10 @@ class RoseConfigMixin:
             raise ValueError("initial_size must be >= 10")
         if self.resample_size < 1:
             raise ValueError("resample_size must be >= 1")
-        if any(v < 1 for v in _setting_values(self.batch_size)):
-            raise ValueError("batch_size must be >= 1 (for every likelihood)")
-        if any(v < 1 for v in _setting_values(self.training_iterations)):
-            raise ValueError("training_iterations must be >= 1 (for every likelihood)")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if self.training_iterations < 1:
+            raise ValueError("training_iterations must be >= 1")
     
     def _configure_mcmc_parameters(self) -> None:
         """Configure MCMC sampling parameters."""
@@ -243,26 +178,12 @@ class RoseConfigMixin:
         if self.seed == 0:
             self.seed = None  # Use random seed
         
-        # Neural network options. Each of these accepts either a single
-        # value applied to all likelihoods, or per-likelihood overrides using
-        # 'name:value' tokens, e.g.
-        #   data_trafo = lsst:signed_log_norm desi_bao:log_norm
-        #   n_pca      = lsst:64 default:32
-        #   loss_function = lsst:weighted_mse desi_bao:standard
-        self.data_trafo = _parse_per_likelihood(
-            self.read_ini("data_trafo", str, "log_norm"), str
-        )
-        self.n_pca = _parse_per_likelihood(
-            self.read_ini("n_pca", str, "32"), int
-        )
-        self.loss_function = _parse_per_likelihood(
-            self.read_ini("loss_function", str, "standard"), str
-        )
-
-        if any(
-            isinstance(v, str) and v.startswith("weighted")
-            for v in _setting_values(self.loss_function)
-        ) and self.keys:
+        # Neural network options (currently fixed)
+        self.data_trafo = self.read_ini("data_trafo", str, "log_norm")
+        self.n_pca = self.read_ini("n_pca", int, 32)
+        self.loss_function = self.read_ini("loss_function", str, "standard")
+        
+        if self.loss_function.startswith("weighted") and self.keys:
             raise ValueError("Weighted loss function can only be used with full data vector "
                            "(empty keys parameter)")
         
@@ -279,8 +200,6 @@ class RoseConfigMixin:
         if self.use_nuts_final:
             self._configure_nuts_parameters()
         
-        # Neural network architecture (scalar or per-likelihood dict)
-        self.nn_model = _parse_per_likelihood(
-            self.read_ini("nn_model", str, "MLP"), str
-        )
+        # Neural network architecture
+        self.nn_model = self.read_ini("nn_model", str, 'MLP')  # Could be made configurable in future
 
