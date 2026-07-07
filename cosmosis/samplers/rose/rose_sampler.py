@@ -18,7 +18,7 @@ from typing import Any
 
 from .. import ParallelSampler
 
-from .config import RoseConfigMixin
+from .config import RoseConfigMixin, _parse_per_likelihood
 from .data_processing import RoseDataProcessingMixin
 import cosmosis.samplers.rose.data_processing as data_processing_module
 from .pipeline_setup import RosePipelineSetupMixin
@@ -92,9 +92,21 @@ class RoseSampler(
         self._configure_output_saving()
         self._timing_file = os.path.join(self.save_outputs_dir, "rose_timing.txt")
         
-        # Configure emulator loading
-        self.load_emu_filename = self.read_ini("load_emu_filename", str, "")
+        # Configure emulator loading. Accepts either a single directory/base
+        # path (applied to all likelihoods) or per-likelihood 'name:path'
+        # tokens, e.g.
+        #   load_emu_filename = planck:/a/emumodel_5/planck desi_bao:/b/emumodel_5/desi_bao
+        self.load_emu_filename = _parse_per_likelihood(
+            self.read_ini("load_emu_filename", str, ""), str, default=""
+        )
         self.trained_before = self.read_ini("trained_before", bool, False)
+        # When loading a pre-trained emulator into a pipeline that varies extra
+        # parameters the emulator does not depend on (e.g. combining a
+        # CMB-only planck emulator with supernova_params--m), ignore those
+        # extra parameters at prediction time instead of raising.
+        self.ignore_missing_emu_params = self.read_ini(
+            "ignore_missing_emu_params", bool, False
+        )
         
         if self.trained_before and not self.load_emu_filename:
             raise ValueError("trained_before=true requires load_emu_filename to be specified")

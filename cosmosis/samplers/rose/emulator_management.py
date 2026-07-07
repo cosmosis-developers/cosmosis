@@ -183,38 +183,81 @@ class RoseEmulatorManagementMixin:
             )
         return value
 
+    def _resolve_emu_base_path(
+        self, name: str, load_setting: Any, load_dir: Optional[str]
+    ) -> str:
+        """Resolve the emulator base path (without ``.npz``) for a likelihood.
+
+        ``load_setting`` is either a single directory/base path (in which case
+        ``load_dir`` is used and the file is ``{load_dir}/{name}.npz``) or a
+        per-likelihood dict mapping likelihood name to a path. A per-likelihood
+        value may be given as a directory (``{dir}/{name}.npz``), a base path
+        (``{base}.npz``), or the full ``.npz`` file itself.
+        """
+        if not isinstance(load_setting, dict):
+            return os.path.join(load_dir, name)
+
+        if name in load_setting:
+            val = load_setting[name]
+        elif "__default__" in load_setting:
+            val = os.path.join(load_setting["__default__"], name)
+        else:
+            raise FileNotFoundError(
+                f"No emulator path specified for likelihood '{name}' in "
+                "load_emu_filename. Provide a 'name:path' token per likelihood "
+                "or a 'default:dir' fallback."
+            )
+
+        if val.endswith(".npz"):
+            return val[:-4]
+        if os.path.isdir(val):
+            return os.path.join(val, name)
+        return val
+
     def load_emulator(self, path: Optional[str] = None) -> None:
         """Load per-likelihood pre-trained emulators from disk.
 
         Expected directory layout (as written by :meth:`train_emulator`):
             {load_dir}/{likelihood_name}.npz
 
+        ``load_emu_filename`` may instead specify per-likelihood paths using
+        ``name:path`` tokens, allowing each likelihood's emulator to come from
+        a different location.
+
         Args:
             path: Optional directory containing per-likelihood model files.
                   When set this overrides ``load_emu_filename`` and iterations.
         """
+        load_setting = self.load_emu_filename
+        per_likelihood = path is None and isinstance(load_setting, dict)
+
+        load_dir: Optional[str]
         if path is not None:
             load_dir = path
-        elif self.load_emu_filename:
-            load_dir = self.load_emu_filename
+        elif per_likelihood:
+            load_dir = None
+        elif load_setting:
+            load_dir = load_setting
         else:
             load_dir = os.path.join(
                 self.save_outputs_dir, f"emumodel_{self.iterations + 1}"
             )
 
-        if not os.path.isdir(load_dir):
-            raise FileNotFoundError(
-                f"Emulator directory not found: {load_dir}. Expected one .npz "
-                f"per likelihood."
-            )
-
-        logger.info(f"Loading pre-trained emulators from {load_dir}")
+        if not per_likelihood:
+            if not os.path.isdir(load_dir):
+                raise FileNotFoundError(
+                    f"Emulator directory not found: {load_dir}. Expected one .npz "
+                    f"per likelihood."
+                )
+            logger.info(f"Loading pre-trained emulators from {load_dir}")
+        else:
+            logger.info("Loading pre-trained emulators from per-likelihood paths")
 
         loaded_emulators: Dict[str, NNEmulator] = {}
         output_indices: Dict[str, Optional[np.ndarray]] = {}
 
         for name in self.likelihood_names:
-            base_path = os.path.join(load_dir, name)
+            base_path = self._resolve_emu_base_path(name, load_setting, load_dir)
             info_file = base_path + ".npz"
             if not os.path.exists(info_file):
                 raise FileNotFoundError(
@@ -257,6 +300,25 @@ class RoseEmulatorManagementMixin:
                 data_trafo=data_trafo_init,
             )
             emu.load(base_path)
+
+            ignore_extra = getattr(self, "ignore_missing_emu_params", False)
+            emu.ignore_extra_params = ignore_extra
+            if ignore_extra:
+                trained_params = set(model_parameters)
+                current_params = [str(p) for p in self.pipeline.varied_params]
+                extra = [p for p in current_params if p not in trained_params]
+                missing = [p for p in trained_params if p not in current_params]
+                if extra:
+                    logger.info(
+                        f"[{name}] Ignoring pipeline parameter(s) not seen during "
+                        f"training: {extra}"
+                    )
+                if missing:
+                    logger.warning(
+                        f"[{name}] Emulator expects parameter(s) not varied by the "
+                        f"current pipeline: {missing}. Predictions may be invalid."
+                    )
+
             loaded_emulators[name] = emu
 
             expected_size = int(self.data_vector_sizes[name])

@@ -842,6 +842,11 @@ class NNEmulator:
                  inv_cov: Optional[np.ndarray] = None):
         
         self.trained = False
+        # When True, parameters passed to predict()/compute_gradients() that are
+        # not part of this emulator's training data are silently ignored instead
+        # of raising. Used when a pre-trained emulator is combined into a larger
+        # pipeline that varies extra parameters it does not depend on.
+        self.ignore_extra_params = False
         self.model_parameters = model_parameters
         self.modes = modes
         self.data_trafo = data_trafo
@@ -1155,6 +1160,8 @@ class NNEmulator:
         X_norm_dict = {}
         for key in X.keys():
             if key not in self.X_mean:
+                if self.ignore_extra_params:
+                    continue
                 raise KeyError(f"Parameter {key} not found in training data")
             
             # Handle scalar inputs - ensure consistent array format
