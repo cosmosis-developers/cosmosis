@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from .nn_emulator import NNEmulator
+
 from .utils import mkdir
 
 logger = logging.getLogger(__name__)
@@ -101,7 +101,7 @@ class RoseEmulatorManagementMixin:
             return None
         return np.arange(current_size, dtype=int)
     
-    def train_emulator(self) -> None:
+    def train_emulator(self, model_version: Optional[int] = None) -> None:
         """Train one independent emulator per likelihood on current training data.
 
         Each likelihood gets its own :class:`NNEmulator` trained on its own
@@ -109,12 +109,40 @@ class RoseEmulatorManagementMixin:
         matching reference data vector and inverse covariance. The resulting
         dict of emulators is handed to the :class:`EmulatorModule` so that the
         downstream pipeline can look each one up by name.
+
+        Args:
+            model_version: Integer id for the on-disk model directory
+                ``emumodel_{model_version}``. Defaults to ``self.iterations + 1``
+                (the normal one-training-per-iteration numbering). The final-step
+                KL-convergence loop passes successive ids (N+1, N+2, ...) so each
+                retrain writes a *new* directory instead of overwriting the last
+                one, and the freshly trained model is both kept in memory and
+                (being on disk) picked up by the MPI worker processes.
         """
+        from .nn_emulator import NNEmulator
+
+        if model_version is None:
+            model_version = self.iterations + 1
+        self._current_emu_version = model_version
+
         n_samp, n_in = self.unit_sample.shape
         model_parameters = [str(param) for param in self.pipeline.varied_params]
         logger.info(f"Model parameters: {model_parameters}")
 
-        iter_dir = os.path.join(self.save_outputs_dir, f"emumodel_{self.iterations + 1}")
+        pruned = getattr(self, "_pruned_training", None)
+        if pruned is not None:
+            n_pruned = len(pruned["sample_likes"])
+            logger.info(
+                f"emumodel_{model_version}: training on {n_samp} points "
+                f"({n_pruned} outliers pruned from the training set and "
+                f"stashed under pruned/* in total_training_set.npz)"
+            )
+        else:
+            logger.info(
+                f"emumodel_{model_version}: training on {n_samp} points"
+            )
+
+        iter_dir = os.path.join(self.save_dir, f"emumodel_{model_version}")
         mkdir(iter_dir)
 
         X = {str(param): self.sample[:, i]
@@ -132,12 +160,52 @@ class RoseEmulatorManagementMixin:
             )
 
             model_filename = os.path.join(iter_dir, name)
+            n_cycles_per_training = self._resolve_training_setting(
+                "n_cycles_per_training", name
+            )
+            n_hidden = list(self._resolve_training_setting("n_hidden", name))
+            batch_sizes = list(self._resolve_training_setting("batch_sizes", name))
+            if len(batch_sizes) == 1:
+                batch_sizes = batch_sizes * n_cycles_per_training
+            elif len(batch_sizes) != n_cycles_per_training:
+                raise ValueError(
+                    f"batch_sizes for likelihood '{name}' has length "
+                    f"{len(batch_sizes)} but n_cycles_per_training is "
+                    f"{n_cycles_per_training} (use a single value to broadcast)"
+                )
+            # Ini ``batch_sizes`` are the base (iteration-0) values; multiply by
+            # (iterations + 1) each ROSE iteration, matching the previous
+            # ``batch_size * (self.iterations + 1)`` behaviour.
+            batch_sizes = [b * (self.iterations + 1) for b in batch_sizes]
             kwargs = {
                 "model_filename": model_filename,
-                "n_cycles": self._resolve_training_setting("training_iterations", name),
-                "batch_size": self._resolve_training_setting("batch_size", name)
-                               * (self.iterations + 1),
+                "n_cycles_per_training": n_cycles_per_training,
+                "batch_sizes": batch_sizes,
+                "test_split": self._resolve_training_setting(
+                    "validation_split", name
+                ),
+                "n_hidden": n_hidden,
             }
+            # Optional CosmoPowerNN schedule overrides. Length must match this
+            # likelihood's n_cycles_per_training. Partial per-likelihood dicts
+            # leave unlisted likelihoods on the auto schedule.
+            for attr, kw in (
+                ("learning_rates", "learning_rates"),
+                ("gradient_accumulation_steps", "gradient_accumulation_steps"),
+                ("patience_values", "patience_values"),
+                ("max_epochs", "max_epochs"),
+            ):
+                values = self._resolve_optional_training_setting(attr, name)
+                if values is None:
+                    continue
+                values = list(values)
+                if len(values) != n_cycles_per_training:
+                    raise ValueError(
+                        f"{attr} for likelihood '{name}' has length "
+                        f"{len(values)} but n_cycles_per_training is "
+                        f"{n_cycles_per_training}"
+                    )
+                kwargs[kw] = values
 
             emu = NNEmulator(
                 model_parameters,
@@ -162,6 +230,27 @@ class RoseEmulatorManagementMixin:
 
         self.emulator = trained_emulators
         self.emu_module.data.set_emulator(trained_emulators)
+        # Record which on-disk model this (master) process now holds in memory,
+        # so the worker-synchronization logic in utils._ensure_emulator does not
+        # needlessly reload it. iter_dir is exactly the path that worker
+        # processes are told to (re)load from via _worker_emu_model_path().
+        self._loaded_emu_path = iter_dir
+
+    def _worker_emu_model_path(self) -> Optional[str]:
+        """Path token identifying the emulator the master is currently using.
+
+        This is handed to worker processes (through the emcee/nautilus log-prob
+        and prior-transform callables) so they load/reload the *same* emulator
+        the master holds -- see :func:`utils._ensure_emulator`. For a run that
+        trains from scratch this is the per-iteration model directory written by
+        :meth:`train_emulator`; for a pre-trained run there is no per-iteration
+        directory, so we return ``None`` and workers fall back to
+        ``load_emulator(None)`` (i.e. ``load_emu_filename``).
+        """
+        if getattr(self, "trained_before", False):
+            return None
+        version = getattr(self, "_current_emu_version", 0) or (self.iterations + 1)
+        return os.path.join(self.save_dir, f"emumodel_{version}")
 
     def _resolve_training_setting(self, attr: str, likelihood_name: str) -> Any:
         """Resolve a training setting with optional per-likelihood override.
@@ -181,6 +270,27 @@ class RoseEmulatorManagementMixin:
             raise KeyError(
                 f"No value for setting '{attr}' for likelihood '{likelihood_name}'"
             )
+        return value
+
+    def _resolve_optional_training_setting(
+        self, attr: str, likelihood_name: str
+    ) -> Any:
+        """Like :meth:`_resolve_training_setting`, but missing entries mean unset.
+
+        Used for optional schedule overrides (``learning_rates``,
+        ``patience_values``, ...). A partial per-likelihood dict only overrides
+        the listed likelihoods; others fall back to the built-in auto schedule
+        (``None``) instead of raising.
+        """
+        value = getattr(self, attr)
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            if likelihood_name in value:
+                return value[likelihood_name]
+            if "__default__" in value:
+                return value["__default__"]
+            return None
         return value
 
     def _resolve_emu_base_path(
@@ -228,6 +338,8 @@ class RoseEmulatorManagementMixin:
             path: Optional directory containing per-likelihood model files.
                   When set this overrides ``load_emu_filename`` and iterations.
         """
+        from .nn_emulator import NNEmulator
+
         load_setting = self.load_emu_filename
         per_likelihood = path is None and isinstance(load_setting, dict)
 
@@ -239,8 +351,9 @@ class RoseEmulatorManagementMixin:
         elif load_setting:
             load_dir = load_setting
         else:
+            version = getattr(self, "_current_emu_version", 0) or (self.iterations + 1)
             load_dir = os.path.join(
-                self.save_outputs_dir, f"emumodel_{self.iterations + 1}"
+                self.save_dir, f"emumodel_{version}"
             )
 
         if not per_likelihood:

@@ -53,12 +53,12 @@ def get_device() -> str:
             with tf.device('/gpu:0'):
                 test = tf.constant([1.0])
                 _ = tf.square(test)
-            logger.info("GPU detected and verified - using GPU acceleration")
+            print("GPU detected and verified - using GPU acceleration")
             return 'gpu:0'
     except Exception as e:
-        logger.warning(f"GPU detection failed: {e}")
+        print(f"GPU detection failed: {e}")
     
-    logger.info("Using CPU for computations")
+    print("Using CPU for computations")
     return 'cpu'
 
 DEVICE = get_device()
@@ -217,6 +217,7 @@ class CosmoPowerNN(tf.keras.Model):
                 name=f"b_{i}",
                 trainable=trainable
             ))
+
         
         # Activation function parameters (for all layers except output)
         for i in range(self.n_layers - 1):
@@ -230,6 +231,7 @@ class CosmoPowerNN(tf.keras.Model):
                 name=f"betas_{i}",
                 trainable=trainable
             ))
+
 
 
     def _print_initialization_info(self) -> None:
@@ -659,8 +661,7 @@ class CosmoPowerNN(tf.keras.Model):
                     if epoch % 10 == 0 or patience_counter >= patience_values[stage]:
                         logger.info(f"Epoch {epoch}: train_loss={avg_train_loss:.6f}, "
                                   f"val_loss={val_loss:.6f}, best_val={best_val_loss:.6f}")
-                        print(f"Epoch {epoch}: train_loss={avg_train_loss:.6f}, "
-                                  f"val_loss={val_loss:.6f}, best_val={best_val_loss:.6f}")
+
                     
                     # Early stopping
                     if patience_counter >= patience_values[stage]:
@@ -982,8 +983,13 @@ class NNEmulator:
               y: np.ndarray,
               model_filename: str,
               test_split: float = 0.1,
-              batch_size: int = 32,
-              n_cycles: int = 5) -> None:
+              n_cycles_per_training: int = 5,
+              n_hidden: Optional[List[int]] = None,
+              learning_rates: Optional[List[float]] = None,
+              batch_sizes: Optional[List[int]] = None,
+              gradient_accumulation_steps: Optional[List[int]] = None,
+              patience_values: Optional[List[int]] = None,
+              max_epochs: Optional[List[int]] = None) -> None:
         """Train the neural network emulator.
         
         Args:
@@ -991,8 +997,15 @@ class NNEmulator:
             y: Target output data
             model_filename: Base filename for saving model
             test_split: Fraction of data for validation
-            batch_size: Training batch size
-            n_cycles: Number of training cycles
+            n_cycles_per_training: Number of training cycles / learning-rate stages
+            n_hidden: Hidden-layer widths; defaults to ``[512, 512, 512, 512]``
+            learning_rates: Per-stage learning rates; defaults to
+                ``[1e-2, 1e-3, ...]`` over ``n_cycles_per_training``
+            batch_sizes: Per-stage batch sizes; a single value is broadcast.
+                Defaults to ``[32] * n_cycles_per_training``
+            gradient_accumulation_steps: Per-stage accumulation steps
+            patience_values: Early-stopping patience per stage
+            max_epochs: Maximum epochs per stage
         """
         logger.info("Starting emulator training")
         
@@ -1009,6 +1022,36 @@ class NNEmulator:
             raise ValueError("All input parameters must have the same length")
         if len(y) != param_lengths[0]:
             raise ValueError("Target data length must match input parameter length")
+
+        if n_hidden is None:
+            n_hidden = [512, 512, 512, 512]
+        if learning_rates is None:
+            learning_rates = [10 ** (-2 - i) for i in range(n_cycles_per_training)]
+        if batch_sizes is None:
+            batch_sizes = [32] * n_cycles_per_training
+        elif len(batch_sizes) == 1:
+            batch_sizes = list(batch_sizes) * n_cycles_per_training
+        if gradient_accumulation_steps is None:
+            gradient_accumulation_steps = [1] * n_cycles_per_training
+        if patience_values is None:
+            patience_values = [100] * n_cycles_per_training
+        if max_epochs is None:
+            max_epochs = [1000] * n_cycles_per_training
+
+        schedule_lengths = [
+            len(learning_rates), len(batch_sizes), len(gradient_accumulation_steps),
+            len(patience_values), len(max_epochs),
+        ]
+        if not all(length == n_cycles_per_training for length in schedule_lengths):
+            raise ValueError(
+                f"Training schedule lists must all have length "
+                f"n_cycles_per_training={n_cycles_per_training}; "
+                f"got learning_rates={len(learning_rates)}, "
+                f"batch_sizes={len(batch_sizes)}, "
+                f"gradient_accumulation_steps={len(gradient_accumulation_steps)}, "
+                f"patience_values={len(patience_values)}, "
+                f"max_epochs={len(max_epochs)}"
+            )
         
         # Normalize input parameters
         logger.info("Normalizing input parameters")
@@ -1024,7 +1067,7 @@ class NNEmulator:
         X_std_arr = np.array([self.X_std[key] for key in self.model_parameters])
         
         # Create neural network
-        logger.info(f"Creating {self.nn_model} neural network")
+        logger.info(f"Creating {self.nn_model} neural network with n_hidden={n_hidden}")
         output_dim = self.n_pca if self.data_trafo == 'PCA' else len(self.modes)
         
         self.cp_nn = CosmoPowerNN(
@@ -1034,7 +1077,7 @@ class NNEmulator:
             parameters_std=X_std_arr,
             features_mean=self.y_mean,
             features_std=self.y_std,
-            n_hidden=[512, 512, 512, 512],
+            n_hidden=n_hidden,
             verbose=True,
             architecture_type=self.nn_model,
             loss_function=self.loss_function
@@ -1051,11 +1094,11 @@ class NNEmulator:
                 training_features=y_train,
                 filename_saved_model=model_filename,
                 validation_split=test_split,
-                learning_rates=[10**(-2-i) for i in range(n_cycles)],
-                batch_sizes=[batch_size] * n_cycles,
-                gradient_accumulation_steps=[1] * n_cycles,
-                patience_values=[100] * n_cycles,
-                max_epochs=[1000] * n_cycles
+                learning_rates=learning_rates,
+                batch_sizes=batch_sizes,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                patience_values=patience_values,
+                max_epochs=max_epochs
             )
         
         # Save additional attributes
@@ -1063,7 +1106,6 @@ class NNEmulator:
         
         self.trained = True
         logger.info("Emulator training completed successfully")
-            
 
 
     def _save_attributes(self, model_filename: str) -> None:
@@ -1131,7 +1173,7 @@ class NNEmulator:
         """Save current emulator state to filename so workers can load it from disk.
         
         Used when running with a pool (e.g. Nautilus) and the model may not have been
-        written to this path yet (e.g. save_outputs is not 'all'). Call this before
+        written to this path yet (e.g. save_output is not 'all'). Call this before
         passing the path to worker processes.
         
         Args:

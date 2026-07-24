@@ -162,12 +162,19 @@ class RoseDataProcessingMixin:
     def generate_updated_sample(self) -> None:
         """Generate additional training samples from MCMC chain.
         
-        This method selects high-likelihood samples from the current MCMC chain,
-        evaluates them with the exact pipeline, and adds them to the training set.
+        Training points are drawn from the tempered HPD credible region of the
+        current MCMC chain (``test_credible_fraction``, default 95% / 2-sigma)
+        and spaced as evenly as possible in unit-prior parameter space so the
+        emulator is not biased toward high-density posterior pockets. Test
+        points (final training iteration only) use the same region with a
+        simpler uniform draw.
         """
-        logger.info(f"Selecting {self.resample_size} samples from MCMC chain for training")
+        logger.info(
+            f"Selecting {self.resample_size} homogeneous training samples "
+            f"from the {self.test_credible_fraction:.0%} tempered credible "
+            "region of the MCMC chain"
+        )
         
-        # Select random samples from chain
         chain_length = len(self.chain)
         if chain_length == 0:
             raise RuntimeError(
@@ -176,21 +183,12 @@ class RoseDataProcessingMixin:
                 "emcee_samples were reached and the burn-in then discarded "
                 "everything. Lower emcee_burn or increase emcee_samples."
             )
-        if chain_length < self.resample_size:
-            logger.warning(
-                f"Chain has {chain_length} samples, fewer than resample_size="
-                f"{self.resample_size}; sampling with replacement."
-            )
-            random_indices = np.random.choice(
-                chain_length, size=self.resample_size, replace=True
-            )
-        else:
-            random_indices = np.random.choice(
-                chain_length, size=self.resample_size, replace=False
-            )
-        
-        unit_sample = self.unit_chain[random_indices]
-        sample = self.chain[random_indices]
+
+        train_indices = self._select_credible_region_indices(
+            self.resample_size, homogeneous=True
+        )
+        unit_sample = self.unit_chain[train_indices]
+        sample = self.chain[train_indices]
 
         # Test points are collected only once, during the last training
         # iteration (i.e. just before the final sampling stage), drawn from the
@@ -204,7 +202,9 @@ class RoseDataProcessingMixin:
         sample_test = None
         unit_sample_test = None
         if collect_test:
-            test_indices = self._select_credible_region_indices(self.final_test_size)
+            test_indices = self._select_credible_region_indices(
+                self.final_test_size, homogeneous=False
+            )
             unit_sample_test = self.unit_chain[test_indices]
             sample_test = self.chain[test_indices]
             logger.info(
@@ -235,9 +235,18 @@ class RoseDataProcessingMixin:
         self._update_training_set(sample_results, sample, unit_sample)
         if collect_test:
             self._update_test_set(sample_results_test, sample_test, unit_sample_test)
+
+        # Final training iteration: optionally prune early exploration points
+        # that fall outside the n-sigma region of the last tempered chain before
+        # the final emulator is trained (and before datasets are saved).
+        if (
+            self.iterations == (self.max_iterations - 1)
+            and getattr(self, "remove_outliers", False)
+        ):
+            self._remove_training_outliers()
         
         # Save datasets if requested
-        if self.save_outputs == SAVE_ALL and self.iterations == (self.max_iterations - 1):
+        if self.save_output == SAVE_ALL and self.iterations == (self.max_iterations - 1):
             self._save_datasets()
 
     def _select_non_overlapping_indices(self, chain_length: int, 
@@ -253,45 +262,117 @@ class RoseDataProcessingMixin:
         
         return np.random.choice(available_indices, size=n_select, replace=False)
 
-    def _select_credible_region_indices(self, n_select: int) -> np.ndarray:
-        """Select chain indices inside the 1-sigma (credible) region.
+    def _credible_region_indices(self, fraction: float = None) -> np.ndarray:
+        """Indices of chain points in the tempered HPD credible region.
 
-        The one-before-last MCMC chain is ranked by its posterior value and the
-        highest-posterior fraction (``test_credible_fraction``, default 0.95) is
-        taken as the 1-sigma credible region. For an equal-weight MCMC sample,
-        keeping the top 68% of points by posterior density is equivalent to the
-        68% highest-posterior-density (HPD) credible region, and is robust in any
-        number of dimensions. ``n_select`` points are then drawn uniformly from
-        that region.
+        The current MCMC chain was drawn from the tempered posterior
+        ``q(θ) ∝ π(θ)^T``. Ranking by ``chain_logpost`` (untempered) is
+        equivalent to ranking by the tempered log-density for fixed ``T > 0``,
+        so the top ``fraction`` of points is the tempered highest-posterior-
+        density region of that chain.
 
         Args:
-            n_select: Number of test points to draw from the credible region.
+            fraction: HPD mass to keep. Defaults to ``test_credible_fraction``
+                (0.95 ≈ 2-sigma). Use ``erf(n/sqrt(2))`` for an n-sigma mass
+                (0.68 / 0.95 / 0.997 for 1 / 2 / 3 sigma).
+        """
+        if fraction is None:
+            fraction = self.test_credible_fraction
+        logpost = getattr(self, "chain_logpost", None)
+        if logpost is None or len(logpost) != len(self.chain):
+            logger.warning(
+                "Chain posterior values unavailable; using the full chain "
+                "instead of the tempered credible region."
+            )
+            return np.arange(len(self.chain))
+
+        logpost = np.asarray(logpost)
+        finite = np.isfinite(logpost)
+        n_finite = int(finite.sum())
+        if n_finite == 0:
+            logger.warning(
+                "No finite posterior values in chain; using full chain for "
+                "credible-region selection."
+            )
+            return np.arange(len(self.chain))
+
+        # Rank by posterior (descending) and keep the top fraction.
+        order = np.argsort(logpost)[::-1][:n_finite]
+        n_region = max(1, int(np.ceil(float(fraction) * n_finite)))
+        return order[:n_region]
+
+    def _select_homogeneous_indices(
+        self, region_indices: np.ndarray, n_select: int
+    ) -> np.ndarray:
+        """Space-filling subset of ``region_indices`` in unit-parameter space.
+
+        Uses greedy farthest-point (maximin) sampling on ``self.unit_chain`` so
+        selected points cover the credible region as evenly as possible and the
+        training set is not concentrated where the MCMC density is highest.
+        Distances are Euclidean in the unit-prior cube, which puts every varied
+        parameter on a common [0, 1] scale.
+        """
+        region_indices = np.asarray(region_indices)
+        n_region = len(region_indices)
+        if n_region == 0:
+            raise RuntimeError("Cannot select homogeneous points from an empty region")
+
+        if n_region < n_select:
+            logger.warning(
+                f"Credible region has only {n_region} points, fewer than "
+                f"requested {n_select}; sampling with replacement after "
+                "taking the full region."
+            )
+            extra = np.random.choice(
+                region_indices, size=n_select - n_region, replace=True
+            )
+            return np.concatenate([region_indices, extra])
+
+        if n_region == n_select:
+            return region_indices.copy()
+
+        coords = np.asarray(self.unit_chain[region_indices], dtype=float)
+        # Seed with the point closest to the region's centroid so the first
+        # pick is central and stable across minor chain reorderings.
+        centroid = coords.mean(axis=0)
+        first = int(np.argmin(np.sum((coords - centroid) ** 2, axis=1)))
+        selected_local = [first]
+        min_sqdist = np.sum((coords - coords[first]) ** 2, axis=1)
+        min_sqdist[first] = -np.inf
+
+        for _ in range(1, n_select):
+            nxt = int(np.argmax(min_sqdist))
+            selected_local.append(nxt)
+            d_new = np.sum((coords - coords[nxt]) ** 2, axis=1)
+            min_sqdist = np.minimum(min_sqdist, d_new)
+            min_sqdist[nxt] = -np.inf
+
+        return region_indices[np.asarray(selected_local, dtype=int)]
+
+    def _select_credible_region_indices(
+        self, n_select: int, homogeneous: bool = False
+    ) -> np.ndarray:
+        """Select chain indices inside the tempered HPD credible region.
+
+        The MCMC chain is ranked by posterior and the highest-posterior
+        fraction (``test_credible_fraction``, default 0.95) is taken as the
+        tempered HPD credible region. For an equal-weight MCMC sample, keeping
+        the top 68% / 95% of points by posterior density is the 1-sigma /
+        2-sigma HPD region in any dimension.
+
+        Args:
+            n_select: Number of points to draw from the credible region.
+            homogeneous: If True, use farthest-point sampling in unit-parameter
+                space (preferred for training). If False, draw uniformly at
+                random from the region (sufficient for testing).
 
         Returns:
             Array of indices into ``self.chain`` / ``self.unit_chain``.
         """
-        logpost = getattr(self, "chain_logpost", None)
-        if logpost is None or len(logpost) != len(self.chain):
-            logger.warning(
-                "Chain posterior values unavailable; drawing test points from "
-                "the full chain instead of the 1-sigma credible region."
-            )
-            region_indices = np.arange(len(self.chain))
-        else:
-            logpost = np.asarray(logpost)
-            finite = np.isfinite(logpost)
-            n_finite = int(finite.sum())
-            if n_finite == 0:
-                logger.warning(
-                    "No finite posterior values in chain; using full chain for "
-                    "test-point selection."
-                )
-                region_indices = np.arange(len(self.chain))
-            else:
-                # Rank by posterior (descending) and keep the top fraction.
-                order = np.argsort(logpost)[::-1][:n_finite]
-                n_region = max(1, int(np.ceil(self.test_credible_fraction * n_finite)))
-                region_indices = order[:n_region]
+        region_indices = self._credible_region_indices()
+
+        if homogeneous:
+            return self._select_homogeneous_indices(region_indices, n_select)
 
         replace = len(region_indices) < n_select
         if replace:
@@ -336,6 +417,128 @@ class RoseDataProcessingMixin:
         self.sample_posts = np.concatenate([self.sample_posts, new_posts])
         self.points_per_iteration = np.concatenate([self.points_per_iteration, np.array([len(valid_results)])])
 
+    def _remove_training_outliers(self) -> None:
+        """Move out-of-region training points aside for the final emulator.
+
+        Called once, on the final training iteration, when ``remove_outliers`` is
+        True. ``outlier_nsigma`` is interpreted with the same HPD convention used
+        elsewhere in ROSE (1 / 2 / 3 sigma ↔ 68% / 95% / 99.7% highest-posterior
+        mass via ``erf(n/sqrt(2))``). Training points that fall outside the
+        axis-aligned bounding box of that tempered HPD region in unit-prior
+        space are removed from the active training set but retained on
+        ``self._pruned_training`` and written into ``total_training_set.npz``
+        under ``pruned/...`` keys so no evaluated points are lost.
+
+        A fixed Mahalanobis ``d <= n`` cut is *not* used: in moderate dimension
+        (e.g. 6 parameters) that ellipsoid is much smaller than the n-sigma HPD
+        region and can wipe out most of the training set.
+
+        Leave ``remove_outliers=False`` when the final sampler (e.g. Nautilus)
+        explores from the prior and benefits from retaining those broader
+        training points in the emulator itself.
+        """
+        import math
+
+        self._pruned_training = None
+        unit_chain = getattr(self, "unit_chain", None)
+        if unit_chain is None or len(unit_chain) == 0:
+            logger.warning(
+                "remove_outliers=True but no tempered chain is available; "
+                "skipping outlier removal."
+            )
+            return
+
+        n_before = len(self.unit_sample)
+        if n_before == 0:
+            return
+
+        nsigma = float(self.outlier_nsigma)
+        # 1D Gaussian mass for n-sigma; matches ROSE's 68/95/99.7 HPD labels.
+        fraction = math.erf(nsigma / math.sqrt(2.0))
+        fraction = min(max(fraction, 1e-6), 1.0)
+        region_indices = self._credible_region_indices(fraction=fraction)
+        region_unit = np.asarray(self.unit_chain[region_indices], dtype=float)
+        if len(region_unit) == 0:
+            logger.warning(
+                "remove_outliers: empty credible region; skipping prune."
+            )
+            return
+
+        lo = region_unit.min(axis=0)
+        hi = region_unit.max(axis=0)
+        # Tiny padding so points sitting on the HPD boundary are not clipped
+        # by floating-point noise.
+        pad = 1e-8 * np.maximum(hi - lo, 1e-12)
+        train = np.asarray(self.unit_sample, dtype=float)
+        keep = np.all((train >= (lo - pad)) & (train <= (hi + pad)), axis=1)
+        n_keep = int(keep.sum())
+
+        if n_keep == n_before:
+            logger.info(
+                f"remove_outliers: all {n_before} training points already lie "
+                f"within the {nsigma:g}-sigma ({fraction:.1%}) HPD box of the "
+                "last tempered chain."
+            )
+            return
+
+        ndim = train.shape[1]
+        min_keep = max(ndim + 1, 10)
+        if n_keep < min_keep:
+            logger.warning(
+                f"remove_outliers would leave only {n_keep} training points "
+                f"(need >= {min_keep}); skipping prune to avoid an unusable "
+                "training set. Consider a larger outlier_nsigma."
+            )
+            return
+
+        pruned = ~keep
+        # Diagnostic: Mahalanobis distance to the HPD cloud (not used for the cut).
+        mu = region_unit.mean(axis=0)
+        cov = np.cov(region_unit, rowvar=False)
+        if np.ndim(cov) == 0:
+            cov = np.array([[float(cov)]])
+        cov = np.asarray(cov, dtype=float) + np.eye(ndim) * 1e-12
+        try:
+            prec = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            prec = np.linalg.pinv(cov)
+        diff = train[pruned] - mu
+        d2 = np.einsum("ni,ij,nj->n", diff, prec, diff)
+
+        self._pruned_training = {
+            "sample": self.sample[pruned],
+            "unit_sample": self.unit_sample[pruned],
+            "sample_data_vectors": {
+                name: v[pruned] for name, v in self.sample_data_vectors.items()
+            },
+            "sample_likes": self.sample_likes[pruned],
+            "sample_priors": self.sample_priors[pruned],
+            "sample_posts": self.sample_posts[pruned],
+            "mahalanobis_d": np.sqrt(np.maximum(d2, 0.0)),
+            "outlier_nsigma": nsigma,
+            "credible_fraction": fraction,
+            "unit_lo": lo,
+            "unit_hi": hi,
+        }
+
+        self.sample = self.sample[keep]
+        self.unit_sample = self.unit_sample[keep]
+        self.sample_likes = self.sample_likes[keep]
+        self.sample_priors = self.sample_priors[keep]
+        self.sample_posts = self.sample_posts[keep]
+        self.sample_data_vectors = {
+            name: v[keep] for name, v in self.sample_data_vectors.items()
+        }
+        # Iteration-wise counts are no longer meaningful after a global prune.
+        self.points_per_iteration = np.array([n_keep])
+
+        logger.info(
+            f"remove_outliers: kept {n_keep}/{n_before} training points inside "
+            f"the {nsigma:g}-sigma ({fraction:.1%} HPD) unit-space box of the "
+            f"last tempered chain; stashed {n_before - n_keep} outliers for "
+            "total_training_set.npz."
+        )
+
     def _update_test_set(self, sample_results_test: List, sample_test: np.ndarray,
                         unit_sample_test: np.ndarray) -> None:
         """Update test set with new samples."""
@@ -371,13 +574,20 @@ class RoseDataProcessingMixin:
         """Save training and test datasets."""
         logger.info("Saving training and test datasets")
         
-        # Training set
+        # Training set (active points used for the final emulator)
         training_dict = self._build_dataset_dict(
             self.sample, self.unit_sample, self.sample_data_vectors,
             self.sample_likes, self.sample_priors, self.sample_posts,
             self.points_per_iteration
         )
-        np.savez(f'{self.save_outputs_dir}/total_training_set.npz', **training_dict)
+        pruned = getattr(self, "_pruned_training", None)
+        if pruned is not None:
+            training_dict.update(self._build_pruned_dataset_entries(pruned))
+            logger.info(
+                f"Including {len(pruned['sample_likes'])} pruned outlier "
+                "points under pruned/* keys in total_training_set.npz"
+            )
+        np.savez(f'{self.save_dir}/total_training_set.npz', **training_dict)
         
         # Test set
         test_dict = self._build_dataset_dict(
@@ -385,7 +595,42 @@ class RoseDataProcessingMixin:
             self.sample_likes_test, self.sample_priors_test, self.sample_posts_test,
             self.points_per_iteration_test
         )
-        np.savez(f'{self.save_outputs_dir}/total_testing_set.npz', **test_dict)
+        np.savez(f'{self.save_dir}/total_testing_set.npz', **test_dict)
+
+    def _build_pruned_dataset_entries(self, pruned: Dict[str, Any]) -> Dict[str, Any]:
+        """Serialize stashed outlier points under ``pruned/...`` keys."""
+        param_names = [str(param) for param in self.pipeline.varied_params]
+        sample = pruned["sample"]
+        unit_sample = pruned["unit_sample"]
+        data_vectors = pruned["sample_data_vectors"]
+        entries: Dict[str, Any] = {
+            "pruned/outlier_nsigma": np.asarray(pruned["outlier_nsigma"]),
+            "pruned/mahalanobis_d": pruned["mahalanobis_d"],
+            "pruned/chi2": pruned["sample_likes"],
+            "pruned/priors": pruned["sample_priors"],
+            "pruned/posts": pruned["sample_posts"],
+            "pruned/n_points": np.asarray(len(pruned["sample_likes"])),
+        }
+        if "credible_fraction" in pruned:
+            entries["pruned/credible_fraction"] = np.asarray(pruned["credible_fraction"])
+        if "unit_lo" in pruned:
+            entries["pruned/unit_lo"] = pruned["unit_lo"]
+            entries["pruned/unit_hi"] = pruned["unit_hi"]
+        for i, param in enumerate(param_names):
+            entries[f"pruned/{param}"] = sample[:, i]
+            entries[f"pruned/{param}--norm"] = unit_sample[:, i]
+
+        likelihood_names = list(data_vectors.keys())
+        for name, block in data_vectors.items():
+            entries[f"pruned/features/{name}"] = block
+        concatenated = (
+            np.concatenate([data_vectors[n] for n in likelihood_names], axis=1)
+            if likelihood_names and all(len(data_vectors[n]) for n in likelihood_names)
+            else np.empty((0, 0))
+        )
+        entries["pruned/features"] = concatenated
+        entries["pruned/likelihood_names"] = likelihood_names
+        return entries
 
     def _build_dataset_dict(self, sample: np.ndarray, unit_sample: np.ndarray,
                            data_vectors: Dict[str, np.ndarray], likes: np.ndarray,

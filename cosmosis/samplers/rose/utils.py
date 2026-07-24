@@ -22,6 +22,44 @@ SAVE_ALL = 2    # Save all training data, models, and diagnostics
 
 _sampler = None
 
+# Sentinel used to detect "no emulator has been loaded yet on this process".
+_UNSET_EMU_PATH = object()
+
+
+def _ensure_emulator(sampler: Any, model_path: Optional[str]) -> None:
+    """Make sure this process has the emulator the master is currently using.
+
+    In MPI runs only the master process executes the training loop, so the
+    worker processes never see the master's in-memory emulator updates (there
+    is no broadcast). Each worker therefore loads the emulator lazily from disk.
+
+    Because the master retrains the emulator every iteration -- and, when
+    ``kl_convergence = T``, again at the final step after folding in the test
+    points -- a worker that loaded an emulator once must *reload* it whenever
+    the master moves on to a new model. We track the path of the emulator this
+    process last loaded in ``sampler._loaded_emu_path`` and reload whenever the
+    requested ``model_path`` differs from it.
+
+    ``model_path`` is the per-iteration model directory (written by
+    ``train_emulator``) for from-scratch runs, or ``None`` for a pre-trained
+    emulator (in which case ``load_emulator(None)`` uses ``load_emu_filename``).
+    """
+    if sampler.emu_pipeline is None:
+        logger.warning("emu_pipeline is not initialized, setting it up now")
+        sampler.compute_fiducial_setup_emu_pipeline()
+        sampler.load_emulator(model_path)
+        sampler._loaded_emu_path = model_path
+        return
+
+    if getattr(sampler, "_loaded_emu_path", _UNSET_EMU_PATH) != model_path:
+        logger.info(
+            "Emulator on this process is out of date (had %r, need %r); reloading",
+            getattr(sampler, "_loaded_emu_path", None), model_path,
+        )
+        sampler.load_emulator(model_path)
+        sampler._loaded_emu_path = model_path
+
+
 def mkdir(path: str) -> None:
     """Ensure that all the components in the `path` exist in the file system.
     
@@ -138,14 +176,17 @@ def task(p: np.ndarray, sampler: Any, return_all: bool = False) -> Optional[Unio
 
 
 #def log_probability_function(u: np.ndarray, sampler: Any, tempering: float) -> Tuple[float, Tuple[float, List[float]]]:
-def log_probability_function(u: np.ndarray, tempering: float):
+def log_probability_function(u: np.ndarray, tempering: float, model_path: Optional[str] = None):
     """Log probability function using emulated pipeline.
     
     Args:
         u: Parameter vector in unit hypercube [0,1]^ndim
         tempering: Tempering factor to apply to posterior (0 < tempering <= 1)
                   Lower values flatten the likelihood for better exploration
-                  
+        model_path: Directory of the emulator the master is currently using.
+                  Passed so worker processes load/reload the matching emulator
+                  (see :func:`_ensure_emulator`). ``None`` for a pre-trained run.
+
     Returns:
         Tuple of (tempered_posterior, (prior, extra_parameters))
         Returns (-inf, (-inf, [nan, ...])) if parameters are outside prior bounds
@@ -153,14 +194,8 @@ def log_probability_function(u: np.ndarray, tempering: float):
     global _sampler
     if _sampler is None:
         raise RuntimeError("Global sampler not set. This should be set in RoseSampler.config()")
-    # Check if emu_pipeline is initialized
-    if _sampler.emu_pipeline is None:
-        #raise RuntimeError("emu_pipeline is not initialized. This may happen if execute() "
-        #                    "hasn't been called yet, or if compute_fiducial_setup_emu_pipeline() "
-        #                    "failed on this process.")
-        logger.warning("emu_pipeline is not initialized, setting it up now")
-        _sampler.compute_fiducial_setup_emu_pipeline()
-        _sampler.load_emulator()
+    # Make sure this process has the same (current) emulator as the master.
+    _ensure_emulator(_sampler, model_path)
     sampler = _sampler
     try:
         # Transform from unit hypercube to physical parameter space
@@ -177,11 +212,8 @@ def log_probability_function_nautilus(p, model_path=None):
     global _sampler
     if _sampler is None:
         raise RuntimeError("Global sampler not set. This should be set in RoseSampler.config()")
-    # Check if emu_pipeline is initialized
-    if _sampler.emu_pipeline is None:
-        logger.warning("emu_pipeline is not initialized, setting it up now")
-        _sampler.compute_fiducial_setup_emu_pipeline()
-        _sampler.load_emulator(model_path)
+    # Make sure this process has the same (current) emulator as the master.
+    _ensure_emulator(_sampler, model_path)
     sampler = _sampler
     r = sampler.emu_pipeline.run_results(p)
     log_prob, blobs =  r.post, (r.prior, r.extra)
@@ -208,11 +240,8 @@ def prior_transform(p, model_path=None):
     global _sampler
     if _sampler is None:
         raise RuntimeError("Global sampler not set. This should be set in RoseSampler.config()")
-    # Check if emu_pipeline is initialized
-    if _sampler.emu_pipeline is None:
-        logger.warning("emu_pipeline is not initialized, setting it up now")
-        _sampler.compute_fiducial_setup_emu_pipeline()
-        _sampler.load_emulator(model_path)
+    # Make sure this process has the same (current) emulator as the master.
+    _ensure_emulator(_sampler, model_path)
     sampler = _sampler
     return sampler.pipeline.denormalize_vector_from_prior(p)
 

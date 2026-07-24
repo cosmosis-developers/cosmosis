@@ -14,7 +14,16 @@ diagnostics on those test points using the freshly trained emulator:
 (c) KL divergence between consecutive-iteration likelihood estimates
     (implemented separately; see ``_test_kl_divergence``).
 
-All numeric results are written to ``{save_outputs_dir}/convergence`` and, when
+Separately, a lightweight per-iteration KL diagnostic is computed after every
+MCMC stage (see ``_record_iteration_kl``): the symmetric KL divergence between
+the current and previous iteration's MCMC chains after importance-reweighting
+both to the *untempered* posterior (so tempering changes no longer dominate the
+signal). Two estimators are reported side by side -- a closed-form Gaussian KL
+(``kl_gaussian``) and a non-parametric, sample-based k-nearest-neighbour KL
+(``kl_knn``; neighbour order set by ``kl_knn_k``). One row per iteration is
+appended to ``{save_dir}/rose_kl.txt`` (mirroring ``rose_timing.txt``).
+
+All numeric results are written to ``{save_dir}/convergence`` and, when
 matplotlib is available, summary figures are saved alongside them.
 """
 
@@ -58,7 +67,7 @@ class RoseConvergenceMixin:
             len(sample_test),
         )
 
-        self.convergence_dir = os.path.join(self.save_outputs_dir, "convergence")
+        self.convergence_dir = os.path.join(self.save_dir, "convergence")
         os.makedirs(self.convergence_dir, exist_ok=True)
 
         self.convergence_results: Dict[str, Any] = {}
@@ -221,13 +230,22 @@ class RoseConvergenceMixin:
         threshold = float(self.kl_threshold)
         max_retrain = int(self.kl_max_retrain)
 
-        # Posterior of iteration N (emulator without test points).
+        # Posterior of iteration N (emulator without test points). Each KL
+        # retrain writes a brand-new emumodel_{version} directory (rather than
+        # overwriting the current one) so the freshly trained model is both kept
+        # in memory and, being on disk, picked up by the MPI worker processes via
+        # _worker_emu_model_path()/_ensure_emulator.
         logp_prev = self._emulated_log_posterior(theta)
+        emu_version = getattr(self, "_current_emu_version", self.iterations + 1)
 
         # Fold the held-out test points into the training set and retrain -> N+1.
         n_added = self._append_test_points_to_training()
-        logger.info("Folded %d test points into the training set; retraining emulator", n_added)
-        self.train_emulator()
+        emu_version += 1
+        logger.info(
+            "Folded %d test points into the training set; retraining emulator "
+            "(emumodel_%d)", n_added, emu_version,
+        )
+        self.train_emulator(model_version=emu_version)
         logp_curr = self._emulated_log_posterior(theta)
 
         kl, ess = self._gaussian_kl_via_importance(theta, logp_prev, logq, logp_curr)
@@ -243,13 +261,14 @@ class RoseConvergenceMixin:
         while not converged and attempt < max_retrain:
             attempt += 1
             n_extra = self._add_training_points(self.kl_extra_size)
+            emu_version += 1
             logger.info(
                 "KL not converged (%.4g >= %.4g); retrain attempt %d/%d after "
-                "adding %d training points",
-                kl, threshold, attempt, max_retrain, n_extra,
+                "adding %d training points (emumodel_%d)",
+                kl, threshold, attempt, max_retrain, n_extra, emu_version,
             )
             logp_prev = logp_curr
-            self.train_emulator()
+            self.train_emulator(model_version=emu_version)
             logp_curr = self._emulated_log_posterior(theta)
             kl, ess = self._gaussian_kl_via_importance(theta, logp_prev, logq, logp_curr)
             kl_history.append(kl)
@@ -282,6 +301,169 @@ class RoseConvergenceMixin:
         }
         self._plot_kl_history(results)
         return results
+
+    # ------------------------------------------------------------------
+    # Per-iteration KL divergence between consecutive MCMC chains
+    # ------------------------------------------------------------------
+    def _untempered_log_weights(self, chain: np.ndarray) -> np.ndarray:
+        """Log importance weights that map the current chain to the untempered posterior.
+
+        Emcee/NUTS draw from the tempered posterior
+        ``q(θ) ∝ exp(T * log π(θ))``. Reweighting to the untempered target
+        ``π(θ)`` therefore contributes ``(1 - T) * log π(θ)``.
+
+        Nautilus (and any future weighted sampler) may already carry its own
+        importance weights in ``chain_log_weights``; those are added on top.
+        When ``T = 1`` the tempering term vanishes and only the sampler weights
+        remain.
+        """
+        n = len(chain)
+        logw = getattr(self, "chain_log_weights", None)
+        if logw is None or len(logw) != n:
+            logw = np.zeros(n, dtype=float)
+        else:
+            logw = np.asarray(logw, dtype=float).copy()
+
+        tempering = float(getattr(self, "chain_tempering", 1.0))
+        logpost = getattr(self, "chain_logpost", None)
+        if abs(tempering - 1.0) > 1e-12:
+            if logpost is None or len(logpost) != n:
+                logger.warning(
+                    "chain_logpost unavailable; cannot reweight tempering=%.4g "
+                    "to the untempered posterior for the per-iteration KL.",
+                    tempering,
+                )
+            else:
+                logpost = np.asarray(logpost, dtype=float)
+                # w ∝ π / q ∝ exp((1 - T) * log π)
+                logw = logw + (1.0 - tempering) * logpost
+        return logw
+
+    def _resample_equal_weight(self, chain: np.ndarray, logw: np.ndarray,
+                               cov: np.ndarray, n_sub: int) -> np.ndarray:
+        """Build an equal-weight subsample for the k-NN KL estimator.
+
+        Multinomial-resamples by ``logw`` when the weights are non-uniform
+        (tempering and/or sampler weights), with a tiny jitter to break the
+        exact duplicate ties that replacement creates. Falls back to plain
+        subsampling without replacement for equal-weight chains.
+        """
+        finite = np.isfinite(logw)
+        weighted = bool(finite.any() and np.ptp(logw[finite]) > 0)
+        n_sub = min(n_sub, len(chain))
+        if not weighted:
+            idx = np.random.choice(len(chain), size=n_sub, replace=False)
+            return chain[idx]
+
+        w = logw - np.max(logw[finite])
+        w = np.where(np.isfinite(w), np.exp(w), 0.0)
+        w_sum = w.sum()
+        if w_sum <= 0 or not np.isfinite(w_sum):
+            idx = np.random.choice(len(chain), size=n_sub, replace=False)
+            return chain[idx]
+
+        idx = np.random.choice(len(chain), size=n_sub, replace=True, p=w / w_sum)
+        samples = chain[idx].astype(float)
+        jitter_scale = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        jitter_scale = np.where(jitter_scale > 0, jitter_scale, 1.0)
+        samples = samples + np.random.normal(size=samples.shape) * (1e-3 * jitter_scale)
+        return samples
+
+    def _record_iteration_kl(self):
+        """Compute and persist per-iteration chain-to-chain KL divergences.
+
+        Called once per iteration right after the MCMC stage. Both the current
+        and previous chains are importance-reweighted to the *untempered*
+        posterior before the KL is computed, so changes in the tempering
+        schedule do not dominate the diagnostic. Sampler-native weights
+        (e.g. nautilus importance weights) are included as well.
+
+        Two symmetric (Jeffreys) KL divergences are reported:
+
+        * ``kl_gaussian`` -- closed-form Gaussian KL from weighted mean/cov.
+        * ``kl_knn`` -- sample-based k-NN KL (neighbour order ``kl_knn_k``)
+          on equal-weight resamples of the reweighted clouds. Uses Mahalanobis
+          whitening and, when ``kl_knn_debias = T``, subtracts a same-
+          distribution null to reduce the positive finite-sample bias.
+
+        One row per iteration is appended to ``{save_dir}/rose_kl.txt``.
+        The first iteration has no previous chain, so both KL entries are ``nan``.
+
+        Returns ``(kl_gaussian, kl_knn)``.
+        """
+        chain = getattr(self, "chain", None)
+        if chain is None or len(chain) < 2:
+            logger.warning(
+                "No usable MCMC chain available; skipping per-iteration KL divergence."
+            )
+            return float("nan"), float("nan")
+
+        chain = np.asarray(chain, dtype=float)
+        logw = self._untempered_log_weights(chain)
+        tempering = float(getattr(self, "chain_tempering", 1.0))
+
+        moments = self._weighted_moments(chain, logw)
+        if moments is None:
+            logger.warning(
+                "Could not compute tempering-reweighted chain moments "
+                "(tempering=%.4g); skipping per-iteration KL.",
+                tempering,
+            )
+            return float("nan"), float("nan")
+        mean, cov, ess = moments
+        if ess < 50:
+            logger.warning(
+                "Low ESS (%.0f) after tempering reweight (T=%.4g) for "
+                "per-iteration KL; the estimate may be noisy.",
+                ess, tempering,
+            )
+
+        n_sub = min(int(getattr(self, "kl_n_samples", 2000)), len(chain))
+        chain_samples = self._resample_equal_weight(chain, logw, cov, n_sub)
+
+        kl_gauss = float("nan")
+        kl_knn = float("nan")
+        prev_moments = getattr(self, "_kl_prev_chain_moments", None)
+        prev_samples = getattr(self, "_kl_prev_chain_samples", None)
+        if prev_moments is not None:
+            mean_prev, cov_prev = prev_moments
+            if mean_prev.shape == mean.shape:
+                kl_ab = _gaussian_kl(mean_prev, cov_prev, mean, cov)
+                kl_ba = _gaussian_kl(mean, cov, mean_prev, cov_prev)
+                kl_gauss = 0.5 * (kl_ab + kl_ba)
+        if prev_samples is not None and prev_samples.shape[1] == chain_samples.shape[1]:
+            kl_knn = _knn_kl_symmetric(
+                prev_samples, chain_samples,
+                k=int(getattr(self, "kl_knn_k", 3)),
+                debias=bool(getattr(self, "kl_knn_debias", True)),
+            )
+
+        self._kl_prev_chain_moments = (mean, cov)
+        self._kl_prev_chain_samples = chain_samples
+
+        kl_file = os.path.join(self.save_dir, "rose_kl.txt")
+        write_header = not os.path.isfile(kl_file)
+        with open(kl_file, "a") as f:
+            if write_header:
+                f.write("iteration\tkl_gaussian\tkl_knn\tess\ttempering\n")
+            f.write(
+                f"{self.iterations + 1}\t{kl_gauss:.6e}\t{kl_knn:.6e}\t"
+                f"{ess:.1f}\t{tempering:.6g}\n"
+            )
+
+        if np.isfinite(kl_gauss) or np.isfinite(kl_knn):
+            logger.info(
+                "Iteration %d chain-to-chain KL (untempered): Gaussian=%.4g, "
+                "k-NN=%.4g, ESS=%.0f, T=%.4g (saved to %s)",
+                self.iterations + 1, kl_gauss, kl_knn, ess, tempering, kl_file,
+            )
+        else:
+            logger.info(
+                "Iteration %d chain-to-chain KL: nan "
+                "(no previous chain; T=%.4g, ESS=%.0f; saved to %s)",
+                self.iterations + 1, tempering, ess, kl_file,
+            )
+        return float(kl_gauss), float(kl_knn)
 
     def _kl_reference_samples(self):
         """Return (theta, logq) reference samples for importance reweighting.
@@ -355,16 +537,14 @@ class RoseConvergenceMixin:
     def _add_training_points(self, n_points: int) -> int:
         """Draw, evaluate, and append ``n_points`` new training points.
 
-        Points are drawn from the one-before-last MCMC chain (``self.chain``) and
-        evaluated with the exact full pipeline, mirroring
+        Points are drawn homogeneously from the tempered HPD credible region of
+        the one-before-last MCMC chain (``self.chain``), mirroring
         ``generate_updated_sample`` but without collecting test points.
         """
         from .data_processing import _task_wrapper
         from .utils import task
 
-        chain_length = len(self.chain)
-        replace = chain_length < n_points
-        idx = np.random.choice(chain_length, size=n_points, replace=replace)
+        idx = self._select_credible_region_indices(n_points, homogeneous=True)
         sample = self.chain[idx]
         unit_sample = self.unit_chain[idx]
 
@@ -552,6 +732,154 @@ def _gaussian_kl(mean0: np.ndarray, cov0: np.ndarray,
     _, logdet0 = np.linalg.slogdet(cov0)
     _, logdet1 = np.linalg.slogdet(cov1)
     return float(0.5 * (trace_term - d + quad_term + (logdet1 - logdet0)))
+
+
+def _knn_distances(query: np.ndarray, reference: np.ndarray, k: int,
+                   exclude_self: bool) -> np.ndarray:
+    """Distance from each ``query`` point to its ``k``-th neighbour in ``reference``.
+
+    When ``exclude_self`` is True the query points are assumed to be a subset of
+    ``reference`` (self-distances of zero are discarded), so the k-th neighbour
+    is found among the remaining points.
+    """
+    n_needed = k + 1 if exclude_self else k
+    from scipy.spatial import cKDTree
+    tree = cKDTree(reference)
+    dist, _ = tree.query(query, k=n_needed)
+    dist = np.asarray(dist, dtype=float)
+    # query() returns a 1D array when n_needed == 1; make it (n, 1).
+    if dist.ndim == 1:
+        dist = dist[:, None]
+    return dist[:, -1]
+    # # Brute-force fallback (O(n*m)) when scipy is unavailable.
+    # diff = query[:, None, :] - reference[None, :, :]
+    # dmat = np.sqrt(np.sum(diff * diff, axis=2))
+    # dmat.sort(axis=1)
+    # return dmat[:, n_needed - 1]
+
+
+def _knn_kl_divergence(x: np.ndarray, y: np.ndarray, k: int = 1) -> float:
+    """Sample-based estimate of KL(P || Q) from samples ``x``~P and ``y``~Q.
+
+    Implements the k-nearest-neighbour estimator of Wang, Kulkarni & Verdu
+    (2009), "Divergence estimation for multidimensional densities via
+    k-nearest-neighbor distances":
+
+        KL(P||Q) ~= (d / n) * sum_i log(nu_k(i) / rho_k(i)) + log(m / (n - 1))
+
+    where ``rho_k(i)`` is the distance from ``x_i`` to its k-th neighbour within
+    ``x`` (excluding itself) and ``nu_k(i)`` is the distance from ``x_i`` to its
+    k-th neighbour in ``y``. No Gaussianity assumption is made.
+    """
+    x = np.atleast_2d(np.asarray(x, dtype=float))
+    y = np.atleast_2d(np.asarray(y, dtype=float))
+    n, d = x.shape
+    m = y.shape[0]
+    if n < k + 1 or m < k:
+        return float("nan")
+
+    rho = _knn_distances(x, x, k, exclude_self=True)
+    nu = _knn_distances(x, y, k, exclude_self=False)
+
+    valid = (rho > 0) & (nu > 0) & np.isfinite(rho) & np.isfinite(nu)
+    if valid.sum() < 1:
+        return float("nan")
+    rho = rho[valid]
+    nu = nu[valid]
+
+    kl = (d / rho.size) * np.sum(np.log(nu / rho)) + np.log(m / (n - 1.0))
+    return float(kl)
+
+
+def _whiten_pair(sample_a: np.ndarray, sample_b: np.ndarray):
+    """Whiten two sample sets with the pooled covariance (Mahalanobis metric).
+
+    Cosmological posteriors are strongly correlated; isotropic Euclidean k-NN
+    after only per-axis rescaling still stretches the metric along the
+    principal correlations and inflates the KL bias. Full whitening puts all
+    directions on an equal footing.
+    """
+    a = np.atleast_2d(np.asarray(sample_a, dtype=float))
+    b = np.atleast_2d(np.asarray(sample_b, dtype=float))
+    pooled = np.vstack([a, b])
+    cov = np.atleast_2d(np.cov(pooled, rowvar=False))
+    cov = cov + np.eye(cov.shape[0]) * 1e-12
+    try:
+        # L L^T = cov  =>  whitened = L^{-1} x
+        chol = np.linalg.cholesky(cov)
+        a_w = np.linalg.solve(chol, a.T).T
+        b_w = np.linalg.solve(chol, b.T).T
+        return a_w, b_w
+    except np.linalg.LinAlgError:
+        scale = np.std(pooled, axis=0)
+        scale = np.where(scale > 0, scale, 1.0)
+        return a / scale, b / scale
+
+
+def _knn_kl_raw_symmetric(a: np.ndarray, b: np.ndarray, k: int) -> float:
+    """Symmetrized k-NN KL on already-whitened samples (no debiasing)."""
+    kl_ab = _knn_kl_divergence(a, b, k=k)
+    kl_ba = _knn_kl_divergence(b, a, k=k)
+    if not (np.isfinite(kl_ab) and np.isfinite(kl_ba)):
+        return float("nan")
+    return float(max(0.0, 0.5 * (kl_ab + kl_ba)))
+
+
+def _knn_self_kl_null(samples: np.ndarray, k: int) -> float:
+    """Same-distribution null k-NN KL from a random 50/50 split of ``samples``.
+
+    For identical distributions the Wang–Kulkarni–Verdú estimator is biased
+    *positive* in finite samples; this null estimates that floor so it can be
+    subtracted from a cross-chain KL.
+    """
+    n = len(samples)
+    if n < 2 * (k + 1):
+        return 0.0
+    idx = np.random.permutation(n)
+    half = n // 2
+    return _knn_kl_raw_symmetric(samples[idx[:half]], samples[idx[half:]], k)
+
+
+def _knn_kl_symmetric(sample_a: np.ndarray, sample_b: np.ndarray,
+                      k: int = 3, debias: bool = True) -> float:
+    """Symmetrized (Jeffreys) k-NN KL divergence between two sample sets.
+
+    Steps:
+      1. Whiten both clouds with the pooled covariance (Mahalanobis metric)
+         so correlations do not inflate nearest-neighbour distances.
+      2. Compute the raw symmetrized Wang–Kulkarni–Verdú KL.
+      3. If ``debias`` (ini ``kl_knn_debias``), subtract the average
+         same-distribution null KL of each cloud. This removes most of the
+         positive finite-sample bias in moderate dimension.
+
+    ``k`` is the neighbour order (ini option ``kl_knn_k``; default 3).
+    """
+    a = np.atleast_2d(np.asarray(sample_a, dtype=float))
+    b = np.atleast_2d(np.asarray(sample_b, dtype=float))
+    if a.shape[1] != b.shape[1]:
+        return float("nan")
+
+    a, b = _whiten_pair(a, b)
+    kl_raw = _knn_kl_raw_symmetric(a, b, k)
+    if not np.isfinite(kl_raw):
+        return float("nan")
+    if not debias:
+        return float(kl_raw)
+
+    null_a = _knn_self_kl_null(a, k)
+    null_b = _knn_self_kl_null(b, k)
+    null = 0.0
+    n_null = 0
+    if np.isfinite(null_a):
+        null += null_a
+        n_null += 1
+    if np.isfinite(null_b):
+        null += null_b
+        n_null += 1
+    if n_null > 0:
+        null /= n_null
+        kl_raw = kl_raw - null
+    return float(max(0.0, kl_raw))
 
 
 def _get_pyplot():

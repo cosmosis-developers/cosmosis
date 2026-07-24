@@ -46,13 +46,17 @@ class RoseSamplingMixin:
             # Update global sampler reference after setup
             utils_module._sampler = self
         
-        # Use module-level function (can be pickled for MPI) and pass sampler/tempering via args
-        # emcee will call: log_probability_function(u, tempering)
+        # Use module-level function (can be pickled for MPI) and pass tempering
+        # plus the current emulator model path via args. emcee will call:
+        # log_probability_function(u, tempering, model_path). The model path lets
+        # worker processes (which never run execute()) load/reload the SAME
+        # emulator the master just trained, instead of a stale cached one.
+        model_path = self._worker_emu_model_path()
         emcee_sampler = emcee.EnsembleSampler(
             self.emcee_walkers,
             self.ndim,
             log_probability_function,
-            args=[tempering],
+            args=[tempering, model_path],
             pool=self.pool,
         )
         
@@ -127,11 +131,16 @@ class RoseSamplingMixin:
         logger.info(f"Starting Nautilus sampling with n_live={self.nautilus_n_live}")
         
         # Capture current model directory so workers (which never run execute()) load the same
-        # per-likelihood emulators when the pool pickles these callables.
-        current_model_path = os.path.join(self.save_outputs_dir, f'emumodel_{self.iterations + 1}')
+        # per-likelihood emulators when the pool pickles these callables. Using the
+        # shared helper keeps this in sync with the emcee path and with
+        # utils._ensure_emulator, so workers reload after e.g. a final-step KL
+        # retrain instead of serving a stale cached emulator.
+        current_model_path = self._worker_emu_model_path()
         # When using a pool, workers load from disk; ensure every per-likelihood
-        # emulator is on disk even if save_outputs is not "all".
-        if self.pool is not None and self.emulator:
+        # emulator is on disk even if save_output is not "all". (Only relevant
+        # for from-scratch runs; a pre-trained run has current_model_path=None
+        # and workers load from load_emu_filename.)
+        if current_model_path is not None and self.pool is not None and self.emulator:
             emulators_dict = (
                 self.emulator if isinstance(self.emulator, dict)
                 else {self.likelihood_names[0]: self.emulator}
@@ -775,9 +784,12 @@ class RoseSamplingMixin:
         # Store the (untempered) posterior per chain point for credible-region
         # test-point selection in the next iteration.
         self.chain_logpost = np.asarray(logp) / tempering
+        # NUTS samples are equal-weight (log-weight 0).
+        self.chain_log_weights = np.zeros(len(self.chain))
+        self.chain_tempering = float(tempering)
         
         # Handle output file management
-        if self.save_outputs == SAVE_ALL and 0 < self.iterations < self.max_iterations:
+        if self.save_output == SAVE_ALL and 0 < self.iterations < self.max_iterations:
             suffix = f'_tempering_{self.tempering[self.iterations-1]}_iteration_{self.iterations}'
             self.output.save_and_reset_to_chain_start(suffix)
         else:
@@ -828,11 +840,15 @@ class RoseSamplingMixin:
         # self.chain/self.unit_chain, so the next iteration can select test
         # points from the 1-sigma credible region of this chain.
         self.chain_logpost = np.asarray(logp) / tempering
+        # emcee samples are equal-weight (log-weight 0); recorded so the
+        # per-iteration KL diagnostic can treat all samplers uniformly.
+        self.chain_log_weights = np.zeros(len(self.chain))
+        self.chain_tempering = float(tempering)
         
         # Final iteration (e.g. trained_before=True or last of multi-iteration): write to main file only.
         # Intermediate iterations: save current chain to suffixed file and reset main for next chain.
         #is_final_chain = (self.iterations == self.max_iterations - 1)
-        if self.save_outputs == SAVE_ALL and 0 < self.iterations < self.max_iterations:
+        if self.save_output == SAVE_ALL and 0 < self.iterations < self.max_iterations:
             suffix = f'_tempering_{self.tempering[self.iterations-1]}_iteration_{self.iterations}'
             self.output.save_and_reset_to_chain_start(suffix)
         else:
@@ -844,7 +860,7 @@ class RoseSamplingMixin:
             post = tempered_post / tempering
             
             # If using nautilus for final iteration, always pass log_weight (0.0 for emcee)
-            if self.use_nautilus_final:
+            if self.final_sampler == "nautilus":
                 self.output.parameters(params, extra, prior, tempered_post, post, 0.0)
             else:
                 self.output.parameters(params, extra, prior, tempered_post, post)
@@ -915,6 +931,13 @@ class RoseSamplingMixin:
         # Store the (untempered) posterior per chain point for credible-region
         # test-point selection in the next iteration.
         self.chain_logpost = np.asarray(posts)
+        # Nautilus returns IMPORTANCE-WEIGHTED samples: the raw sample cloud
+        # includes a broad low-weight exploration tail. Storing the log-weights
+        # lets the per-iteration KL diagnostic weight the samples correctly
+        # (otherwise the unweighted covariance is hugely inflated and the
+        # Gaussian KL blows up).
+        self.chain_log_weights = np.asarray(log_weights, dtype=float)
+        self.chain_tempering = float(tempering)
         
         # Create log probability array (tempered)
         tempered_posts = posts * tempering
@@ -924,7 +947,7 @@ class RoseSamplingMixin:
         self.blobs = list(zip(priors, extras))
         
         # Handle output file management
-        if self.save_outputs == SAVE_ALL and 0 < self.iterations < self.max_iterations:
+        if self.save_output == SAVE_ALL and 0 < self.iterations < self.max_iterations:
             #suffix = f'_nautilus_iteration_{self.iterations}'
             suffix = f'_tempering_{self.tempering[self.iterations-1]}_iteration_{self.iterations}'
             self.output.save_and_reset_to_chain_start(suffix)

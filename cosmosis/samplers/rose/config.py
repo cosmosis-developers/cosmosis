@@ -6,13 +6,15 @@ parameters from ini files.
 """
 
 import logging
-from typing import Any, Callable, Dict, Union
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
 
 import numpy as np
 
 from .utils import SAVE_NONE, SAVE_MODEL, SAVE_ALL, mkdir
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def _parse_per_likelihood(
@@ -35,7 +37,7 @@ def _parse_per_likelihood(
             (``default:`` sets a fallback used by any likelihood not listed)
 
     Values are run through ``value_type`` (e.g. ``int``, ``float``) so numeric
-    settings like ``n_pca`` or ``batch_size`` still type-check.
+    settings like ``n_pca`` or ``batch_sizes`` still type-check.
     """
     if raw is None or not str(raw).strip():
         return default
@@ -57,6 +59,74 @@ def _parse_per_likelihood(
     return result
 
 
+def _parse_number_list(
+    raw: str,
+    value_type: Callable[[str], T] = float,
+    default: Optional[List[T]] = None,
+) -> Optional[List[T]]:
+    """Parse a space- or comma-separated list of numbers from an ini string.
+
+    Accepts forms like ``512 512 512``, ``512,512,512``, or ``[512, 512, 512]``.
+    An empty / missing string returns ``default`` (typically ``None``, meaning
+    the caller should fall back to its built-in schedule).
+    """
+    if raw is None or not str(raw).strip():
+        return default
+    cleaned = str(raw).strip().strip("[]()")
+    cleaned = cleaned.replace(",", " ")
+    parts = cleaned.split()
+    if not parts:
+        return default
+    return [value_type(x) for x in parts]
+
+
+def _parse_number_list_setting(
+    raw: str,
+    value_type: Callable[[str], T] = float,
+    default: Any = None,
+) -> Union[Optional[List[T]], Dict[str, List[T]]]:
+    """Parse a number-list setting that may be global or per-likelihood.
+
+    Global forms (applied to every likelihood)::
+
+        "512 512 512"
+        "512,512,512"
+        "[512, 512, 512]"
+
+    Per-likelihood forms use whitespace-separated ``name:v1,v2,...`` tokens
+    (commas inside the value; avoid spaces inside a token)::
+
+        "lsst:512,512,512 desi_bao:256,256,256,256"
+        "lsst:1e-2,1e-3,1e-4 default:1e-2,1e-3,1e-4,1e-5"
+
+    An empty / missing string returns ``default``.
+    """
+    if raw is None or not str(raw).strip():
+        return default
+    tokens = str(raw).split()
+    if any(":" in tok for tok in tokens):
+        result: Dict[str, List[T]] = {}
+        for tok in tokens:
+            if ":" not in tok:
+                raise ValueError(
+                    f"Per-likelihood list token '{tok}' is missing a ':'. "
+                    "Use a global list (e.g. '512 512 512') or "
+                    "'name:v1,v2,...' tokens (commas inside the value)."
+                )
+            name, val = tok.split(":", 1)
+            name = name.strip()
+            key = "__default__" if name.lower() in ("default", "*") else name
+            parsed = _parse_number_list(val, value_type)
+            if not parsed:
+                raise ValueError(
+                    f"Empty number list for likelihood '{name}' in setting "
+                    f"token '{tok}'"
+                )
+            result[key] = parsed
+        return result
+    return _parse_number_list(raw, value_type, default=default)
+
+
 def _setting_values(setting: Any) -> list:
     """Return the list of concrete values inside a setting.
 
@@ -73,56 +143,76 @@ class RoseConfigMixin:
     
     def _configure_output_saving(self) -> None:
         """Configure output saving options."""
-        save_outputs = self.read_ini("save_outputs", str, "")
-        
-        if save_outputs:
-            self.save_outputs_dir = self.read_ini("save_outputs_dir", str, "")
-            if not self.save_outputs_dir:
-                raise ValueError("save_outputs_dir must be specified when save_outputs is set")
-                
-            mkdir(self.save_outputs_dir)
-            
-            if save_outputs == "model":
-                self.save_outputs = SAVE_MODEL
-            elif save_outputs == "all":
-                self.save_outputs = SAVE_ALL
-            else:
-                raise ValueError(f"Unknown save_outputs option '{save_outputs}' - "
-                               "should be 'model', 'all', or empty")
+        save_dir = getattr(self.output, "filename_base", "")
+        if save_dir:
+            self.save_dir = self.read_ini("save_dir", str, save_dir + ".rose_output")
         else:
-            self.save_outputs = SAVE_NONE
+            self.save_dir = self.read_ini("save_dir", str, "")
+
+        if self.save_dir:
+            save_output = self.read_ini_choices("save_output", str, ["", "all", "last", "none"], "")
+            if save_output == "" or save_output == "none":
+                self.save_output = SAVE_NONE
+            elif save_output == "last":
+                mkdir(self.save_dir)
+            elif save_output == "all":
+                # must be save_output == "all" or would have failed above
+                mkdir(self.save_dir)
+                self.save_output = SAVE_ALL
+            else:
+                raise ValueError(f"Unknown save_output option '{save_output}' - "
+                               "should be 'last', 'all', 'none' or empty")
+        else:
+            self.save_output = SAVE_NONE
             # Set a default directory for model saving (even when not saving outputs)
             # This is needed because train_emulator always needs a model_filename
             import tempfile
             import os
-            self.save_outputs_dir = os.path.join(tempfile.gettempdir(), "rose_emulator")
-            mkdir(self.save_outputs_dir)
-            logger.warning("No outputs will be saved (save_outputs not specified), "
-                         f"but models will be saved to temporary directory: {self.save_outputs_dir}")
+            self.save_dir = os.path.join(tempfile.gettempdir(), "rose_emulator")
+            mkdir(self.save_dir)
+            logger.warning("No outputs will be saved (save_output not specified), "
+                         f"but models will be saved to temporary directory: {self.save_dir}")
     
     def _configure_training_parameters(self) -> None:
         """Configure neural network training parameters.
 
-        ``batch_size`` and ``training_iterations`` may be specified either as a
-        single integer (applied to all likelihoods) or with per-likelihood
-        overrides, e.g. ``batch_size = lsst:64 desi_bao:32`` or
-        ``training_iterations = lsst:8 default:5``.
+        ``batch_sizes`` and ``n_cycles_per_training`` may be specified globally
+        or with per-likelihood overrides, e.g.::
+
+            batch_sizes = 128
+            batch_sizes = 64 64 64 64 64
+            batch_sizes = lsst:64,64,64 desi_bao:32
+            n_cycles_per_training = lsst:8 default:5
+
+        A single ``batch_sizes`` value is broadcast across all training cycles.
+        Values are the base (first-iteration) sizes; each ROSE iteration
+        multiplies every entry by ``(iterations + 1)``.
         """
         self.max_iterations = self.read_ini("iterations", int, 4)
         self.initial_size = self.read_ini("initial_size", int, 9600)
         self.resample_size = self.read_ini("resample_size", int, 4800)
-        self.chi2_cut_off = self.read_ini("chi2_cut_off", float)
+        self.chi2_cut_off = self.read_ini("chi2_cut_off", float, 1e6)
         # Number of test points collected once, in the last training iteration,
         # from the 1-sigma or 2-sigma (credible) region of the one-before-last MCMC chain.
         self.final_test_size = self.read_ini(
-            "final_test_size", int, int(0.5 * self.resample_size)
+            "final_test_size", int, int(0.8 * self.resample_size)
         )
         # Fraction of the chain (ranked by posterior) that defines the
-        # "1-sigma"/68% credible region from which test points are drawn;
-        # should be 0.95 for 2-sigma/95% credible region.
+        # tempered HPD credible region used for both training resampling
+        # (homogeneous / farthest-point in unit space) and final test points
+        # (uniform draw). Use 0.68 for 1-sigma or 0.95 for 2-sigma.
         self.test_credible_fraction = self.read_ini(
             "test_credible_fraction", float, 0.95 
         )
+        # Optional: before training the final emulator, drop early training
+        # points that lie outside the n-sigma HPD region of the last tempered
+        # MCMC chain (same 68/95/99.7 convention as elsewhere in ROSE; the cut
+        # is the unit-prior bounding box of that HPD cloud). Can improve local
+        # accuracy near the posterior, but leave False when the final sampler
+        # (e.g. Nautilus) starts from the prior and benefits from retaining
+        # broad prior-volume coverage in the training set.
+        self.remove_outliers = self.read_ini("remove_outliers", bool, False)
+        self.outlier_nsigma = self.read_ini("outlier_nsigma", float, 3.0)
         # Convergence (KL divergence) settings. This test is opt-in: set
         # kl_convergence = T in the ini file to enable it. When enabled, before
         # the final sampling stage the test points are folded into the training
@@ -135,12 +225,57 @@ class RoseConfigMixin:
         self.kl_threshold = self.read_ini("kl_threshold", float, 0.1)
         self.kl_max_retrain = self.read_ini("kl_max_retrain", int, 5)
         self.kl_extra_size = self.read_ini("kl_extra_size", int, self.resample_size)
-        self.kl_n_samples = self.read_ini("kl_n_samples", int, 2000)
-        self.batch_size = _parse_per_likelihood(
-            self.read_ini("batch_size", str, "32"), int
+        self.kl_n_samples = self.read_ini("kl_n_samples", int, 3000)
+        # Neighbour order for the per-iteration sample-based (k-NN) KL
+        # estimator. k=1 is the classic Wang–Kulkarni–Verdú estimator; k=3–5
+        # is usually less noisy in moderate dimension (e.g. ~6 cosmological
+        # parameters).
+        self.kl_knn_k = self.read_ini("kl_knn_k", int, 3)
+        # Subtract a same-distribution "null" k-NN KL (split-sample self-KL)
+        # from the cross-chain estimate. This removes most of the positive
+        # finite-sample bias of the Wang–Kulkarni–Verdú estimator in moderate
+        # dimension, so kl_knn is closer in scale to kl_gaussian when the
+        # posteriors are similar.
+        self.kl_knn_debias = self.read_ini("kl_knn_debias", bool, True)
+
+        self.n_cycles_per_training = _parse_per_likelihood(
+            self.read_ini("n_cycles_per_training", str, "5"), int
         )
-        self.training_iterations = _parse_per_likelihood(
-            self.read_ini("training_iterations", str, "5"), int
+        # Per-stage batch sizes for the first ROSE iteration. A single value
+        # (default 32) is broadcast to every training cycle; otherwise the list
+        # length must match ``n_cycles_per_training``. Later ROSE iterations
+        # multiply each entry by ``(iterations + 1)``. Accepts the same global /
+        # per-likelihood list syntax as ``learning_rates``.
+        self.batch_sizes = _parse_number_list_setting(
+            self.read_ini("batch_sizes", str, "32"), int
+        )
+        # Optional CosmoPowerNN training-schedule overrides. Leave blank to keep
+        # the defaults derived from n_cycles_per_training
+        # (learning rates 1e-2, 1e-3, ...; patience=100; max_epochs=1000;
+        # gradient_accumulation_steps=1 per cycle).
+        #
+        # Global list (spaces or commas)::
+        #   learning_rates = 1e-2 1e-3 1e-4 1e-5 1e-6
+        # Per-likelihood (commas inside each token)::
+        #   learning_rates = lsst:1e-2,1e-3,1e-4 desi_bao:1e-2,1e-3 default:1e-2,1e-3,1e-4,1e-5
+        #
+        # Schedule list lengths must match that likelihood's
+        # ``n_cycles_per_training`` (except ``batch_sizes``, where a single
+        # value is broadcast).
+        self.validation_split = _parse_per_likelihood(
+            self.read_ini("validation_split", str, "0.1"), float
+        )
+        self.learning_rates = _parse_number_list_setting(
+            self.read_ini("learning_rates", str, ""), float
+        )
+        self.gradient_accumulation_steps = _parse_number_list_setting(
+            self.read_ini("gradient_accumulation_steps", str, ""), int
+        )
+        self.patience_values = _parse_number_list_setting(
+            self.read_ini("patience_values", str, ""), int
+        )
+        self.max_epochs = _parse_number_list_setting(
+            self.read_ini("max_epochs", str, ""), int
         )
         
         # Validate training parameters
@@ -154,6 +289,8 @@ class RoseConfigMixin:
             raise ValueError("final_test_size must be >= 0 (use 0 to disable test collection)")
         if not (0.0 < self.test_credible_fraction <= 1.0):
             raise ValueError("test_credible_fraction must be in (0, 1]")
+        if self.outlier_nsigma <= 0:
+            raise ValueError("outlier_nsigma must be > 0")
         if self.kl_threshold <= 0:
             raise ValueError("kl_threshold must be > 0")
         if self.kl_max_retrain < 0:
@@ -162,10 +299,19 @@ class RoseConfigMixin:
             raise ValueError("kl_extra_size must be >= 1")
         if self.kl_n_samples < 10:
             raise ValueError("kl_n_samples must be >= 10")
-        if any(v < 1 for v in _setting_values(self.batch_size)):
-            raise ValueError("batch_size must be >= 1 (for every likelihood)")
-        if any(v < 1 for v in _setting_values(self.training_iterations)):
-            raise ValueError("training_iterations must be >= 1 (for every likelihood)")
+        if self.kl_knn_k < 1:
+            raise ValueError("kl_knn_k must be >= 1")
+        if any(v < 1 for v in _setting_values(self.n_cycles_per_training)):
+            raise ValueError("n_cycles_per_training must be >= 1 (for every likelihood)")
+        for sizes in _setting_values(self.batch_sizes):
+            if not sizes or any(v < 1 for v in sizes):
+                raise ValueError(
+                    "batch_sizes must be a non-empty list of integers >= 1 "
+                    "(for every likelihood)"
+                )
+        if any(not (0.0 < v < 1.0) for v in _setting_values(self.validation_split)):
+            raise ValueError("validation_split must be in (0, 1) (for every likelihood)")
+        self._validate_training_schedule_lists()
     
     def _configure_mcmc_parameters(self) -> None:
         """Configure MCMC sampling parameters."""
@@ -258,20 +404,16 @@ class RoseConfigMixin:
         self.prior_module = self.read_ini("prior_module", str, "")
 
         # Tempering settings
-        tempering = self.read_ini("tempering", float, 0.05)
-        self.tempering = np.full(self.max_iterations, tempering)
-        
-        tempering_file = self.read_ini("tempering_file", str, "")
-        if tempering_file:
-            try:
-                custom_tempering = np.genfromtxt(tempering_file)
-                if len(custom_tempering) < self.max_iterations:
-                    logger.warning(f"Tempering file has {len(custom_tempering)} values but "
-                                 f"{self.max_iterations} iterations requested")
-                self.tempering = custom_tempering[:self.max_iterations]
-            except Exception as e:
-                raise ValueError(f"Failed to read tempering file {tempering_file}: {e}")
-        
+        tempering = self.read_ini("tempering", str, "")
+        if tempering == "":
+            self.tempering = np.linspace(0.05, 1.0, self.max_iterations)
+        else:
+            self.tempering = _parse_number_list(tempering, float)
+        if len(self.tempering) != self.max_iterations:
+            raise ValueError(f"Tempering param must have same number of values as max_iterations ({self.max_iterations})")
+        if self.tempering[-1] != 1.0:
+            raise ValueError("Final tempering value must be 1. You gave: " + tempering)
+   
         logger.info(f"Tempering schedule: {self.tempering}")
         
         # Random seed
@@ -301,22 +443,120 @@ class RoseConfigMixin:
         ) and self.keys:
             raise ValueError("Weighted loss function can only be used with full data vector "
                            "(empty keys parameter)")
-        
+        available_final_samplers = ["emcee", "nautilus", "nuts"]
+        self.final_sampler = self.read_ini_choices("final_sampler", str, available_final_samplers, "emcee")
+
         # Nautilus configuration for final iteration
-        self.use_nautilus_final = self.read_ini("use_nautilus_final", bool, False)
-        if self.use_nautilus_final:
+        if self.final_sampler == "nautilus":
             self._configure_nautilus_parameters()
             # Add log_weight column to output when using nautilus (for all iterations)
             if self.output is not None:
                 self.output.add_column("log_weight", float)
         
         # NUTS configuration for final iteration
-        self.use_nuts_final = self.read_ini("use_nuts_final", bool, False)
-        if self.use_nuts_final:
+        elif self.final_sampler == "nuts":
             self._configure_nuts_parameters()
+        else:
+        # If the final sampler is emcee then it just inherits
+        # the sampler settings used for all the intermediate
+        # sampling cycles
+            logger.info(f"Final sampler is emcee, so using the same settings as the intermediate sampling cycles")
+
         
         # Neural network architecture (scalar or per-likelihood dict)
         self.nn_model = _parse_per_likelihood(
             self.read_ini("nn_model", str, "MLP"), str
         )
+        # Hidden-layer widths for the MLP. Global: ``n_hidden = 512 512 512``.
+        # Per-likelihood: ``n_hidden = lsst:512,512,512 desi_bao:256,256,256,256``.
+        # Defaults to four layers of 512 (the previous hard-coded ROSE layout).
+        self.n_hidden = _parse_number_list_setting(
+            self.read_ini("n_hidden", str, "512 512 512 512"), int
+        )
+        for widths in _setting_values(self.n_hidden):
+            if not widths or any(n < 1 for n in widths):
+                raise ValueError(
+                    "n_hidden must be a non-empty list of integers >= 1 "
+                    "(for every likelihood)"
+                )
+
+    def _peek_training_setting(self, setting: Any, likelihood_name: str) -> Any:
+        """Resolve a setting value for ``likelihood_name`` without getattr."""
+        if isinstance(setting, dict):
+            if likelihood_name in setting:
+                return setting[likelihood_name]
+            if "__default__" in setting:
+                return setting["__default__"]
+            raise KeyError(
+                f"No value for likelihood '{likelihood_name}' in setting {setting!r}"
+            )
+        return setting
+
+    def _validate_training_schedule_lists(self) -> None:
+        """Ensure optional schedule lists agree with n_cycles_per_training.
+
+        Supports global and per-likelihood forms. Remaining per-likelihood
+        length checks that cannot be resolved at config time (e.g. a schedule
+        entry whose likelihood is not yet listed in ``n_cycles_per_training``)
+        are re-checked when training each emulator.
+        """
+        schedule_attrs = (
+            ("learning_rates", self.learning_rates, lambda v: v > 0, False),
+            ("batch_sizes", self.batch_sizes, lambda v: v >= 1, True),
+            ("gradient_accumulation_steps", self.gradient_accumulation_steps,
+             lambda v: v >= 1, False),
+            ("patience_values", self.patience_values, lambda v: v >= 1, False),
+            ("max_epochs", self.max_epochs, lambda v: v >= 1, False),
+        )
+        for name, setting, ok, allow_broadcast in schedule_attrs:
+            if setting is None:
+                continue
+            for values in _setting_values(setting):
+                if not values:
+                    raise ValueError(f"{name} must be a non-empty list when set")
+                if any(not ok(v) for v in values):
+                    raise ValueError(f"{name} contains an invalid value: {values}")
+
+            items = (
+                list(setting.items()) if isinstance(setting, dict)
+                else [("*", setting)]
+            )
+            for label, values in items:
+                expected_lengths: List[int] = []
+                if label == "*":
+                    expected_lengths = list(
+                        _setting_values(self.n_cycles_per_training)
+                    )
+                elif label == "__default__":
+                    if isinstance(self.n_cycles_per_training, dict):
+                        if "__default__" in self.n_cycles_per_training:
+                            expected_lengths = [
+                                self.n_cycles_per_training["__default__"]
+                            ]
+                    else:
+                        expected_lengths = [self.n_cycles_per_training]
+                else:
+                    try:
+                        expected_lengths = [
+                            self._peek_training_setting(
+                                self.n_cycles_per_training, label
+                            )
+                        ]
+                    except KeyError:
+                        expected_lengths = []
+                for n in expected_lengths:
+                    if allow_broadcast and len(values) == 1:
+                        continue
+                    if len(values) != n:
+                        where = (
+                            "globally" if label == "*"
+                            else f"for '{label}'"
+                        )
+                        raise ValueError(
+                            f"{name} {where} has length {len(values)} but "
+                            f"n_cycles_per_training is {n}; schedule "
+                            "lists must match n_cycles_per_training"
+                            + (" (or be a single value to broadcast)"
+                               if allow_broadcast else "")
+                        )
 

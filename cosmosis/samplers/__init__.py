@@ -23,6 +23,5 @@ from .apriori.apriori_sampler import AprioriSampler
 from .dynesty.dynesty_sampler import DynestySampler
 from .zeus.zeus_sampler import ZeusSampler
 from .poco.poco_sampler import PocoMCSampler
-from .emugen.emugen_sampler import EmugenSampler
 from .rose.rose_sampler import RoseSampler
 from .nautilus.nautilus_sampler import NautilusSampler

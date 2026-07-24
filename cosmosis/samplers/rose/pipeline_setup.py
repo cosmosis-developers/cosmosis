@@ -180,17 +180,15 @@ class RosePipelineSetupMixin:
             emu_modules = [emu_module, *patched]
 
         # Add prior modules if they exist
-        logger.info(f"Emulated modules: {[m.name for m in emu_modules]}")
         if self.prior_module:
             try:
                 prior_index = module_names.index(self.prior_module)
                 emu_modules.insert(0, self.pipeline.modules[prior_index])
             except ValueError:
                 raise ValueError(f"Module '{self.prior_module}' not found in pipeline")
-            logger.info(f"Emulated modules: {[m.name for m in emu_modules]}")
         else:
             logger.warning("No prior module found")
-        
+        logger.info(f"Emulated modules: {[m.name for m in emu_modules]}")
         self.emu_modules = emu_modules
         self.fixed_inputs = fixed_inputs
 

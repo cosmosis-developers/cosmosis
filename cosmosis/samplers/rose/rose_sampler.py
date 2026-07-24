@@ -90,7 +90,7 @@ class RoseSampler(
         
         # Configure output saving
         self._configure_output_saving()
-        self._timing_file = os.path.join(self.save_outputs_dir, "rose_timing.txt")
+        self._timing_file = os.path.join(self.save_dir, "rose_timing.txt")
         
         # Configure emulator loading. Accepts either a single directory/base
         # path (applied to all likelihoods) or per-likelihood 'name:path'
@@ -105,7 +105,7 @@ class RoseSampler(
         # CMB-only planck emulator with supernova_params--m), ignore those
         # extra parameters at prediction time instead of raising.
         self.ignore_missing_emu_params = self.read_ini(
-            "ignore_missing_emu_params", bool, False
+            "ignore_missing_emu_params", bool, True
         )
         
         if self.trained_before and not self.load_emu_filename:
@@ -114,7 +114,13 @@ class RoseSampler(
         # Initialize state
         self.ndim = len(self.pipeline.varied_params)
         self.emu_pipeline = None
-        self.iterations = 0    
+        self.iterations = 0
+        # Monotonically increasing id of the emulator model directory
+        # (emumodel_{version}). Normally version == iterations + 1 (one training
+        # per iteration), but the final-step KL-convergence loop retrains
+        # additional times; each retrain bumps this so a fresh emumodel_N+1 dir
+        # is written instead of overwriting the previous one.
+        self._current_emu_version = 0
         
         # Configure training parameters
         self._configure_training_parameters()
@@ -148,6 +154,9 @@ class RoseSampler(
             self.compute_fiducial_setup_emu_pipeline()
             logger.info("Using pre-trained emulator, proceeding to final sampling")
             self.load_emulator()
+            # Match the path token workers are given (None for pre-trained) so
+            # utils._ensure_emulator does not reload on the master.
+            self._loaded_emu_path = self._worker_emu_model_path()
             self.iterations = self.max_iterations - 1
         else:
             # Normal training workflow: time training set generation
@@ -180,16 +189,21 @@ class RoseSampler(
             self.run_convergence_tests()
         
         t2 = time.perf_counter()
-        if is_final_iteration and self.use_nuts_final:
+        if is_final_iteration and self.final_sampler == "nuts":
             logger.info("Using NUTS for final iteration")
             self._run_nuts_sampling(tempering)
-        elif is_final_iteration and self.use_nautilus_final:
+        elif is_final_iteration and self.final_sampler == "nautilus":
             logger.info("Using Nautilus for final iteration")
             self._run_nautilus_sampling(tempering)
         else:
             logger.info("Using emcee for sampling")
             self._run_emcee_sampling(tempering)
         time_sampling_s = time.perf_counter() - t2
+
+        # Compute a per-iteration KL divergence directly from the MCMC chains
+        # (ignoring the tempering used to produce them) and append it to
+        # rose_kl.txt, mirroring the per-iteration timing bookkeeping below.
+        self._record_iteration_kl()
 
         # Save timing for this iteration to file
         write_header = not os.path.isfile(self._timing_file)
