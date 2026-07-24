@@ -414,7 +414,7 @@ class RoseEmulatorManagementMixin:
             )
             emu.load(base_path)
 
-            ignore_extra = getattr(self, "ignore_missing_emu_params", False)
+            ignore_extra = getattr(self, "ignore_missing_emu_params", True)
             emu.ignore_extra_params = ignore_extra
             if ignore_extra:
                 trained_params = set(model_parameters)

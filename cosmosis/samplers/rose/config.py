@@ -225,12 +225,12 @@ class RoseConfigMixin:
         self.kl_threshold = self.read_ini("kl_threshold", float, 0.1)
         self.kl_max_retrain = self.read_ini("kl_max_retrain", int, 5)
         self.kl_extra_size = self.read_ini("kl_extra_size", int, self.resample_size)
-        self.kl_n_samples = self.read_ini("kl_n_samples", int, 3000)
+        self.kl_n_samples = self.read_ini("kl_n_samples", int, 7000)
         # Neighbour order for the per-iteration sample-based (k-NN) KL
         # estimator. k=1 is the classic Wang–Kulkarni–Verdú estimator; k=3–5
         # is usually less noisy in moderate dimension (e.g. ~6 cosmological
         # parameters).
-        self.kl_knn_k = self.read_ini("kl_knn_k", int, 3)
+        self.kl_knn_k = self.read_ini("kl_knn_k", int, 10)
         # Subtract a same-distribution "null" k-NN KL (split-sample self-KL)
         # from the cross-chain estimate. This removes most of the positive
         # finite-sample bias of the Wang–Kulkarni–Verdú estimator in moderate
