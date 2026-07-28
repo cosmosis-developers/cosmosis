@@ -38,6 +38,8 @@ DTYPE = tf.float32
 tf.get_logger().setLevel('ERROR')
 warnings.filterwarnings('ignore', category=FutureWarning)
 
+# Value for the signed log norm transform
+# optimised for 3x2pt with C_ell ~1e-11-1e-9
 s = 1e-7
 
 # Device detection with better error handling
@@ -825,7 +827,7 @@ class NNEmulator:
         modes: Output modes/features
         nn_model: Neural network architecture ('MLP' or other models of your choice -- to be implemented)
         iteration: Current training iteration (for naming)
-        data_trafo: Data transformation type ('log_norm', 'norm', 'PCA')
+        data_transformation: Data transformation type ('log_norm', 'norm', 'PCA')
         n_pca: Number of PCA components (if using PCA)
         datavector: Reference data vector for weighted training
         inv_cov: Inverse covariance matrix for weighted training
@@ -837,7 +839,7 @@ class NNEmulator:
                  nn_model: str = 'MLP',
                  loss_function: str = "standard",
                  iteration: int = 1,
-                 data_trafo: str = 'log_norm',
+                 data_transformation: str = 'log_norm',
                  n_pca: int = 64,
                  datavector: Optional[np.ndarray] = None,
                  inv_cov: Optional[np.ndarray] = None):
@@ -850,7 +852,7 @@ class NNEmulator:
         self.ignore_extra_params = False
         self.model_parameters = model_parameters
         self.modes = modes
-        self.data_trafo = data_trafo
+        self.data_transformation = data_transformation
         self.datavector = datavector
         self.data_inv_cov = inv_cov
         self.n_pca = n_pca
@@ -867,7 +869,7 @@ class NNEmulator:
         self.X_mean = None
         self.X_std = None
         
-        logger.info(f"NNEmulator initialized with {data_trafo} transformation")
+        logger.info(f"NNEmulator initialized with {data_transformation} transformation")
 
     def transform(self, model_datavector: np.ndarray) -> np.ndarray:
         """Transform data vector for neural network training.
@@ -878,16 +880,16 @@ class NNEmulator:
         Returns:
             Transformed data vector ready for training
         """
-        if self.data_trafo == 'log_norm':
+        if self.data_transformation == 'log_norm':
             return self._log_norm_transform(model_datavector)
-        elif self.data_trafo == 'signed_log_norm':
+        elif self.data_transformation == 'signed_log_norm':
             return self._signed_log_norm_transform(model_datavector)
-        elif self.data_trafo == 'norm':
+        elif self.data_transformation == 'norm':
             return self._norm_transform(model_datavector)
-        elif self.data_trafo == 'PCA':
+        elif self.data_transformation == 'PCA':
             return self._pca_transform(model_datavector)
         else:
-            raise ValueError(f"Unknown data transformation: {self.data_trafo}")
+            raise ValueError(f"Unknown data transformation: {self.data_transformation}")
 
     def _log_norm_transform(self, data: np.ndarray) -> np.ndarray:
         """Apply log-normalization transformation."""
@@ -965,18 +967,18 @@ class NNEmulator:
         Returns:
             Predictions in original data space
         """
-        if self.data_trafo == 'log_norm':
+        if self.data_transformation == 'log_norm':
             return 10 ** model_datavector
-        elif self.data_trafo == 'signed_log_norm':
+        elif self.data_transformation == 'signed_log_norm':
             return np.sign(model_datavector) * s * (10.0 ** np.abs(model_datavector) - 1.)
-        elif self.data_trafo == 'norm':
+        elif self.data_transformation == 'norm':
             return model_datavector
-        elif self.data_trafo == 'PCA':
+        elif self.data_transformation == 'PCA':
             # Reverse PCA transformation
             pca_reconstructed = np.dot(model_datavector, self.pca_transform_matrix)
             return pca_reconstructed * self.features_std + self.features_mean
         else:
-            raise ValueError(f"Unknown data transformation: {self.data_trafo}")
+            raise ValueError(f"Unknown data transformation: {self.data_transformation}")
 
     def train(self,
               X: Dict[str, np.ndarray],
@@ -1059,7 +1061,7 @@ class NNEmulator:
         self.X_std = {key: np.maximum(np.std(X[key], axis=0), 1e-10) for key in X.keys()}
         
         # Transform target data
-        logger.info(f"Applying {self.data_trafo} transformation to target data")
+        logger.info(f"Applying {self.data_transformation} transformation to target data")
         y_train = self.transform(y)
         
         # Prepare normalization arrays
@@ -1068,7 +1070,7 @@ class NNEmulator:
         
         # Create neural network
         logger.info(f"Creating {self.nn_model} neural network with n_hidden={n_hidden}")
-        output_dim = self.n_pca if self.data_trafo == 'PCA' else len(self.modes)
+        output_dim = self.n_pca if self.data_transformation == 'PCA' else len(self.modes)
         
         self.cp_nn = CosmoPowerNN(
             parameters=self.model_parameters,
@@ -1111,7 +1113,7 @@ class NNEmulator:
     def _save_attributes(self, model_filename: str) -> None:
         """Save additional emulator attributes."""
         save_dict = { "data_transformation": {
-            "data_trafo": self.data_trafo,
+            "data_transformation": self.data_transformation,
             "X_mean": self.X_mean,
             "X_std": self.X_std,
             "y_mean": self.y_mean,
@@ -1156,7 +1158,7 @@ class NNEmulator:
         npz_filename = filename + ".npz"
         with np.load(npz_filename, allow_pickle=True) as data:
             data_transformation = data["data_transformation"].item()
-            self.data_trafo = data_transformation["data_trafo"]
+            self.data_transformation = data_transformation["data_transformation"]
             self.X_mean = data_transformation["X_mean"]
             self.X_std = data_transformation["X_std"]
             self.y_mean = data_transformation["y_mean"]
@@ -1330,13 +1332,13 @@ class NNEmulator:
             pred_intermediate = pred_norm * y_std_tf + y_mean_tf
             
             # Apply backtransform (e.g., from log10 space to original space)
-            if self.data_trafo == 'log_norm':
+            if self.data_transformation == 'log_norm':
                 pred_original = tf.pow(10.0, pred_intermediate)
-            elif self.data_trafo == 'signed_log_norm':
+            elif self.data_transformation == 'signed_log_norm':
                 pred_original = tf.sign(pred_intermediate) * tf.multiply(s, tf.subtract(tf.pow(10.0, tf.abs(pred_intermediate)), 1.0))
-            elif self.data_trafo == 'norm':
+            elif self.data_transformation == 'norm':
                 pred_original = pred_intermediate
-            elif self.data_trafo == 'PCA':
+            elif self.data_transformation == 'PCA':
                 # For PCA: pred_original = (pred_intermediate @ pca_transform_matrix) * features_std + features_mean
                 pca_matrix_tf = tf.constant(self.pca_transform_matrix, dtype=DTYPE)
                 features_std_tf = tf.constant(self.features_std, dtype=DTYPE)
@@ -1410,8 +1412,8 @@ class NNEmulator:
         print(f"Parameter names: {self.model_parameters}")
         print(f"Output modes: {len(self.modes)}")
         print(f"Architecture: {self.nn_model}")
-        print(f"Data transformation: {self.data_trafo}")
-        if self.data_trafo == 'PCA':
+        print(f"Data transformation: {self.data_transformation}")
+        if self.data_transformation == 'PCA':
             print(f"PCA components: {self.n_pca}")
         print(f"Trained: {self.trained}")
         

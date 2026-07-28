@@ -173,10 +173,20 @@ class RoseEmulatorManagementMixin:
                     f"{len(batch_sizes)} but n_cycles_per_training is "
                     f"{n_cycles_per_training} (use a single value to broadcast)"
                 )
-            # Ini ``batch_sizes`` are the base (iteration-0) values; multiply by
-            # (iterations + 1) each ROSE iteration, matching the previous
-            # ``batch_size * (self.iterations + 1)`` behaviour.
-            batch_sizes = [b * (self.iterations + 1) for b in batch_sizes]
+            # Ini ``batch_sizes`` are for the first training iteration. Scale
+            # every entry by current_n / first_n as the training set grows
+            # (and shrinks, e.g. after outlier pruning).
+            ref_n = getattr(self, "_batch_sizes_ref_n", None)
+            if ref_n is None or ref_n <= 0:
+                self._batch_sizes_ref_n = n_samp
+                ref_n = n_samp
+            scale = n_samp / ref_n
+            if scale != 1.0:
+                batch_sizes = [max(1, int(round(b * scale))) for b in batch_sizes]
+                logger.info(
+                    f"Scaled batch_sizes for '{name}' by {scale:.3f} "
+                    f"(n_train={n_samp}, ref={ref_n}): {batch_sizes}"
+                )
             kwargs = {
                 "model_filename": model_filename,
                 "n_cycles_per_training": n_cycles_per_training,
@@ -213,7 +223,7 @@ class RoseEmulatorManagementMixin:
                 self._resolve_training_setting("nn_model", name),
                 self._resolve_training_setting("loss_function", name),
                 self.iterations + 1,
-                self._resolve_training_setting("data_trafo", name),
+                self._resolve_training_setting("data_transformation", name),
                 self._resolve_training_setting("n_pca", name),
                 self.data.get(name),
                 self.inv_cov.get(name),
@@ -255,7 +265,7 @@ class RoseEmulatorManagementMixin:
     def _resolve_training_setting(self, attr: str, likelihood_name: str) -> Any:
         """Resolve a training setting with optional per-likelihood override.
 
-        The sampler stores each setting (e.g. ``data_trafo``, ``loss_function``,
+        The sampler stores each setting (e.g. ``data_transformation``, ``loss_function``,
         ``n_pca``) as either a single value (applied to all likelihoods) or a
         dict mapping likelihood name to value. Missing entries fall back to
         the default stored under the ``__default__`` key or, if absent, to
@@ -377,15 +387,15 @@ class RoseEmulatorManagementMixin:
                     f"Emulator info file for likelihood '{name}' not found: {info_file}"
                 )
 
-            default_trafo = self._resolve_training_setting("data_trafo", name)
+            default_trafo = self._resolve_training_setting("data_transformation", name)
             with np.load(info_file, allow_pickle=True) as data:
-                data_trafo_init = default_trafo
+                data_transformation_init = default_trafo
                 if "data_transformation" in data:
                     dt = data["data_transformation"]
                     if hasattr(dt, "item"):
                         dt = dt.item()
-                    if isinstance(dt, dict) and "data_trafo" in dt:
-                        data_trafo_init = str(dt["data_trafo"])
+                    if isinstance(dt, dict) and "data_transformation" in dt:
+                        data_transformation_init = str(dt["data_transformation"])
                 if "parameters" in data:
                     model_parameters = list(data["parameters"])
                 else:
@@ -410,7 +420,7 @@ class RoseEmulatorManagementMixin:
             emu = NNEmulator(
                 model_parameters,
                 np.ones(output_size),
-                data_trafo=data_trafo_init,
+                data_transformation=data_transformation_init,
             )
             emu.load(base_path)
 

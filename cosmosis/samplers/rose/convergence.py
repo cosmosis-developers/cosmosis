@@ -29,6 +29,7 @@ matplotlib is available, summary figures are saved alongside them.
 
 import logging
 import os
+import time
 from typing import Dict, Any
 
 import numpy as np
@@ -238,14 +239,26 @@ class RoseConvergenceMixin:
         logp_prev = self._emulated_log_posterior(theta)
         emu_version = getattr(self, "_current_emu_version", self.iterations + 1)
 
+        # All KL-loop timing rows reuse the final-iteration label (max_iterations),
+        # so rose_timing.txt can show multiple rows for that iteration when
+        # kl_convergence = T. Sampling is not run in this loop, so time_sampling_s=0.
+        timing_iteration = int(self.max_iterations)
+
         # Fold the held-out test points into the training set and retrain -> N+1.
+        t0 = time.perf_counter()
         n_added = self._append_test_points_to_training()
+        time_training_set_s = time.perf_counter() - t0
         emu_version += 1
         logger.info(
             "Folded %d test points into the training set; retraining emulator "
             "(emumodel_%d)", n_added, emu_version,
         )
+        t1 = time.perf_counter()
         self.train_emulator(model_version=emu_version)
+        time_train_emulator_s = time.perf_counter() - t1
+        self._append_timing_row(
+            timing_iteration, time_training_set_s, time_train_emulator_s, 0.0,
+        )
         logp_curr = self._emulated_log_posterior(theta)
 
         kl, ess = self._gaussian_kl_via_importance(theta, logp_prev, logq, logp_curr)
@@ -260,7 +273,9 @@ class RoseConvergenceMixin:
         converged = np.isfinite(kl) and kl < threshold
         while not converged and attempt < max_retrain:
             attempt += 1
+            t0 = time.perf_counter()
             n_extra = self._add_training_points(self.kl_extra_size)
+            time_training_set_s = time.perf_counter() - t0
             emu_version += 1
             logger.info(
                 "KL not converged (%.4g >= %.4g); retrain attempt %d/%d after "
@@ -268,7 +283,12 @@ class RoseConvergenceMixin:
                 kl, threshold, attempt, max_retrain, n_extra, emu_version,
             )
             logp_prev = logp_curr
+            t1 = time.perf_counter()
             self.train_emulator(model_version=emu_version)
+            time_train_emulator_s = time.perf_counter() - t1
+            self._append_timing_row(
+                timing_iteration, time_training_set_s, time_train_emulator_s, 0.0,
+            )
             logp_curr = self._emulated_log_posterior(theta)
             kl, ess = self._gaussian_kl_via_importance(theta, logp_prev, logq, logp_curr)
             kl_history.append(kl)

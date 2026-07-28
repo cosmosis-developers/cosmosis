@@ -428,6 +428,8 @@ class RoseDataProcessingMixin:
         space are removed from the active training set but retained on
         ``self._pruned_training`` and written into ``total_training_set.npz``
         under ``pruned/...`` keys so no evaluated points are lost.
+        ``points_per_iteration`` is recomputed from the keep mask so each
+        entry still counts how many points from that iteration survived.
 
         A fixed Mahalanobis ``d <= n`` cut is *not* used: in moderate dimension
         (e.g. 6 parameters) that ellipsoid is much smaller than the n-sigma HPD
@@ -519,7 +521,27 @@ class RoseDataProcessingMixin:
             "credible_fraction": fraction,
             "unit_lo": lo,
             "unit_hi": hi,
+            "points_per_iteration_before_prune": np.asarray(
+                self.points_per_iteration, dtype=int
+            ).copy(),
         }
+
+        # Recompute per-iteration counts on the pruned (still chronologically
+        # ordered) arrays so progression plots can still slice by iteration.
+        # Collapsing to ``[n_keep]`` used to wipe the history (e.g. turning
+        # ``[80, 40, 40, 40, 40]`` into ``[140]``).
+        ppi = np.asarray(self.points_per_iteration, dtype=int)
+        if ppi.size > 0 and int(ppi.sum()) == n_before:
+            iter_ids = np.repeat(np.arange(len(ppi)), ppi)
+            new_ppi = np.bincount(iter_ids[keep], minlength=len(ppi)).astype(int)
+        else:
+            logger.warning(
+                "remove_outliers: points_per_iteration (sum=%s) inconsistent "
+                "with training size (%d); falling back to a single count.",
+                int(ppi.sum()) if ppi.size else None,
+                n_before,
+            )
+            new_ppi = np.array([n_keep], dtype=int)
 
         self.sample = self.sample[keep]
         self.unit_sample = self.unit_sample[keep]
@@ -529,14 +551,14 @@ class RoseDataProcessingMixin:
         self.sample_data_vectors = {
             name: v[keep] for name, v in self.sample_data_vectors.items()
         }
-        # Iteration-wise counts are no longer meaningful after a global prune.
-        self.points_per_iteration = np.array([n_keep])
+        self.points_per_iteration = new_ppi
 
         logger.info(
             f"remove_outliers: kept {n_keep}/{n_before} training points inside "
             f"the {nsigma:g}-sigma ({fraction:.1%} HPD) unit-space box of the "
             f"last tempered chain; stashed {n_before - n_keep} outliers for "
-            "total_training_set.npz."
+            f"total_training_set.npz. points_per_iteration: {ppi.tolist()} -> "
+            f"{new_ppi.tolist()}."
         )
 
     def _update_test_set(self, sample_results_test: List, sample_test: np.ndarray,
@@ -616,6 +638,10 @@ class RoseDataProcessingMixin:
         if "unit_lo" in pruned:
             entries["pruned/unit_lo"] = pruned["unit_lo"]
             entries["pruned/unit_hi"] = pruned["unit_hi"]
+        if "points_per_iteration_before_prune" in pruned:
+            entries["points_per_iteration_before_prune"] = pruned[
+                "points_per_iteration_before_prune"
+            ]
         for i, param in enumerate(param_names):
             entries[f"pruned/{param}"] = sample[:, i]
             entries[f"pruned/{param}--norm"] = unit_sample[:, i]

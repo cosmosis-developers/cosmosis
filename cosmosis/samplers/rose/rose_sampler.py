@@ -188,33 +188,56 @@ class RoseSampler(
         if is_final_iteration:
             self.run_convergence_tests()
         
-        t2 = time.perf_counter()
+        # Sampling methods return MCMC wall time only (excluding chain file I/O
+        # in _process_*_results, which can dominate for large chains).
         if is_final_iteration and self.final_sampler == "nuts":
             logger.info("Using NUTS for final iteration")
-            self._run_nuts_sampling(tempering)
+            time_sampling_s = self._run_nuts_sampling(tempering)
         elif is_final_iteration and self.final_sampler == "nautilus":
             logger.info("Using Nautilus for final iteration")
-            self._run_nautilus_sampling(tempering)
+            time_sampling_s = self._run_nautilus_sampling(tempering)
         else:
             logger.info("Using emcee for sampling")
-            self._run_emcee_sampling(tempering)
-        time_sampling_s = time.perf_counter() - t2
+            time_sampling_s = self._run_emcee_sampling(tempering)
 
         # Compute a per-iteration KL divergence directly from the MCMC chains
         # (ignoring the tempering used to produce them) and append it to
         # rose_kl.txt, mirroring the per-iteration timing bookkeeping below.
         self._record_iteration_kl()
 
-        # Save timing for this iteration to file
-        write_header = not os.path.isfile(self._timing_file)
-        with open(self._timing_file, "a") as f:
-            if write_header:
-                f.write("iteration\ttime_training_set_s\ttime_train_emulator_s\ttime_sampling_s\n")
-            f.write(f"{self.iterations + 1}\t{time_training_set_s:.6f}\t{time_train_emulator_s:.6f}\t{time_sampling_s:.6f}\n")
-        logger.info(f"Timing saved to {self._timing_file} (training_set={time_training_set_s:.1f}s, train_emu={time_train_emulator_s:.1f}s, sampling={time_sampling_s:.1f}s)")
+        self._append_timing_row(
+            self.iterations + 1,
+            time_training_set_s,
+            time_train_emulator_s,
+            time_sampling_s,
+        )
         
         # Increment iteration counter
         self.iterations += 1
+
+    def _append_timing_row(
+        self,
+        iteration: int,
+        time_training_set_s: float,
+        time_train_emulator_s: float,
+        time_sampling_s: float,
+    ) -> None:
+        """Append one timing row to ``rose_timing.txt``."""
+        write_header = not os.path.isfile(self._timing_file)
+        with open(self._timing_file, "a") as f:
+            if write_header:
+                f.write(
+                    "iteration\ttime_training_set_s\ttime_train_emulator_s\ttime_sampling_s\n"
+                )
+            f.write(
+                f"{iteration}\t{time_training_set_s:.6f}\t"
+                f"{time_train_emulator_s:.6f}\t{time_sampling_s:.6f}\n"
+            )
+        logger.info(
+            f"Timing saved to {self._timing_file} "
+            f"(iteration={iteration}, training_set={time_training_set_s:.1f}s, "
+            f"train_emu={time_train_emulator_s:.1f}s, sampling={time_sampling_s:.1f}s)"
+        )
 
     def is_converged(self) -> bool:
         """Check if sampler has completed all iterations.

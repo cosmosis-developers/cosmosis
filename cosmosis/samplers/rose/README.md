@@ -35,6 +35,7 @@
 - `nn_emulator.py` - Neural network emulator
 - `data_processing.py` - Data processing and sample generation
 - `sampling.py` - MCMC sampling methods
+- `convergence.py` - Emulator accuracy, Δχ², and Kullback-Leibler divergence (KL) diagnostics
 - `emulator_module.py` - Emulator module interface
 - `utils.py` - Utility functions
 

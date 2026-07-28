@@ -34,8 +34,12 @@ class RoseSamplingMixin:
         
         return tempering
 
-    def _run_emcee_sampling(self, tempering: float) -> None:
-        """Run emcee MCMC sampling."""
+    def _run_emcee_sampling(self, tempering: float) -> float:
+        """Run emcee MCMC sampling.
+
+        Returns:
+            Wall-clock seconds spent in the MCMC loop only (excludes chain I/O).
+        """
         import emcee
         # Ensure emu_pipeline is set up on all processes before MCMC starts
         # This is critical for MPI parallelization where worker processes need
@@ -102,14 +106,20 @@ class RoseSamplingMixin:
             old_tau = tau
 
         end_time = default_timer()
+        time_sampling_s = end_time - start_time
         logger.info('tau: %s', tau_all_params)
-        logger.info(f"MCMC sampling took {end_time - start_time:.1f} seconds")
+        logger.info(f"MCMC sampling took {time_sampling_s:.1f} seconds")
         
-        # Process MCMC results
+        # Process MCMC results (chain file I/O — not counted in sampling time)
         self._process_mcmc_results(emcee_sampler, tempering)
+        return time_sampling_s
 
-    def _run_nautilus_sampling(self, tempering: float) -> None:
-        """Run nautilus sampling for final iteration."""
+    def _run_nautilus_sampling(self, tempering: float) -> float:
+        """Run nautilus sampling for final iteration.
+
+        Returns:
+            Wall-clock seconds spent in nautilus.run only (excludes chain I/O).
+        """
         from nautilus import Sampler
 
         if self.emu_pipeline is None:
@@ -175,7 +185,7 @@ class RoseSamplingMixin:
             n_batch=self.nautilus_n_batch,
             seed=self.seed,
             filepath=resume_filepath,
-            resume=False,  # Don't resume for ROSE
+            resume=True,
             pool=self.pool,
             blobs_dtype=float
         )
@@ -191,11 +201,13 @@ class RoseSamplingMixin:
             verbose=True
         )
         end_time = default_timer()
+        time_sampling_s = end_time - start_time
         
-        logger.info(f"Nautilus sampling took {end_time - start_time:.1f} seconds")
+        logger.info(f"Nautilus sampling took {time_sampling_s:.1f} seconds")
         
-        # Process nautilus results
+        # Process nautilus results (chain file I/O — not counted in sampling time)
         self._process_nautilus_results(nautilus_sampler, tempering)
+        return time_sampling_s
 
     def _verify_nuts_gradients(self, test_params: np.ndarray, tempering: float,
                                emulator, X_mean_tf, X_std_tf, y_mean_tf, y_std_tf,
@@ -310,8 +322,12 @@ class RoseSamplingMixin:
         
         logger.info("=" * 60)
 
-    def _run_nuts_sampling(self, tempering: float) -> None:
-        """Run NUTS sampling using TensorFlow Probability."""
+    def _run_nuts_sampling(self, tempering: float) -> float:
+        """Run NUTS sampling using TensorFlow Probability.
+
+        Returns:
+            Wall-clock seconds spent in NUTS sampling (excludes chain file I/O).
+        """
         try:
             import tensorflow as tf
             import tensorflow_probability as tfp
@@ -583,10 +599,12 @@ class RoseSamplingMixin:
         ])
         
         end_time = default_timer()
-        logger.info(f"NUTS sampling took {end_time - start_time:.1f} seconds")
+        time_sampling_s = end_time - start_time
+        logger.info(f"NUTS sampling took {time_sampling_s:.1f} seconds")
         
-        # Process NUTS results
+        # Process NUTS results (chain file I/O — not counted in sampling time)
         self._process_nuts_results(tempering)
+        return time_sampling_s
 
     
     def _log_prob_nuts_impl(self, physical_params_tf, emulator, X_mean_tf, X_std_tf,
@@ -624,13 +642,13 @@ class RoseSamplingMixin:
         
         pred_intermediate = pred_norm * y_std_tf + y_mean_tf
         
-        if emulator.data_trafo == 'log_norm':
+        if emulator.data_transformation == 'log_norm':
             predictions = tf.pow(10.0, pred_intermediate)
-        elif emulator.data_trafo == 'signed_log_norm':
+        elif emulator.data_transformation == 'signed_log_norm':
             predictions = tf.sign(pred_intermediate) * tf.multiply(s, tf.subtract(tf.pow(10.0, tf.abs(pred_intermediate)), 1.0))
-        elif emulator.data_trafo == 'norm':
+        elif emulator.data_transformation == 'norm':
             predictions = pred_intermediate
-        elif emulator.data_trafo == 'PCA':
+        elif emulator.data_transformation == 'PCA':
             pca_matrix_tf = tf.constant(emulator.pca_transform_matrix, dtype=DTYPE)
             features_std_tf = tf.constant(emulator.features_std, dtype=DTYPE)
             features_mean_tf = tf.constant(emulator.features_mean, dtype=DTYPE)

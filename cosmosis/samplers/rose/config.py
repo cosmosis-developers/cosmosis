@@ -185,8 +185,8 @@ class RoseConfigMixin:
             n_cycles_per_training = lsst:8 default:5
 
         A single ``batch_sizes`` value is broadcast across all training cycles.
-        Values are the base (first-iteration) sizes; each ROSE iteration
-        multiplies every entry by ``(iterations + 1)``.
+        Values are for the first training iteration; later iterations scale every
+        entry by ``n_train / n_train_first`` as the training set grows.
         """
         self.max_iterations = self.read_ini("iterations", int, 4)
         self.initial_size = self.read_ini("initial_size", int, 9600)
@@ -241,11 +241,12 @@ class RoseConfigMixin:
         self.n_cycles_per_training = _parse_per_likelihood(
             self.read_ini("n_cycles_per_training", str, "5"), int
         )
-        # Per-stage batch sizes for the first ROSE iteration. A single value
-        # (default 32) is broadcast to every training cycle; otherwise the list
-        # length must match ``n_cycles_per_training``. Later ROSE iterations
-        # multiply each entry by ``(iterations + 1)``. Accepts the same global /
-        # per-likelihood list syntax as ``learning_rates``.
+        # Per-stage batch sizes for the *first* training iteration. A single
+        # value (default 32) is broadcast to every training cycle; otherwise
+        # the list length must match ``n_cycles_per_training``. In later
+        # iterations each entry is multiplied by n_train / n_train_first.
+        # Accepts the same global / per-likelihood list syntax as
+        # ``learning_rates``.
         self.batch_sizes = _parse_number_list_setting(
             self.read_ini("batch_sizes", str, "32"), int
         )
@@ -424,11 +425,11 @@ class RoseConfigMixin:
         # Neural network options. Each of these accepts either a single
         # value applied to all likelihoods, or per-likelihood overrides using
         # 'name:value' tokens, e.g.
-        #   data_trafo = lsst:signed_log_norm desi_bao:log_norm
+        #   data_transformation = lsst:signed_log_norm desi_bao:log_norm
         #   n_pca      = lsst:64 default:32
         #   loss_function = lsst:weighted_mse desi_bao:standard
-        self.data_trafo = _parse_per_likelihood(
-            self.read_ini("data_trafo", str, "log_norm"), str
+        self.data_transformation = _parse_per_likelihood(
+            self.read_ini("data_transformation", str, "log_norm"), str
         )
         self.n_pca = _parse_per_likelihood(
             self.read_ini("n_pca", str, "32"), int
