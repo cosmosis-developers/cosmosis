@@ -38,6 +38,7 @@ class RosePipelineSetupMixin:
             angle_key = base_key + "_angle"
             bin1_key = base_key + "_bin1"
             bin2_key = base_key + "_bin2"
+            name_key = base_key + "_name"
 
             item = {
                 "base_key": base_key,
@@ -52,6 +53,23 @@ class RosePipelineSetupMixin:
                 item["angle"] = np.asarray(block[sec, angle_key]).astype(float)
                 item["bin1"] = np.asarray(block[sec, bin1_key]).astype(int)
                 item["bin2"] = np.asarray(block[sec, bin2_key]).astype(int)
+
+            # Per-element spectrum name (shear_cl / galaxy_shear_cl / galaxy_cl).
+            # Needed for block-wise amplitude_prefactor; absent or placeholder on
+            # CosmoSIS <= 3.19.
+            if block.has_value(sec, name_key):
+                raw_name = block[sec, name_key]
+                name_arr = np.asarray(raw_name)
+                if name_arr.dtype.kind in ("U", "S", "O") and name_arr.size == item["size"]:
+                    item["name"] = name_arr.astype(str)
+                elif name_arr.size == item["size"]:
+                    item["name"] = name_arr
+                else:
+                    logger.warning(
+                        "data_vector/%s has unexpected shape %s (expected %d); "
+                        "not storing spectrum names.",
+                        name_key, getattr(name_arr, "shape", None), item["size"],
+                    )
 
             metadata[base_key] = item
 

@@ -28,6 +28,8 @@ from sklearn.decomposition import IncrementalPCA
 import pickle
 from tqdm import trange
 
+from .amplitude_prefactor import BlockAmplitudePrefactor, parse_amplitude_prefactor
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -842,7 +844,8 @@ class NNEmulator:
                  data_transformation: str = 'log_norm',
                  n_pca: int = 64,
                  datavector: Optional[np.ndarray] = None,
-                 inv_cov: Optional[np.ndarray] = None):
+                 inv_cov: Optional[np.ndarray] = None,
+                 amplitude_prefactor: Union[bool, str] = False):
         
         self.trained = False
         # When True, parameters passed to predict()/compute_gradients() that are
@@ -859,6 +862,8 @@ class NNEmulator:
         self.nn_model = nn_model
         self.loss_function = loss_function
         self.iteration = iteration
+        self.amplitude_prefactor_enabled = parse_amplitude_prefactor(amplitude_prefactor)
+        self.amplitude_prefactor: Optional[BlockAmplitudePrefactor] = None
         
         # Initialize transformation attributes
         self.pca_transform_matrix = None
@@ -869,7 +874,27 @@ class NNEmulator:
         self.X_mean = None
         self.X_std = None
         
-        logger.info(f"NNEmulator initialized with {data_transformation} transformation")
+        logger.info(
+            f"NNEmulator initialized with {data_transformation} transformation"
+            + (", amplitude_prefactor=T" if self.amplitude_prefactor_enabled else "")
+        )
+
+    def configure_amplitude_prefactor(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        spectra: Optional[Any] = None,
+    ) -> None:
+        """Build the block-wise 3x2pt amplitude prefactor from vector metadata."""
+        if not self.amplitude_prefactor_enabled:
+            self.amplitude_prefactor = None
+            return
+        if not metadata:
+            raise ValueError(
+                "amplitude_prefactor=T but no fiducial vector metadata is available."
+            )
+        self.amplitude_prefactor = BlockAmplitudePrefactor.from_metadata(
+            metadata, self.model_parameters, spectra=spectra
+        )
 
     def transform(self, model_datavector: np.ndarray) -> np.ndarray:
         """Transform data vector for neural network training.
@@ -1060,9 +1085,15 @@ class NNEmulator:
         self.X_mean = {key: np.mean(X[key], axis=0) for key in X.keys()}
         self.X_std = {key: np.maximum(np.std(X[key], axis=0), 1e-10) for key in X.keys()}
         
+        # Optional block-wise amplitude prefactor, then data_transformation
+        y_for_transform = y
+        if self.amplitude_prefactor is not None:
+            logger.info("Applying block-wise 3x2pt amplitude prefactor to training targets")
+            y_for_transform = self.amplitude_prefactor.divide(X, y)
+
         # Transform target data
         logger.info(f"Applying {self.data_transformation} transformation to target data")
-        y_train = self.transform(y)
+        y_train = self.transform(y_for_transform)
         
         # Prepare normalization arrays
         X_mean_arr = np.array([self.X_mean[key] for key in self.model_parameters])
@@ -1120,7 +1151,13 @@ class NNEmulator:
             "y_std": self.y_std,
             "features_mean": self.features_mean,
             "features_std": self.features_std,
-            "pca_transform_matrix": self.pca_transform_matrix}
+            "pca_transform_matrix": self.pca_transform_matrix,
+            "amplitude_prefactor_enabled": self.amplitude_prefactor_enabled,
+            "amplitude_prefactor_state": (
+                self.amplitude_prefactor.to_state()
+                if self.amplitude_prefactor is not None else None
+            ),
+            }
         }
 
         npz_filename = model_filename + ".npz"
@@ -1166,6 +1203,14 @@ class NNEmulator:
             self.features_mean = data_transformation["features_mean"]
             self.features_std = data_transformation["features_std"]
             self.pca_transform_matrix = data_transformation["pca_transform_matrix"]
+            self.amplitude_prefactor_enabled = bool(
+                data_transformation.get("amplitude_prefactor_enabled", False)
+            )
+            amp_state = data_transformation.get("amplitude_prefactor_state")
+            if self.amplitude_prefactor_enabled and amp_state is not None:
+                self.amplitude_prefactor = BlockAmplitudePrefactor.from_state(amp_state)
+            else:
+                self.amplitude_prefactor = None
         
         self.trained = True
         logger.info("Emulator loaded successfully")
@@ -1227,6 +1272,10 @@ class NNEmulator:
         
         # Apply inverse transformation
         y_pred = self.backtransform(y_pred)
+
+        # Undo block-wise amplitude prefactor
+        if self.amplitude_prefactor is not None:
+            y_pred = self.amplitude_prefactor.multiply(X, y_pred)
         
         return y_pred
 
@@ -1347,6 +1396,14 @@ class NNEmulator:
                 pred_original = pca_reconstructed * features_std_tf + features_mean_tf
             else:
                 pred_original = pred_intermediate
+
+            if self.amplitude_prefactor is not None:
+                param_index = {p: i for i, p in enumerate(self.model_parameters)}
+                amp = self.amplitude_prefactor.factors_tf(params_orig, param_index, DTYPE)
+                if len(pred_original.shape) == 2:
+                    pred_original = pred_original * amp[None, :]
+                else:
+                    pred_original = pred_original * amp
             
             return pred_original
         

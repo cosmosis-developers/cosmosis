@@ -19,24 +19,37 @@ from .utils import mkdir
 logger = logging.getLogger(__name__)
 
 
-def _tagged_row_keys(item: dict[str, Any], n: int) -> list[tuple[tuple[int, int, float], int]]:
-    """Row keys for (bin1, bin2, angle) with ordinal disambiguation.
+def _tagged_row_keys(item: dict[str, Any], n: int) -> list[tuple[tuple, int]]:
+    """Row keys for (name?, bin1, bin2, angle) with ordinal disambiguation.
 
-    The same triple can appear more than once per theory block (e.g. different
-    probe combinations sharing bin indices). Pair duplicates by occurrence order
-    so the k-th duplicate matches between trained and current metadata.
+    The same (bin1, bin2, angle) triple can appear more than once per theory
+    block (different probes). When spectrum ``name`` is available it is included
+    in the key; otherwise occurrence order disambiguates duplicates.
     """
     bin1 = np.asarray(item["bin1"])
     bin2 = np.asarray(item["bin2"])
     angle = np.asarray(item["angle"])
-    counts: dict[tuple[int, int, float], int] = {}
-    keys: list[tuple[tuple[int, int, float], int]] = []
+    names = item.get("name")
+    if names is not None:
+        names = np.asarray(names).astype(str)
+        if names.size != n:
+            names = None
+    counts: dict[tuple, int] = {}
+    keys: list[tuple[tuple, int]] = []
     for i in range(n):
-        triple = (
-            int(bin1[i]),
-            int(bin2[i]),
-            round(float(angle[i]), 12),
-        )
+        if names is not None:
+            triple: tuple = (
+                str(names[i]),
+                int(bin1[i]),
+                int(bin2[i]),
+                round(float(angle[i]), 12),
+            )
+        else:
+            triple = (
+                int(bin1[i]),
+                int(bin2[i]),
+                round(float(angle[i]), 12),
+            )
         occ = counts.get(triple, 0)
         counts[triple] = occ + 1
         keys.append((triple, occ))
@@ -86,12 +99,20 @@ class RoseEmulatorManagementMixin:
         current_has_tags = all(k in current_item for k in ("angle", "bin1", "bin2"))
 
         if train_has_tags and current_has_tags:
-            train_keys: dict[tuple[tuple[int, int, float], int], int] = {}
-            for i, key in enumerate(_tagged_row_keys(trained_item, train_size)):
+            # Prefer spectrum-name keys when *both* sides have them; otherwise
+            # fall back to (bin1, bin2, angle) so older emulators still remap.
+            train_use = dict(trained_item)
+            current_use = dict(current_item)
+            if "name" not in trained_item or "name" not in current_item:
+                train_use.pop("name", None)
+                current_use.pop("name", None)
+
+            train_keys: dict[tuple, int] = {}
+            for i, key in enumerate(_tagged_row_keys(train_use, train_size)):
                 train_keys[key] = i
 
             indices = []
-            for key in _tagged_row_keys(current_item, current_size):
+            for key in _tagged_row_keys(current_use, current_size):
                 if key not in train_keys:
                     return None
                 indices.append(train_keys[key])
@@ -174,15 +195,19 @@ class RoseEmulatorManagementMixin:
                     f"{n_cycles_per_training} (use a single value to broadcast)"
                 )
             # Ini ``batch_sizes`` are for the first training iteration. Scale
-            # every entry by current_n / first_n as the training set grows
+            # every entry by sqrt(current_n / first_n) as the training set grows
             # (and shrinks, e.g. after outlier pruning).
             ref_n = getattr(self, "_batch_sizes_ref_n", None)
             if ref_n is None or ref_n <= 0:
                 self._batch_sizes_ref_n = n_samp
                 ref_n = n_samp
-            scale = n_samp / ref_n
+            scale = np.sqrt(n_samp / ref_n)
+            val_split = float(self._resolve_training_setting("validation_split", name))
             if scale != 1.0:
-                batch_sizes = [max(1, int(round(b * scale))) for b in batch_sizes]
+                # cap the batch size at 1/10 of the training set size
+                # ignored for the first training iteration
+                #batch_sizes = [max(1, min(int((1.-val_split)*n_samp/10), int(round(b * scale)))) for b in batch_sizes]
+                batch_sizes = [max(1, int((1.-val_split)*n_samp/10)) for b in batch_sizes]
                 logger.info(
                     f"Scaled batch_sizes for '{name}' by {scale:.3f} "
                     f"(n_train={n_samp}, ref={ref_n}): {batch_sizes}"
@@ -227,6 +252,16 @@ class RoseEmulatorManagementMixin:
                 self._resolve_training_setting("n_pca", name),
                 self.data.get(name),
                 self.inv_cov.get(name),
+                amplitude_prefactor=self._resolve_training_setting(
+                    "amplitude_prefactor", name
+                ),
+            )
+            metadata_all = getattr(self, "fiducial_vector_metadata", None) or {}
+            emu.configure_amplitude_prefactor(
+                metadata_all.get(name),
+                spectra=self._resolve_training_setting(
+                    "amplitude_prefactor_spectra", name
+                ),
             )
             emu.train(X, y, **kwargs)
             self._save_vector_metadata(model_filename, name)

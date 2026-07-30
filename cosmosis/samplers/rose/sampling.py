@@ -656,6 +656,13 @@ class RoseSamplingMixin:
             predictions = (pca_reconstructed * features_std_tf + features_mean_tf)[0]
         else:
             predictions = pred_intermediate
+
+        if getattr(emulator, "amplitude_prefactor", None) is not None:
+            param_index = {p: i for i, p in enumerate(emulator.model_parameters)}
+            amp = emulator.amplitude_prefactor.factors_tf(
+                physical_params_tf, param_index, DTYPE
+            )
+            predictions = predictions * amp
         
         # Compute log_likelihood from predictions using TensorFlow operations
         if data_vector_tf is not None and inv_covariance_tf is not None and TF:

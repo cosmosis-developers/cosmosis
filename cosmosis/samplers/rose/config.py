@@ -244,7 +244,7 @@ class RoseConfigMixin:
         # Per-stage batch sizes for the *first* training iteration. A single
         # value (default 32) is broadcast to every training cycle; otherwise
         # the list length must match ``n_cycles_per_training``. In later
-        # iterations each entry is multiplied by n_train / n_train_first.
+        # iterations each entry is multiplied by sqrt(n_train / n_train_first).
         # Accepts the same global / per-likelihood list syntax as
         # ``learning_rates``.
         self.batch_sizes = _parse_number_list_setting(
@@ -431,6 +431,32 @@ class RoseConfigMixin:
         self.data_transformation = _parse_per_likelihood(
             self.read_ini("data_transformation", str, "log_norm"), str
         )
+        # Optional block-wise 3x2pt amplitude prefactor applied *before*
+        # data_transformation (and undone after backtransform). Values:
+        #   F / none  → off (default)
+        #   T / 3x2pt → on (WL/~S8^2, XC/~b_i S8^2, GC/~b_i b_j sigma8^2;
+        #                   As_1e9*Omega_m/0.3 proxy when S8/sigma8 are not varied;
+        #                   As_1e9 = As/1e-9)
+        # Per-likelihood: ``amplitude_prefactor = lsst:T desi_bao:F``
+        self.amplitude_prefactor = _parse_per_likelihood(
+            self.read_ini("amplitude_prefactor", str, "F"), str
+        )
+        # Probe names in data_sets order, used only when CosmoSIS does not
+        # store data_vector/<like>_name (≤3.19). Default matches LSST 3x2pt.
+        # Space-separated global list, or per-likelihood with commas inside:
+        #   amplitude_prefactor_spectra = shear_cl galaxy_shear_cl galaxy_cl
+        #   amplitude_prefactor_spectra = lsst:shear_cl,galaxy_shear_cl,galaxy_cl
+        _amp_spec_raw = self.read_ini(
+            "amplitude_prefactor_spectra",
+            str,
+            "shear_cl galaxy_shear_cl galaxy_cl",
+        )
+        if _amp_spec_raw and any(":" in tok for tok in str(_amp_spec_raw).split()):
+            self.amplitude_prefactor_spectra = _parse_per_likelihood(
+                _amp_spec_raw, str
+            )
+        else:
+            self.amplitude_prefactor_spectra = str(_amp_spec_raw).strip()
         self.n_pca = _parse_per_likelihood(
             self.read_ini("n_pca", str, "32"), int
         )
