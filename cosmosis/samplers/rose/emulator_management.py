@@ -15,6 +15,7 @@ import numpy as np
 
 
 from .utils import mkdir
+from .amplitude_prefactor import parse_amplitude_prefactor
 
 logger = logging.getLogger(__name__)
 
@@ -204,10 +205,10 @@ class RoseEmulatorManagementMixin:
             scale = np.sqrt(n_samp / ref_n)
             val_split = float(self._resolve_training_setting("validation_split", name))
             if scale != 1.0:
-                # cap the batch size at 1/10 of the training set size
+                # cap the batch size at 1/5 of the training set size
                 # ignored for the first training iteration
-                #batch_sizes = [max(1, min(int((1.-val_split)*n_samp/10), int(round(b * scale)))) for b in batch_sizes]
-                batch_sizes = [max(1, int((1.-val_split)*n_samp/10)) for b in batch_sizes]
+                #batch_sizes = [max(1, min(int((1.-val_split)*n_samp/5), int(round(b * scale)))) for b in batch_sizes]
+                batch_sizes = [max(1, int((1.-val_split)*n_samp/5)) for b in batch_sizes]
                 logger.info(
                     f"Scaled batch_sizes for '{name}' by {scale:.3f} "
                     f"(n_train={n_samp}, ref={ref_n}): {batch_sizes}"
@@ -458,6 +459,55 @@ class RoseEmulatorManagementMixin:
                 data_transformation=data_transformation_init,
             )
             emu.load(base_path)
+
+            # amplitude_prefactor is baked into the trained weights. Always use
+            # the saved state; the ini flag only controls *training*, not loads.
+            ini_amp = parse_amplitude_prefactor(
+                self._resolve_training_setting("amplitude_prefactor", name)
+            )
+            if emu.amplitude_prefactor_enabled and emu.amplitude_prefactor is None:
+                md = trained_item or (
+                    getattr(self, "fiducial_vector_metadata", {}) or {}
+                ).get(name)
+                if md is None:
+                    raise ValueError(
+                        f"[{name}] Loaded emulator has amplitude_prefactor_enabled=T "
+                        "but no amplitude_prefactor_state and no rose_vector_metadata "
+                        "to rebuild it. Retrain with amplitude_prefactor=T."
+                    )
+                emu.amplitude_prefactor_enabled = True
+                emu.configure_amplitude_prefactor(
+                    md,
+                    spectra=self._resolve_training_setting(
+                        "amplitude_prefactor_spectra", name
+                    ),
+                )
+            if ini_amp and emu.amplitude_prefactor is None:
+                raise ValueError(
+                    f"[{name}] amplitude_prefactor=T in the ini, but the loaded "
+                    "emulator was trained without amplitude_prefactor. The prefactor "
+                    "cannot be applied after the fact (weights learned the unscaled "
+                    "vector). Load an emulator trained with amplitude_prefactor=T "
+                    "(e.g. rose_lssty1_nonlin_v4/emumodel_5), or retrain."
+                )
+            if (not ini_amp) and emu.amplitude_prefactor is not None:
+                logger.warning(
+                    "[%s] amplitude_prefactor=F in the ini, but the loaded emulator "
+                    "was trained with amplitude_prefactor=T. Keeping the saved "
+                    "prefactor (required for correct predictions). The ini flag "
+                    "only affects training, not trained_before loads.",
+                    name,
+                )
+            if emu.amplitude_prefactor is not None:
+                logger.info(
+                    "[%s] Loaded emulator uses amplitude_prefactor (%s): "
+                    "WL=%d XC=%d GC=%d",
+                    name,
+                    emu.amplitude_prefactor.amp_family,
+                    int(emu.amplitude_prefactor.wl_mask.sum()),
+                    int(emu.amplitude_prefactor.xc_mask.sum()),
+                    int(emu.amplitude_prefactor.gc_mask.sum()),
+                )
 
             ignore_extra = getattr(self, "ignore_missing_emu_params", True)
             emu.ignore_extra_params = ignore_extra

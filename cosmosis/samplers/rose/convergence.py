@@ -8,7 +8,9 @@ diagnostics on those test points using the freshly trained emulator:
 
 (a) Emulator accuracy on all emulated modes: relative-error percentiles between
     the emulated data vectors and the true full-pipeline data vectors (the same
-    diagnostic as ``rose_test/salmon_plot.py``, but computed in-memory).
+    diagnostic as ``rose_test/salmon_plot.py``, but computed in-memory), plus a
+    covariance-normalized residual
+    ``|emu - truth| / sqrt(diag(C))``.
 (b) Delta chi^2: for every test point, the difference between the true
     full-pipeline log-likelihood and the emulated log-likelihood.
 (c) KL divergence between consecutive-iteration likelihood estimates
@@ -30,7 +32,7 @@ matplotlib is available, summary figures are saved alongside them.
 import logging
 import os
 import time
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -100,8 +102,10 @@ class RoseConvergenceMixin:
 
         For each likelihood the emulator is evaluated on the test parameters and
         compared, mode by mode, to the true full-pipeline data vectors. We report
-        the 68/95/99/99.9 percentiles of the absolute relative error across the
-        test set for every emulated mode.
+        the 68/95/99/99.9 percentiles of (i) the absolute relative error and
+        (ii) the absolute covariance-normalized residual
+        ``|emu - truth| / sqrt(diag(C))`` across the test set for every emulated
+        mode.
         """
         param_names = [str(p) for p in self.pipeline.varied_params]
         X = {name: self.sample_test[:, i] for i, name in enumerate(param_names)}
@@ -124,6 +128,13 @@ class RoseConvergenceMixin:
                 rel_error = np.abs((predictions - truth) / truth)
             rel_error = np.where(np.isfinite(rel_error), rel_error, np.nan)
 
+            sigma = self._data_vector_sigma(name, n_modes=truth.shape[1])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_cov_error = np.abs((predictions - truth) / sigma)
+            rel_cov_error = np.where(
+                np.isfinite(rel_cov_error), rel_cov_error, np.nan
+            )
+
             percentiles = np.nanpercentile(rel_error, _ACCURACY_PERCENTILES, axis=0)
             modes = np.asarray(getattr(emu, "modes", np.arange(truth.shape[1])))
 
@@ -135,6 +146,12 @@ class RoseConvergenceMixin:
                 "max_rel_error": float(np.nanmax(rel_error)),
             }
 
+
+            cov_percentiles = np.nanpercentile(rel_cov_error, _ACCURACY_PERCENTILES, axis=0)
+            results[name]["cov_percentiles"] = cov_percentiles
+            results[name]["median_rel_cov_error"] = float(np.nanmedian(rel_cov_error))
+            results[name]["max_rel_cov_error"] = float(np.nanmax(rel_cov_error))
+
             logger.info(
                 "[%s] Accuracy on %d test points: median rel. error=%.3g, "
                 "68%%=%.3g, 95%%=%.3g, 99%%=%.3g (max mode-wise)",
@@ -144,10 +161,43 @@ class RoseConvergenceMixin:
                 float(np.nanmax(percentiles[1])),
                 float(np.nanmax(percentiles[2])),
             )
+            if rel_cov_error is not None:
+                logger.info(
+                    "[%s] Cov-normalized accuracy: median=%.3g, "
+                    "68%%=%.3g, 95%%=%.3g, 99%%=%.3g (max mode-wise, in units of "
+                    "sqrt(diag(C)))",
+                    name,
+                    results[name]["median_rel_cov_error"],
+                    float(np.nanmax(results[name]["cov_percentiles"][0])),
+                    float(np.nanmax(results[name]["cov_percentiles"][1])),
+                    float(np.nanmax(results[name]["cov_percentiles"][2])),
+                )
 
             self._plot_accuracy(name, results[name])
+            self._plot_accuracy_cov(name, results[name])
 
         return results
+
+    def _data_vector_sigma(self, name: str, n_modes: int) -> Optional[np.ndarray]:
+        """Return ``sqrt(diag(C))`` for likelihood ``name``, or ``None`` if unknown."""
+        errors = getattr(self, "fiducial_errors", None) or {}
+        sigma = errors.get(name)
+        if sigma is None:
+            inv_cov = (getattr(self, "inv_cov", None) or {}).get(name)
+            if inv_cov is None:
+                return None
+            cov = np.linalg.inv(np.atleast_2d(np.asarray(inv_cov, dtype=float)))
+            sigma = np.sqrt(np.diag(cov))
+
+        sigma = np.asarray(sigma, dtype=float).ravel()
+        if sigma.shape[0] != n_modes:
+            logger.warning(
+                "[%s] Data-vector sigma length %d does not match %d modes; "
+                "skipping covariance-normalized accuracy.",
+                name, sigma.shape[0], n_modes,
+            )
+            return None
+        return sigma
 
     # ------------------------------------------------------------------
     # (b) Delta chi^2 between true and emulated likelihoods
@@ -671,6 +721,14 @@ class RoseConvergenceMixin:
             save_dict[f"accuracy/{name}/percentiles"] = res["percentiles"]
             save_dict[f"accuracy/{name}/median_rel_error"] = res["median_rel_error"]
             save_dict[f"accuracy/{name}/max_rel_error"] = res["max_rel_error"]
+            if "cov_percentiles" in res:
+                save_dict[f"accuracy/{name}/cov_percentiles"] = res["cov_percentiles"]
+                save_dict[f"accuracy/{name}/median_rel_cov_error"] = res[
+                    "median_rel_cov_error"
+                ]
+                save_dict[f"accuracy/{name}/max_rel_cov_error"] = res[
+                    "max_rel_cov_error"
+                ]
 
         dchi2 = self.convergence_results.get("delta_chi2", {})
         for key in ("delta_chi2", "chi2_true", "chi2_emu"):
@@ -712,6 +770,33 @@ class RoseConvergenceMixin:
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved accuracy figure to %s", out_path)
+
+    def _plot_accuracy_cov(self, name: str, result: Dict[str, Any]) -> None:
+        """Save covariance-normalized accuracy percentiles ``|emu-test|/σ``."""
+        plt = _get_pyplot()
+        if plt is None:
+            return
+
+        modes = result["modes"]
+        percentiles = result["cov_percentiles"]
+
+        fig = plt.figure(figsize=(6, 5))
+        plt.fill_between(modes, 0, percentiles[2], color="salmon", label="99%", alpha=0.8)
+        plt.fill_between(modes, 0, percentiles[1], color="red", label="95%", alpha=0.7)
+        plt.fill_between(modes, 0, percentiles[0], color="darkred", label="68%", alpha=1.0)
+        plt.axhline(y=1.0, color="grey", linestyle="--", label=r"$1\sigma$")
+        plt.legend(frameon=False, fontsize=16, loc="upper left")
+        plt.ylabel(
+            r"$\frac{|\mathrm{emu} - \mathrm{test}|}{\sqrt{\mathrm{diag}(C)}}$",
+            fontsize=24,
+        )
+        plt.xlabel("modes", fontsize=16)
+        plt.title(f"Emulator accuracy (cov-normalized): {name}", fontsize=14)
+        plt.tight_layout()
+        out_path = os.path.join(self.convergence_dir, f"accuracy_cov_{name}.png")
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("Saved cov-normalized accuracy figure to %s", out_path)
 
     def _plot_delta_chi2(self, result: Dict[str, Any]) -> None:
         """Save a histogram of the per-test-point Delta chi^2."""
