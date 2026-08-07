@@ -80,6 +80,30 @@ def _parse_number_list(
     return [value_type(x) for x in parts]
 
 
+def default_resample_hpd_fractions(n_resample: int) -> List[float]:
+    """Default HPD fractions for each training resample step.
+
+    ``n_resample = iterations - 1`` (initial LH is separate). Matches::
+
+        4 iterations (3 resamples): 0.50, 0.60, 0.75
+        5 iterations (4 resamples): 0.50, 0.60, 0.75, 0.90
+
+    Otherwise linearly spaced from 0.50 → 0.90.
+    """
+    n = int(n_resample)
+    if n <= 0:
+        return []
+    if n == 1:
+        return [0.75]
+    if n == 2:
+        return [0.50, 0.75]
+    if n == 3:
+        return [0.50, 0.60, 0.75]
+    if n == 4:
+        return [0.50, 0.60, 0.75, 0.90]
+    return [float(x) for x in np.linspace(0.50, 0.90, n)]
+
+
 def _parse_number_list_setting(
     raw: str,
     value_type: Callable[[str], T] = float,
@@ -198,34 +222,81 @@ class RoseConfigMixin:
             "final_test_size", int, int(0.8 * self.resample_size)
         )
         # Fraction of the chain (ranked by posterior) that defines the
-        # tempered HPD credible region used for both training resampling
-        # (homogeneous / farthest-point in unit space) and final test points
-        # (uniform draw). Use 0.68 for 1-sigma or 0.95 for 2-sigma.
+        # tempered HPD credible region used for training/test resampling.
+        # Use 0.68 for 1-sigma or 0.95 for 2-sigma.
         self.test_credible_fraction = self.read_ini(
             "test_credible_fraction", float, 0.95 
         )
+        # HPD fill design: split the tempered HPD into this many equal-mass
+        # log-posterior shells and draw volume-uniform Latin-hypercube points
+        # inside each shell's whitened ellipsoid (not farthest-point).
+        self.resample_hpd_nshells = self.read_ini("resample_hpd_nshells", int, 4)
+        # Mahalanobis-radius quantile of shell points used as the ellipsoid
+        # boundary (1.0 = max distance in the shell).
+        self.resample_hpd_radius_quantile = self.read_ini(
+            "resample_hpd_radius_quantile", float, 0.95
+        )
+        # Resample mixture: fraction of new training points from tempered HPD
+        # (rest = HPD base with weak-param coordinates redrawn from the prior).
+        # Blank → automatic schedule from ``iterations`` (see
+        # ``default_resample_hpd_fractions``). Override with an explicit list
+        # of length ``iterations - 1``, e.g. ``0.5 0.6 0.75``.
+        self.resample_hpd_fractions = _parse_number_list(
+            self.read_ini("resample_hpd_fractions", str, ""), float, default=None
+        )
+        # Varied parameters whose unit-cube coordinates are redrawn from the
+        # prior on the explore half of each resample (space-separated
+        # ``section--name`` or unique ``name``). Empty → 100% HPD (legacy).
+        weak_raw = self.read_ini("resample_weak_params", str, "")
+        self.resample_weak_params = [
+            p.strip() for p in weak_raw.replace(",", " ").split() if p.strip()
+        ]
+        self.resample_weak_param_indices = self._resolve_resample_weak_param_indices(
+            self.resample_weak_params
+        )
+        if self.resample_hpd_fractions is None:
+            n_resample = max(int(self.max_iterations) - 1, 0)
+            self.resample_hpd_fractions = default_resample_hpd_fractions(n_resample)
+        if self.resample_weak_param_indices:
+            logger.info(
+                "Resample mixture enabled: weak params %s (indices %s); "
+                "HPD fractions per resample step: %s",
+                [str(self.pipeline.varied_params[i]) for i in self.resample_weak_param_indices],
+                self.resample_weak_param_indices,
+                [f"{x:.2f}" for x in self.resample_hpd_fractions],
+            )
         # Optional: before training the final emulator, drop early training
-        # points that lie outside the n-sigma HPD region of the last tempered
-        # MCMC chain (same 68/95/99.7 convention as elsewhere in ROSE; the cut
-        # is the unit-prior bounding box of that HPD cloud). Can improve local
-        # accuracy near the posterior, but leave False when the final sampler
-        # (e.g. Nautilus) starts from the prior and benefits from retaining
-        # broad prior-volume coverage in the training set.
+        # points whose *true* pipeline chi2 is much worse than the last
+        # training iteration (``chi2 > outlier_chi2_factor * max(chi2_last)``).
+        # Only the initial prior draw and the first resampled iteration are
+        # eligible; later iterations (already near the tempered posterior)
+        # are kept. Does not use the emulated-chain HPD geometry.
         self.remove_outliers = self.read_ini("remove_outliers", bool, False)
+        self.outlier_chi2_factor = self.read_ini("outlier_chi2_factor", float, 2.5)
+        # How many leading ``points_per_iteration`` slices may be pruned
+        # (1 = initial only, 2 = initial + first iteration, …).
+        self.outlier_prune_n_early = self.read_ini("outlier_prune_n_early", int, 2)
+        # Legacy knob (emulated-chain HPD box). Ignored by the chi2 prune;
+        # kept so old inis still parse.
         self.outlier_nsigma = self.read_ini("outlier_nsigma", float, 3.0)
-        # Convergence (KL divergence) settings. This test is opt-in: set
-        # kl_convergence = T in the ini file to enable it. When enabled, before
-        # the final sampling stage the test points are folded into the training
-        # set, the emulator is retrained, and the KL divergence between the
-        # emulated posteriors of two consecutive iterations is computed. If it
-        # exceeds kl_threshold, extra training points are added and the emulator
-        # is retrained until the criterion is met or kl_max_retrain attempts are
-        # exhausted.
+        # Final-stage convergence (opt-in via kl_convergence = T).
+        # The held-out test set is NEVER folded into training. After the last
+        # tempered train, ROSE scores Δχ² on that holdout and stops when
+        # MAD(Δχ² − median) <= delta_chi2_mad_threshold. If not, it adds new
+        # HPD training points and retrains up to kl_max_retrain times.
+        # With kl_convergence_chain = T, each (re)trained emulator also gets an
+        # untempered final_sampler chain; Jeffreys KL on kl_params vs the
+        # previous chain can stop the loop when < kl_threshold.
+        # Passive IW KL (all + selected) is logged to rose_kl.txt only.
         self.kl_convergence = self.read_ini("kl_convergence", bool, False)
+        self.kl_convergence_chain = self.read_ini("kl_convergence_chain", bool, False)
         self.kl_threshold = self.read_ini("kl_threshold", float, 0.1)
         self.kl_max_retrain = self.read_ini("kl_max_retrain", int, 5)
         self.kl_extra_size = self.read_ini("kl_extra_size", int, self.resample_size)
         self.kl_n_samples = self.read_ini("kl_n_samples", int, 7000)
+        self.delta_chi2_mad_threshold = self.read_ini(
+            "delta_chi2_mad_threshold", float, 1.0
+        )
         # Neighbour order for the per-iteration sample-based (k-NN) KL
         # estimator. k=1 is the classic Wang–Kulkarni–Verdú estimator; k=3–5
         # is usually less noisy in moderate dimension (e.g. ~6 cosmological
@@ -237,6 +308,53 @@ class RoseConfigMixin:
         # dimension, so kl_knn is closer in scale to kl_gaussian when the
         # posteriors are similar.
         self.kl_knn_debias = self.read_ini("kl_knn_debias", bool, True)
+        # Parameters to drop from the default "selected" KL subspace. Blank
+        # defaults to ``resample_weak_params``. Set ``none`` to keep all.
+        kl_excl_raw = self.read_ini("kl_exclude_params", str, "")
+        kl_excl_tok = kl_excl_raw.replace(",", " ").split()
+        if kl_excl_tok and kl_excl_tok[0].lower() in ("none", "off", "false", "f"):
+            self.kl_exclude_params: List[str] = []
+            self.kl_exclude_param_indices: List[int] = []
+        elif kl_excl_tok:
+            self.kl_exclude_params = [p.strip() for p in kl_excl_tok if p.strip()]
+            self.kl_exclude_param_indices = self._resolve_resample_weak_param_indices(
+                self.kl_exclude_params
+            )
+        else:
+            self.kl_exclude_params = list(self.resample_weak_params)
+            self.kl_exclude_param_indices = list(self.resample_weak_param_indices)
+        # Optional include-list for the selected KL subspace / chain-KL stop.
+        # When blank, selected = all varied minus kl_exclude_params.
+        kl_incl_raw = self.read_ini("kl_params", str, "")
+        kl_incl_tok = [p.strip() for p in kl_incl_raw.replace(",", " ").split() if p.strip()]
+        if kl_incl_tok:
+            self.kl_params = kl_incl_tok
+            self.kl_param_indices = self._resolve_resample_weak_param_indices(
+                self.kl_params
+            )
+        else:
+            self.kl_params = []
+            self.kl_param_indices = [
+                i for i in range(self.ndim)
+                if i not in set(self.kl_exclude_param_indices)
+            ]
+        if not self.kl_param_indices:
+            raise ValueError(
+                "kl_params / kl_exclude_params leave no parameters for the "
+                "selected KL subspace; unset some exclusions or set "
+                "kl_exclude_params = none"
+            )
+        logger.info(
+            "KL selected subspace (%d params): %s",
+            len(self.kl_param_indices),
+            [str(self.pipeline.varied_params[i]) for i in self.kl_param_indices],
+        )
+        if self.kl_exclude_param_indices and not kl_incl_tok:
+            logger.info(
+                "KL default exclusions %s (indices %s)",
+                [str(self.pipeline.varied_params[i]) for i in self.kl_exclude_param_indices],
+                self.kl_exclude_param_indices,
+            )
 
         self.n_cycles_per_training = _parse_per_likelihood(
             self.read_ini("n_cycles_per_training", str, "5"), int
@@ -290,8 +408,33 @@ class RoseConfigMixin:
             raise ValueError("final_test_size must be >= 0 (use 0 to disable test collection)")
         if not (0.0 < self.test_credible_fraction <= 1.0):
             raise ValueError("test_credible_fraction must be in (0, 1]")
+        if self.resample_hpd_nshells < 1:
+            raise ValueError("resample_hpd_nshells must be >= 1")
+        if not (0.0 < self.resample_hpd_radius_quantile <= 1.0):
+            raise ValueError("resample_hpd_radius_quantile must be in (0, 1]")
+        n_resample = max(int(self.max_iterations) - 1, 0)
+        if len(self.resample_hpd_fractions) != n_resample:
+            raise ValueError(
+                f"resample_hpd_fractions length ({len(self.resample_hpd_fractions)}) "
+                f"must equal iterations-1 ({n_resample})"
+            )
+        if any(not (0.0 <= float(f) <= 1.0) for f in self.resample_hpd_fractions):
+            raise ValueError("resample_hpd_fractions entries must be in [0, 1]")
+        if self.outlier_chi2_factor <= 1.0:
+            raise ValueError(
+                "outlier_chi2_factor must be > 1 (threshold is "
+                "factor * max(chi2 of last training iteration))"
+            )
+        if self.outlier_prune_n_early < 1:
+            raise ValueError("outlier_prune_n_early must be >= 1")
         if self.outlier_nsigma <= 0:
             raise ValueError("outlier_nsigma must be > 0")
+        if self.remove_outliers and self.outlier_nsigma != 3.0:
+            logger.warning(
+                "outlier_nsigma is deprecated and ignored; remove_outliers now "
+                "uses true pipeline chi2 (outlier_chi2_factor / "
+                "outlier_prune_n_early)."
+            )
         if self.kl_threshold <= 0:
             raise ValueError("kl_threshold must be > 0")
         if self.kl_max_retrain < 0:
@@ -302,6 +445,12 @@ class RoseConfigMixin:
             raise ValueError("kl_n_samples must be >= 10")
         if self.kl_knn_k < 1:
             raise ValueError("kl_knn_k must be >= 1")
+        if self.delta_chi2_mad_threshold <= 0:
+            raise ValueError("delta_chi2_mad_threshold must be > 0")
+        if self.kl_convergence_chain and not self.kl_convergence:
+            logger.warning(
+                "kl_convergence_chain=T has no effect unless kl_convergence=T"
+            )
         if any(v < 1 for v in _setting_values(self.n_cycles_per_training)):
             raise ValueError("n_cycles_per_training must be >= 1 (for every likelihood)")
         for sizes in _setting_values(self.batch_sizes):
@@ -314,6 +463,41 @@ class RoseConfigMixin:
             raise ValueError("validation_split must be in (0, 1) (for every likelihood)")
         self._validate_training_schedule_lists()
     
+    def _resolve_resample_weak_param_indices(self, names: List[str]) -> List[int]:
+        """Map ``resample_weak_params`` names to indices in ``varied_params``."""
+        if not names:
+            return []
+        varied = list(self.pipeline.varied_params)
+        full = [str(p) for p in varied]
+        short = [p.name for p in varied]
+        indices: List[int] = []
+        for raw in names:
+            key = str(raw).strip()
+            if key in full:
+                indices.append(full.index(key))
+                continue
+            hits = [i for i, n in enumerate(short) if n == key]
+            if len(hits) == 1:
+                indices.append(hits[0])
+                continue
+            if len(hits) > 1:
+                raise ValueError(
+                    f"resample_weak_params entry '{key}' matches multiple varied "
+                    f"parameters {[full[i] for i in hits]}; use section--name"
+                )
+            raise ValueError(
+                f"resample_weak_params entry '{key}' not found in varied parameters "
+                f"{full}"
+            )
+        # Stable unique order
+        seen = set()
+        unique: List[int] = []
+        for i in indices:
+            if i not in seen:
+                seen.add(i)
+                unique.append(i)
+        return unique
+
     def _configure_mcmc_parameters(self) -> None:
         """Configure MCMC sampling parameters."""
         self.emcee_walkers = self.read_ini("emcee_walkers", int)
@@ -362,27 +546,56 @@ class RoseConfigMixin:
                    f"n_eff={self.nautilus_n_eff}")
     
     def _configure_nuts_parameters(self) -> None:
-        """Configure NUTS sampling parameters for final iteration."""
+        """Configure NUTS sampling parameters for final iteration.
+
+        Default diagonal-mass mode uses TFP's Stan-style
+        ``windowed_sampling.make_windowed_adapt_kernel`` (expanding fast/slow
+        windows for step size + diagonal mass). Prefer
+        ``nuts_sample_unit_space=T`` so all parameters share a common scale;
+        in physical space the diagonal mass prior uses pilot-chain variances
+        or ``(prior_width/4)^2`` instead of unit variance.
+        """
         self.nuts_step_size = self.read_ini("nuts_step_size", float, 0.05)
         self.nuts_use_fixed_step_size = self.read_ini("nuts_use_fixed_step_size", bool, False)
         self.nuts_fixed_step_size = self.read_ini("nuts_fixed_step_size", float, 0.3)
         self.nuts_max_tree_depth = self.read_ini("nuts_max_tree_depth", int, 12)
         self.nuts_max_energy_diff = self.read_ini("nuts_max_energy_diff", float, 1000.0)
-        self.nuts_unrolled_leapfrog_steps = self.read_ini("nuts_unrolled_leapfrog_steps", int, 1) #do not increase it unless profiling shows benefit
+        # TFP NUTS: compile N leapfrog steps into one TF op (usually leave at 1).
+        self.nuts_unrolled_leapfrog_steps = self.read_ini("nuts_unrolled_leapfrog_steps", int, 1)
+        # TFP while_loop parallel_iterations for the NUTS tree build.
         self.nuts_parallel_iterations = self.read_ini("nuts_parallel_iterations", int, 10)
         self.nuts_num_adaptation_steps = self.read_ini("nuts_num_adaptation_steps", int, 1000)
         self.nuts_num_burnin_steps = self.read_ini("nuts_num_burnin_steps", int, 1000)
         self.nuts_num_results = self.read_ini("nuts_num_results", int, 2000)
         self.nuts_num_chains = self.read_ini("nuts_num_chains", int, 1)
-        self.nuts_target_accept_prob = self.read_ini("nuts_target_accept_prob", float, 0.75)
+        # Stan / TFP windowed default is ~0.8–0.85; 0.75 explores a bit more.
+        self.nuts_target_accept_prob = self.read_ini("nuts_target_accept_prob", float, 0.8)
         self.nuts_sample_unit_space = self.read_ini("nuts_sample_unit_space", bool, True)
-        self.nuts_progress_interval = self.read_ini("nuts_progress_interval", int, 500)
+        self.nuts_progress_interval = self.read_ini("nuts_progress_interval", int, 100)
+        # Mass-matrix / momentum preconditioning:
+        #   none      — identity mass + DualAveraging step size
+        #   diagonal  — Stan-style windowed DualAveraging + diagonal mass (default)
+        #   dense     — fixed dense mass from previous ROSE chain + DualAveraging
+        #               step size (windowed mass adapt is diagonal-only)
+        self.nuts_mass_matrix = self.read_ini_choices(
+            "nuts_mass_matrix", str, ["none", "diagonal", "dense"], "diagonal"
+        )
+        # Optional CosmoSIS text chain used for NUTS init + mass pilot when
+        # ``trained_before=T`` (no in-memory tempered chain). Leave blank to
+        # skip; then init falls back to randomized / pipeline starts.
+        self.nuts_pilot_chain = self.read_ini("nuts_pilot_chain", str, "")
         
         # Validate NUTS parameters
         if self.nuts_step_size <= 0:
             raise ValueError("nuts_step_size must be > 0")
+        if self.nuts_fixed_step_size <= 0:
+            raise ValueError("nuts_fixed_step_size must be > 0")
         if self.nuts_max_tree_depth < 1:
             raise ValueError("nuts_max_tree_depth must be >= 1")
+        if self.nuts_unrolled_leapfrog_steps < 1:
+            raise ValueError("nuts_unrolled_leapfrog_steps must be >= 1")
+        if self.nuts_parallel_iterations < 1:
+            raise ValueError("nuts_parallel_iterations must be >= 1")
         if self.nuts_num_results < 100:
             logger.warning(f"nuts_num_results ({self.nuts_num_results}) is very small")
         if self.nuts_num_chains < 1:
@@ -390,12 +603,110 @@ class RoseConfigMixin:
         if not (0.5 <= self.nuts_target_accept_prob <= 0.99):
             raise ValueError("nuts_target_accept_prob should be in (0.5, 0.99), e.g. 0.65-0.8 for better exploration")
         if self.nuts_progress_interval < 0:
-            raise ValueError("nuts_progress_interval must be >= 0 (use 0 to disable progress output)")
+            raise ValueError(
+                "nuts_progress_interval must be >= 0 "
+                "(chunk size for the tqdm bar; 0 disables the bar)"
+            )
+        if self.nuts_num_adaptation_steps > self.nuts_num_burnin_steps:
+            logger.warning(
+                f"nuts_num_adaptation_steps ({self.nuts_num_adaptation_steps}) > "
+                f"nuts_num_burnin_steps ({self.nuts_num_burnin_steps}); "
+                "mass/step adaptation will continue into the retained samples. "
+                "Prefer burnin >= adaptation so windowed warmup is discarded."
+            )
+        if self.nuts_use_fixed_step_size and self.nuts_num_adaptation_steps > 0:
+            logger.info(
+                "nuts_use_fixed_step_size=T: DualAveraging / windowed adaptation "
+                f"disabled; using fixed step_size={self.nuts_fixed_step_size}"
+            )
+        if (
+            not self.nuts_sample_unit_space
+            and self.nuts_mass_matrix == "diagonal"
+            and not self.nuts_use_fixed_step_size
+        ):
+            logger.info(
+                "nuts_sample_unit_space=F: diagonal mass prior will use pilot "
+                "variances or (prior_width/4)^2 — not unit variance"
+            )
         
-        logger.info(f"NUTS configured for final iteration: step_size={self.nuts_step_size}, "
-                   f"max_tree_depth={self.nuts_max_tree_depth}, num_results={self.nuts_num_results}, "
-                   f"target_accept_prob={self.nuts_target_accept_prob}, sample_unit_space={self.nuts_sample_unit_space}")
-    
+        logger.info(
+            f"NUTS configured for final iteration: step_size={self.nuts_step_size}, "
+            f"fixed_step={self.nuts_use_fixed_step_size}/{self.nuts_fixed_step_size}, "
+            f"max_tree_depth={self.nuts_max_tree_depth}, "
+            f"unrolled_leapfrog={self.nuts_unrolled_leapfrog_steps}, "
+            f"parallel_iterations={self.nuts_parallel_iterations}, "
+            f"num_results={self.nuts_num_results}, "
+            f"adaptation/burnin={self.nuts_num_adaptation_steps}/"
+            f"{self.nuts_num_burnin_steps}, "
+            f"target_accept_prob={self.nuts_target_accept_prob}, "
+            f"sample_unit_space={self.nuts_sample_unit_space}, "
+            f"mass_matrix={self.nuts_mass_matrix} "
+            f"({'windowed Stan schedule' if self.nuts_mass_matrix == 'diagonal' and not self.nuts_use_fixed_step_size else 'non-windowed'}); "
+            f"multi-chain uses CosmoSIS pool.map when pool is available"
+        )
+
+    def _configure_numpyro_parameters(self) -> None:
+        """Configure NumPyro NUTS (JAX) for the final iteration.
+
+        The tempered posterior is still the TF autodiff likelihood used by TFP
+        NUTS; ``jax.experimental.jax2tf.call_tf`` wraps it so NumPyro can
+        differentiate through TF. Requires ``numpyro``, ``jax``, and a
+        TF/JAX pair compatible with ``jax2tf`` (see ROSE docs).
+        """
+        self.numpyro_num_warmup = self.read_ini("numpyro_num_warmup", int, 1000)
+        self.numpyro_num_samples = self.read_ini("numpyro_num_samples", int, 2000)
+        self.numpyro_num_chains = self.read_ini("numpyro_num_chains", int, 4)
+        self.numpyro_target_accept_prob = self.read_ini(
+            "numpyro_target_accept_prob", float, 0.8
+        )
+        self.numpyro_max_tree_depth = self.read_ini("numpyro_max_tree_depth", int, 10)
+        self.numpyro_sample_unit_space = self.read_ini(
+            "numpyro_sample_unit_space", bool, True
+        )
+        self.numpyro_progress_bar = self.read_ini("numpyro_progress_bar", bool, True)
+        self.numpyro_chain_method = self.read_ini_choices(
+            "numpyro_chain_method",
+            str,
+            ["parallel", "sequential", "vectorized"],
+            "parallel",
+        )
+        # Pilot chain for init / mass matrix when there is no in-memory ROSE
+        # chain (typical with trained_before=T). With trained_before=F the
+        # previous tempered emcee chain is used automatically; if that is
+        # missing, the latest *_tempering_*_iteration_*.txt next to the
+        # CosmoSIS output is auto-selected. Leave blank unless overriding.
+        # Reuse nuts_pilot_chain if numpyro_pilot_chain is blank.
+        self.numpyro_pilot_chain = self.read_ini("numpyro_pilot_chain", str, "")
+        if not str(self.numpyro_pilot_chain).strip():
+            self.numpyro_pilot_chain = self.read_ini("nuts_pilot_chain", str, "")
+
+        if self.numpyro_num_warmup < 0:
+            raise ValueError("numpyro_num_warmup must be >= 0")
+        if self.numpyro_num_samples < 100:
+            logger.warning(
+                f"numpyro_num_samples ({self.numpyro_num_samples}) is very small"
+            )
+        if self.numpyro_num_chains < 1:
+            raise ValueError("numpyro_num_chains must be >= 1")
+        if not (0.5 <= self.numpyro_target_accept_prob <= 0.99):
+            raise ValueError("numpyro_target_accept_prob should be in (0.5, 0.99)")
+        if self.numpyro_max_tree_depth < 1:
+            raise ValueError("numpyro_max_tree_depth must be >= 1")
+
+        # Alias pilot path onto nuts_pilot_chain so _maybe_load_nuts_pilot_chain works.
+        self.nuts_pilot_chain = str(self.numpyro_pilot_chain)
+        # Alias unit-space flag for shared init helpers.
+        self.nuts_sample_unit_space = bool(self.numpyro_sample_unit_space)
+
+        logger.info(
+            f"NumPyro configured: warmup={self.numpyro_num_warmup}, "
+            f"samples={self.numpyro_num_samples}, chains={self.numpyro_num_chains}, "
+            f"target_accept={self.numpyro_target_accept_prob}, "
+            f"max_tree_depth={self.numpyro_max_tree_depth}, "
+            f"unit_space={self.numpyro_sample_unit_space}, "
+            f"chain_method={self.numpyro_chain_method}"
+        )
+
     def _configure_advanced_options(self) -> None:
         """Configure advanced and experimental options."""
         # Pipeline emulation settings
@@ -427,7 +738,17 @@ class RoseConfigMixin:
         # 'name:value' tokens, e.g.
         #   data_transformation = lsst:signed_log_norm desi_bao:log_norm
         #   n_pca      = lsst:64 default:32
-        #   loss_function = lsst:weighted_mse desi_bao:standard
+        #   loss_function = lsst:weighted_w_cov desi_bao:standard
+        # weighted_w_cov: LINNA Auxilleryfunc (feature-space χ²(M,NN)/χ²(M,d);
+        #   needs data_transformation in {weighted_norm, weighted_median_norm,
+        #   norm}. Incompatible with amplitude_prefactor=T and with PCA /
+        #   PCA_per_bin (θ-dependent amp divide / reduced feature space).
+        # Supported transforms: log_norm, signed_log_norm, norm,
+        # weighted_norm, weighted_median_norm (both need inv_cov / full
+        # data vector; rescale by sqrt(diag(C)) then mean/std or median/MAD),
+        # PCA, PCA_per_bin (PCA with n_pca components per redshift-bin pair,
+        # concatenated into one CosmoPower-like target; use with
+        # amplitude_prefactor=T/F and amplitude_prefactor_spectra for 3x2pt).
         self.data_transformation = _parse_per_likelihood(
             self.read_ini("data_transformation", str, "log_norm"), str
         )
@@ -440,6 +761,17 @@ class RoseConfigMixin:
         # Per-likelihood: ``amplitude_prefactor = lsst:T desi_bao:F``
         self.amplitude_prefactor = _parse_per_likelihood(
             self.read_ini("amplitude_prefactor", str, "F"), str
+        )
+        # Split a 3x2pt likelihood into per-spectrum emulators (default F =
+        # one combined emulator). Spectra order comes from
+        # amplitude_prefactor_spectra / data_sets. Hard-coded param exclusions:
+        #   shear_cl: drop bin_bias, photoz_lens_errors
+        #   galaxy_cl: drop shear_calibration_parameters, photoz_source_errors,
+        #              intrinsic_alignment_parameters
+        #   galaxy_shear_cl: all varied params
+        # Per-likelihood: ``spectrum_emulators = lsst:T desi_bao:F``
+        self.spectrum_emulators = _parse_per_likelihood(
+            self.read_ini("spectrum_emulators", str, "F"), str
         )
         # Probe names in data_sets order, used only when CosmoSIS does not
         # store data_vector/<like>_name (≤3.19). Default matches LSST 3x2pt.
@@ -457,12 +789,15 @@ class RoseConfigMixin:
             )
         else:
             self.amplitude_prefactor_spectra = str(_amp_spec_raw).strip()
+        # For data_transformation=PCA: total PCA components.
+        # For PCA_per_bin: components per redshift-bin pair (clamped to n_modes).
         self.n_pca = _parse_per_likelihood(
             self.read_ini("n_pca", str, "32"), int
         )
         self.loss_function = _parse_per_likelihood(
             self.read_ini("loss_function", str, "standard"), str
         )
+        self._validate_loss_transform_compatibility()
 
         if any(
             isinstance(v, str) and v.startswith("weighted")
@@ -470,7 +805,17 @@ class RoseConfigMixin:
         ) and self.keys:
             raise ValueError("Weighted loss function can only be used with full data vector "
                            "(empty keys parameter)")
-        available_final_samplers = ["emcee", "nautilus", "nuts"]
+        _weighted_transforms = ("weighted_norm", "weighted_median_norm")
+        if any(
+            isinstance(v, str) and v in _weighted_transforms
+            for v in _setting_values(self.data_transformation)
+        ) and self.keys:
+            raise ValueError(
+                "weighted_norm / weighted_median_norm can only be used with the "
+                "full data vector (empty keys parameter); they need the "
+                "likelihood inverse covariance"
+            )
+        available_final_samplers = ["emcee", "nautilus", "nuts", "numpyro"]
         self.final_sampler = self.read_ini_choices("final_sampler", str, available_final_samplers, "emcee")
 
         # Nautilus configuration for final iteration
@@ -480,9 +825,12 @@ class RoseConfigMixin:
             if self.output is not None:
                 self.output.add_column("log_weight", float)
         
-        # NUTS configuration for final iteration
+        # NUTS (TensorFlow Probability) configuration for final iteration
         elif self.final_sampler == "nuts":
             self._configure_nuts_parameters()
+        # NumPyro NUTS: TF emulator log-prob via jax2tf.call_tf
+        elif self.final_sampler == "numpyro":
+            self._configure_numpyro_parameters()
         else:
         # If the final sampler is emcee then it just inherits
         # the sampler settings used for all the intermediate
@@ -518,6 +866,81 @@ class RoseConfigMixin:
                 f"No value for likelihood '{likelihood_name}' in setting {setting!r}"
             )
         return setting
+
+    def _validate_loss_transform_compatibility(self) -> None:
+        """Reject incompatible loss_function / data_transformation / amplitude_prefactor combos.
+
+        ``weighted_w_cov`` assumes a single global map from physical data + C
+        into NN feature space. That breaks for:
+
+        * ``amplitude_prefactor=T`` (θ-dependent amplitude divide before
+          transform; physical ``d`` / ``C^{-1}`` are not in feature space)
+        * ``PCA`` / ``PCA_per_bin`` (reduced feature space; LINNA cov transform
+          is not implemented for PCA coefficients)
+        """
+        from .amplitude_prefactor import parse_amplitude_prefactor
+
+        ok_transforms = ("weighted_norm", "weighted_median_norm", "norm")
+        pca_transforms = ("PCA", "PCA_per_bin")
+
+        like_names: List[str] = []
+        pipe_names = getattr(getattr(self, "pipeline", None), "likelihood_names", None)
+        if pipe_names and pipe_names != "no_likelihood_names_sentinel":
+            like_names = [str(n) for n in pipe_names]
+        for attr in (
+            "loss_function", "data_transformation", "amplitude_prefactor"
+        ):
+            setting = getattr(self, attr)
+            if isinstance(setting, dict):
+                like_names.extend(
+                    k for k in setting.keys() if k != "__default__"
+                )
+        like_names = sorted(set(like_names))
+        if not like_names:
+            like_names = ["*"]
+
+        for name in like_names:
+            try:
+                loss = str(
+                    self._peek_training_setting(self.loss_function, name)
+                ).strip()
+                transform = str(
+                    self._peek_training_setting(self.data_transformation, name)
+                ).strip()
+                amp_raw = self._peek_training_setting(self.amplitude_prefactor, name)
+            except KeyError:
+                # Per-likelihood dict without this name and without __default__:
+                # leave for train-time resolution.
+                continue
+
+            label = "all likelihoods" if name == "*" else f"likelihood '{name}'"
+            if loss != "weighted_w_cov":
+                continue
+
+            if parse_amplitude_prefactor(amp_raw):
+                raise ValueError(
+                    f"Incompatible ROSE settings for {label}: "
+                    "loss_function=weighted_w_cov cannot be combined with "
+                    "amplitude_prefactor=T. The LINNA cov-weighted loss maps the "
+                    "physical data vector / C^{-1} into feature space, but "
+                    "amplitude_prefactor applies a θ-dependent divide before "
+                    "data_transformation. Use loss_function=standard with "
+                    "amplitude_prefactor, or turn amplitude_prefactor off."
+                )
+            if transform in pca_transforms:
+                raise ValueError(
+                    f"Incompatible ROSE settings for {label}: "
+                    f"loss_function=weighted_w_cov cannot be combined with "
+                    f"data_transformation={transform}. weighted_w_cov currently "
+                    f"supports only {list(ok_transforms)}. Use "
+                    "loss_function=standard with PCA / PCA_per_bin."
+                )
+            if transform not in ok_transforms:
+                raise ValueError(
+                    f"Incompatible ROSE settings for {label}: "
+                    f"loss_function=weighted_w_cov requires data_transformation "
+                    f"in {list(ok_transforms)}; got {transform!r}."
+                )
 
     def _validate_training_schedule_lists(self) -> None:
         """Ensure optional schedule lists agree with n_cycles_per_training.

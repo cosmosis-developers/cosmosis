@@ -6,7 +6,7 @@ and managing training/test datasets.
 """
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from timeit import default_timer
 
 import numpy as np
@@ -160,41 +160,19 @@ class RoseDataProcessingMixin:
         }
 
     def generate_updated_sample(self) -> None:
-        """Generate additional training samples from MCMC chain.
-        
-        Training points are drawn from the tempered HPD credible region of the
-        current MCMC chain (``test_credible_fraction``, default 95% / 2-sigma)
-        and spaced as evenly as possible in unit-prior parameter space so the
-        emulator is not biased toward high-density posterior pockets. Test
-        points (final training iteration only) use the same region with a
-        simpler uniform draw.
-        """
-        logger.info(
-            f"Selecting {self.resample_size} homogeneous training samples "
-            f"from the {self.test_credible_fraction:.0%} tempered credible "
-            "region of the MCMC chain"
-        )
-        
-        chain_length = len(self.chain)
-        if chain_length == 0:
-            raise RuntimeError(
-                "Cannot resample training points: the MCMC chain is empty. "
-                "This usually means the sampler converged before the configured "
-                "emcee_samples were reached and the burn-in then discarded "
-                "everything. Lower emcee_burn or increase emcee_samples."
-            )
+        """Generate additional training samples from the tempered MCMC chain.
 
-        train_indices = self._select_credible_region_indices(
-            self.resample_size, homogeneous=True
-        )
-        unit_sample = self.unit_chain[train_indices]
-        sample = self.chain[train_indices]
+        HPD fills use stratified whitened volume-uniform Latin hypercube
+        sampling (``_sample_hpd_stratified_volume_lh``). When
+        ``resample_weak_params`` is set, a tempering-dependent mixture also
+        redraws those weak-parameter coordinates from a prior Latin hypercube.
+        """
+        sample, unit_sample = self._select_mixture_training_samples(self.resample_size)
 
         # Test points are collected only once, during the last training
         # iteration (i.e. just before the final sampling stage), drawn from the
-        # 1-sigma / credible region of the one-before-last MCMC chain (the chain
-        # currently stored in self.chain). In all earlier iterations no test
-        # points are evaluated.
+        # credible region of the one-before-last MCMC chain. In all earlier
+        # iterations no test points are evaluated.
         collect_test = (
             self.iterations == (self.max_iterations - 1)
             and self.final_test_size > 0
@@ -202,15 +180,17 @@ class RoseDataProcessingMixin:
         sample_test = None
         unit_sample_test = None
         if collect_test:
-            test_indices = self._select_credible_region_indices(
-                self.final_test_size, homogeneous=False
+            sample_test, unit_sample_test = self._sample_hpd_stratified_volume_lh(
+                self.final_test_size,
+                seed=(
+                    None if self.seed is None
+                    else int(self.seed) + int(self.iterations) + 101
+                ),
             )
-            unit_sample_test = self.unit_chain[test_indices]
-            sample_test = self.chain[test_indices]
             logger.info(
-                f"Collecting {len(sample_test)} test points from the "
-                f"{self.test_credible_fraction:.0%} credible region of the "
-                "one-before-last MCMC chain (final training iteration)"
+                f"Collecting {len(sample_test)} stratified volume-LH test points "
+                f"from the {self.test_credible_fraction:.0%} tempered HPD "
+                "(final training iteration)"
             )
 
         n_test = len(sample_test) if collect_test else 0
@@ -236,9 +216,8 @@ class RoseDataProcessingMixin:
         if collect_test:
             self._update_test_set(sample_results_test, sample_test, unit_sample_test)
 
-        # Final training iteration: optionally prune early exploration points
-        # that fall outside the n-sigma region of the last tempered chain before
-        # the final emulator is trained (and before datasets are saved).
+        # Final training iteration: optionally prune early points whose true
+        # chi2 is much worse than the last iteration (see _remove_training_outliers).
         if (
             self.iterations == (self.max_iterations - 1)
             and getattr(self, "remove_outliers", False)
@@ -248,6 +227,267 @@ class RoseDataProcessingMixin:
         # Save datasets if requested
         if self.save_output == SAVE_ALL and self.iterations == (self.max_iterations - 1):
             self._save_datasets()
+
+    def _current_resample_hpd_fraction(self) -> float:
+        """HPD fraction for this ``generate_updated_sample`` call.
+
+        ``self.iterations`` is 1 on the first resample (after T=tempering[0]),
+        so the schedule index is ``iterations - 1``.
+        """
+        fracs = getattr(self, "resample_hpd_fractions", None)
+        if not fracs:
+            return 1.0
+        idx = int(self.iterations) - 1
+        if idx < 0:
+            idx = 0
+        if idx >= len(fracs):
+            idx = len(fracs) - 1
+        return float(fracs[idx])
+
+    def _select_mixture_training_samples(self, n_select: int):
+        """Return ``(physical, unit)`` training arrays of length ``n_select``.
+
+        HPD fills use stratified whitened volume-uniform Latin hypercube
+        sampling (``_sample_hpd_stratified_volume_lh``). When weak params are
+        configured, a tempering-dependent fraction keeps pure HPD fills and the
+        rest redraw those weak coordinates from a prior Latin hypercube.
+        """
+        chain_length = len(self.chain)
+        if chain_length == 0:
+            raise RuntimeError(
+                "Cannot resample training points: the MCMC chain is empty. "
+                "This usually means the sampler converged before the configured "
+                "emcee_samples were reached and the burn-in then discarded "
+                "everything. Lower emcee_burn or increase emcee_samples."
+            )
+
+        weak_idx = list(getattr(self, "resample_weak_param_indices", []) or [])
+        f_hpd = self._current_resample_hpd_fraction()
+        if not weak_idx:
+            f_hpd = 1.0
+
+        n_hpd = int(round(f_hpd * n_select))
+        n_hpd = min(max(n_hpd, 0), n_select)
+        n_exp = n_select - n_hpd
+
+        prev_T = None
+        try:
+            if self.iterations >= 1 and self.iterations - 1 < len(self.tempering):
+                prev_T = float(self.tempering[self.iterations - 1])
+        except Exception:
+            prev_T = None
+        T_msg = f" (chain from T={prev_T:g})" if prev_T is not None else ""
+
+        seed_base = None if self.seed is None else int(self.seed) + int(self.iterations)
+
+        if n_exp == 0 or not weak_idx:
+            logger.info(
+                f"Selecting {n_select} stratified volume-LH HPD training samples "
+                f"({self.test_credible_fraction:.0%} tempered region, "
+                f"nshells={getattr(self, 'resample_hpd_nshells', 4)}){T_msg}"
+            )
+            return self._sample_hpd_stratified_volume_lh(
+                n_select, seed=None if seed_base is None else seed_base + 3
+            )
+
+        weak_names = [str(self.pipeline.varied_params[i]) for i in weak_idx]
+        logger.info(
+            f"Selecting {n_select} mixed training samples{T_msg}: "
+            f"{n_hpd} stratified HPD ({f_hpd:.0%}) + {n_exp} HPD⊕prior on {weak_names}"
+        )
+
+        if n_hpd > 0:
+            phys_hpd, unit_hpd = self._sample_hpd_stratified_volume_lh(
+                n_hpd, seed=None if seed_base is None else seed_base + 3
+            )
+        else:
+            unit_hpd = np.empty((0, self.ndim), dtype=float)
+            phys_hpd = np.empty((0, self.ndim), dtype=float)
+
+        phys_exp, unit_exp = self._sample_hpd_stratified_volume_lh(
+            n_exp, seed=None if seed_base is None else seed_base + 17
+        )
+        import scipy.stats
+        lh = scipy.stats.qmc.LatinHypercube(
+            len(weak_idx), seed=None if seed_base is None else seed_base + 19
+        )
+        weak_u = lh.random(n=n_exp)
+        unit_exp = np.asarray(unit_exp, dtype=float).copy()
+        for j, dim in enumerate(weak_idx):
+            unit_exp[:, dim] = weak_u[:, j]
+        phys_exp = np.array([
+            self.pipeline.denormalize_vector_from_prior(u) for u in unit_exp
+        ])
+
+        if n_hpd == 0:
+            return phys_exp, unit_exp
+        return np.vstack([phys_hpd, phys_exp]), np.vstack([unit_hpd, unit_exp])
+
+    def _sample_hpd_stratified_volume_lh(
+        self, n_select: int, seed: Optional[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Draw ``n_select`` points in the tempered HPD via stratified volume LH.
+
+        1. Rank the tempered chain into the HPD (``test_credible_fraction``).
+        2. Split that cloud into equal-mass log-posterior shells.
+        3. In each shell, draw volume-uniform Latin-hypercube points inside the
+           shell's whitened Mahalanobis ellipsoid (continuous unit-cube coords,
+           clipped to ``[0, 1]``), then denormalize to physical parameters.
+
+        Returns:
+            ``(physical, unit)`` arrays of shape ``(n_select, ndim)``.
+        """
+        import scipy.stats
+
+        if n_select <= 0:
+            return (
+                np.empty((0, self.ndim), dtype=float),
+                np.empty((0, self.ndim), dtype=float),
+            )
+
+        region_indices = np.asarray(self._credible_region_indices(), dtype=int)
+        if region_indices.size == 0:
+            raise RuntimeError(
+                "Tempered HPD region is empty; cannot sample training points"
+            )
+
+        unit_region = np.asarray(self.unit_chain[region_indices], dtype=float)
+        logpost = getattr(self, "chain_logpost", None)
+        if logpost is not None and len(logpost) == len(self.chain):
+            lp_region = np.asarray(logpost, dtype=float)[region_indices]
+        else:
+            lp_region = np.zeros(len(region_indices), dtype=float)
+
+        finite = np.isfinite(lp_region) & np.all(np.isfinite(unit_region), axis=1)
+        unit_region = unit_region[finite]
+        lp_region = lp_region[finite]
+        if len(unit_region) < 2:
+            raise RuntimeError(
+                "Too few finite HPD points to build a whitened volume-LH design"
+            )
+
+        ndim = int(unit_region.shape[1])
+        nshells = int(getattr(self, "resample_hpd_nshells", 4))
+        min_per_shell = max(ndim + 2, 8)
+        nshells = max(1, min(nshells, n_select, max(1, len(unit_region) // min_per_shell)))
+        radius_q = float(getattr(self, "resample_hpd_radius_quantile", 0.95))
+
+        order = np.argsort(lp_region)[::-1]
+        shell_orders = [
+            np.asarray(s, dtype=int) for s in np.array_split(order, nshells) if len(s)
+        ]
+        nshells = len(shell_orders)
+
+        counts = [n_select // nshells] * nshells
+        for i in range(n_select % nshells):
+            counts[i] += 1
+
+        global_mu, global_L, global_radius = self._hpd_whitening(
+            unit_region, radius_q=radius_q
+        )
+
+        unit_parts = []
+        for s_i, (local_order, n_s) in enumerate(zip(shell_orders, counts)):
+            if n_s <= 0:
+                continue
+            pts = unit_region[local_order]
+            if len(pts) >= min_per_shell:
+                mu, L, radius = self._hpd_whitening(pts, radius_q=radius_q)
+            else:
+                mu = pts.mean(axis=0)
+                L, radius = global_L, global_radius
+            shell_seed = None if seed is None else int(seed) + 1000 * (s_i + 1)
+            unit_parts.append(
+                self._volume_uniform_ellipsoid_lh(
+                    n_s, mu=mu, chol=L, radius=radius, seed=shell_seed
+                )
+            )
+
+        unit = np.clip(np.vstack(unit_parts), 0.0, 1.0)
+        if len(unit) < n_select:
+            pad = self._volume_uniform_ellipsoid_lh(
+                n_select - len(unit),
+                mu=global_mu,
+                chol=global_L,
+                radius=global_radius,
+                seed=None if seed is None else int(seed) + 7,
+            )
+            unit = np.clip(np.vstack([unit, pad]), 0.0, 1.0)
+        elif len(unit) > n_select:
+            unit = unit[:n_select]
+
+        phys = np.array([
+            self.pipeline.denormalize_vector_from_prior(u) for u in unit
+        ])
+        return phys, unit
+
+    def _hpd_whitening(self, points: np.ndarray, radius_q: float = 0.95):
+        """Return ``(mean, chol, radius)`` for a Mahalanobis ball around ``points``.
+
+        ``chol`` satisfies ``cov ≈ chol @ chol.T``. ``radius`` is the
+        ``radius_q`` quantile of Mahalanobis distances of ``points`` to the mean
+        (at least a small positive floor).
+        """
+        pts = np.asarray(points, dtype=float)
+        mu = pts.mean(axis=0)
+        ndim = pts.shape[1]
+        if len(pts) == 1:
+            cov = np.eye(ndim) * 1e-4
+        else:
+            cov = np.cov(pts, rowvar=False)
+            if np.ndim(cov) == 0:
+                cov = np.array([[float(cov)]])
+            cov = np.asarray(cov, dtype=float)
+        diag = np.clip(np.diag(cov), 1e-12, None)
+        cov = cov + np.eye(ndim) * (1e-8 + 1e-4 * float(np.mean(diag)))
+        try:
+            chol = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError:
+            cov = cov + np.eye(ndim) * 1e-3 * float(np.mean(diag))
+            chol = np.linalg.cholesky(cov)
+
+        diff = pts - mu
+        try:
+            white = np.linalg.solve(chol, diff.T).T
+            d = np.linalg.norm(white, axis=1)
+        except np.linalg.LinAlgError:
+            d = np.linalg.norm(diff, axis=1)
+        d = d[np.isfinite(d)]
+        if d.size == 0:
+            radius = 1.0
+        else:
+            radius = max(float(np.quantile(d, radius_q)), 1e-3)
+        return mu, chol, radius
+
+    def _volume_uniform_ellipsoid_lh(
+        self,
+        n: int,
+        mu: np.ndarray,
+        chol: np.ndarray,
+        radius: float,
+        seed: Optional[int] = None,
+    ) -> np.ndarray:
+        """Volume-uniform Latin-hypercube samples in a Mahalanobis ball.
+
+        Direction from inverse-normal LH coords (normalized); radius
+        ``U^{1/N} * radius`` so the fill is uniform in ellipsoid volume, not on
+        the surface.
+        """
+        import scipy.stats
+
+        if n <= 0:
+            return np.empty((0, len(mu)), dtype=float)
+
+        ndim = int(len(mu))
+        lh = scipy.stats.qmc.LatinHypercube(ndim + 1, seed=seed)
+        u = lh.random(n=n)
+        g = scipy.stats.norm.ppf(np.clip(u[:, :ndim], 1e-8, 1.0 - 1e-8))
+        norms = np.linalg.norm(g, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        directions = g / norms
+        r = (u[:, ndim] ** (1.0 / float(ndim))) * float(radius)
+        z = directions * r[:, None]
+        return np.asarray(mu, dtype=float) + z @ np.asarray(chol, dtype=float).T
 
     def _select_non_overlapping_indices(self, chain_length: int, 
                                       excluded_indices: np.ndarray, 
@@ -304,13 +544,10 @@ class RoseDataProcessingMixin:
     def _select_homogeneous_indices(
         self, region_indices: np.ndarray, n_select: int
     ) -> np.ndarray:
-        """Space-filling subset of ``region_indices`` in unit-parameter space.
+        """Legacy farthest-point subset of ``region_indices`` (unit cube).
 
-        Uses greedy farthest-point (maximin) sampling on ``self.unit_chain`` so
-        selected points cover the credible region as evenly as possible and the
-        training set is not concentrated where the MCMC density is highest.
-        Distances are Euclidean in the unit-prior cube, which puts every varied
-        parameter on a common [0, 1] scale.
+        Prefer ``_sample_hpd_stratified_volume_lh`` for new training/test fills.
+        Kept for callers that still need chain indices.
         """
         region_indices = np.asarray(region_indices)
         n_region = len(region_indices)
@@ -362,9 +599,10 @@ class RoseDataProcessingMixin:
 
         Args:
             n_select: Number of points to draw from the credible region.
-            homogeneous: If True, use farthest-point sampling in unit-parameter
-                space (preferred for training). If False, draw uniformly at
-                random from the region (sufficient for testing).
+            homogeneous: If True, use legacy farthest-point sampling on chain
+                indices. Prefer ``_sample_hpd_stratified_volume_lh`` for
+                volume-uniform stratified HPD fills. If False, draw uniformly
+                at random from the region.
 
         Returns:
             Array of indices into ``self.chain`` / ``self.unit_chain``.
@@ -418,130 +656,113 @@ class RoseDataProcessingMixin:
         self.points_per_iteration = np.concatenate([self.points_per_iteration, np.array([len(valid_results)])])
 
     def _remove_training_outliers(self) -> None:
-        """Move out-of-region training points aside for the final emulator.
+        """Drop early training points with true chi2 far above the last iteration.
 
-        Called once, on the final training iteration, when ``remove_outliers`` is
-        True. ``outlier_nsigma`` is interpreted with the same HPD convention used
-        elsewhere in ROSE (1 / 2 / 3 sigma ↔ 68% / 95% / 99.7% highest-posterior
-        mass via ``erf(n/sqrt(2))``). Training points that fall outside the
-        axis-aligned bounding box of that tempered HPD region in unit-prior
-        space are removed from the active training set but retained on
-        ``self._pruned_training`` and written into ``total_training_set.npz``
-        under ``pruned/...`` keys so no evaluated points are lost.
-        ``points_per_iteration`` is recomputed from the keep mask so each
-        entry still counts how many points from that iteration survived.
+        Called once on the final training iteration when ``remove_outliers`` is
+        True, after the last resample has been appended. Uses *true* pipeline
+        likelihoods already stored on the training set (``chi2 = -2 log L``):
 
-        A fixed Mahalanobis ``d <= n`` cut is *not* used: in moderate dimension
-        (e.g. 6 parameters) that ellipsoid is much smaller than the n-sigma HPD
-        region and can wipe out most of the training set.
+        - Let ``chi2_last`` be the chi2 values of the most recent
+          ``points_per_iteration`` slice (last training iteration).
+        - Threshold ``T = outlier_chi2_factor * max(chi2_last)`` (default
+          factor 2.5).
+        - Among the first ``outlier_prune_n_early`` slices only (default 2 =
+          initial prior draw + first resampled iteration), remove points with
+          ``chi2 > T``. Later iterations are never pruned.
 
-        Leave ``remove_outliers=False`` when the final sampler (e.g. Nautilus)
-        explores from the prior and benefits from retaining those broader
-        training points in the emulator itself.
+        This avoids the old emulated-chain HPD / AABB cut, which can delete
+        true-posterior support when the tempered emulator chain is biased or
+        non-Gaussian. Points are stashed on ``self._pruned_training`` and
+        written under ``pruned/...`` in ``total_training_set.npz``.
+
+        Leave ``remove_outliers=False`` when the final sampler explores from
+        the prior (e.g. Nautilus) and needs broad training coverage.
         """
-        import math
-
         self._pruned_training = None
-        unit_chain = getattr(self, "unit_chain", None)
-        if unit_chain is None or len(unit_chain) == 0:
-            logger.warning(
-                "remove_outliers=True but no tempered chain is available; "
-                "skipping outlier removal."
-            )
-            return
-
         n_before = len(self.unit_sample)
         if n_before == 0:
             return
 
-        nsigma = float(self.outlier_nsigma)
-        # 1D Gaussian mass for n-sigma; matches ROSE's 68/95/99.7 HPD labels.
-        fraction = math.erf(nsigma / math.sqrt(2.0))
-        fraction = min(max(fraction, 1e-6), 1.0)
-        region_indices = self._credible_region_indices(fraction=fraction)
-        region_unit = np.asarray(self.unit_chain[region_indices], dtype=float)
-        if len(region_unit) == 0:
+        ppi = np.asarray(self.points_per_iteration, dtype=int)
+        if ppi.size < 2 or int(ppi.sum()) != n_before:
             logger.warning(
-                "remove_outliers: empty credible region; skipping prune."
+                "remove_outliers: points_per_iteration (sum=%s, n=%d) inconsistent "
+                "with training size (%d), or fewer than 2 iterations; skipping.",
+                int(ppi.sum()) if ppi.size else None,
+                int(ppi.size),
+                n_before,
             )
             return
 
-        lo = region_unit.min(axis=0)
-        hi = region_unit.max(axis=0)
-        # Tiny padding so points sitting on the HPD boundary are not clipped
-        # by floating-point noise.
-        pad = 1e-8 * np.maximum(hi - lo, 1e-12)
-        train = np.asarray(self.unit_sample, dtype=float)
-        keep = np.all((train >= (lo - pad)) & (train <= (hi + pad)), axis=1)
+        factor = float(getattr(self, "outlier_chi2_factor", 2.5))
+        n_early = int(getattr(self, "outlier_prune_n_early", 2))
+        n_early = min(n_early, len(ppi) - 1)  # never treat the last slice as early
+        if n_early < 1:
+            logger.warning(
+                "remove_outliers: no early iterations eligible to prune; skipping."
+            )
+            return
+
+        likes = np.asarray(self.sample_likes, dtype=float)
+        chi2 = -2.0 * likes
+        iter_ids = np.repeat(np.arange(len(ppi)), ppi)
+
+        last_id = len(ppi) - 1
+        last_chi2 = chi2[iter_ids == last_id]
+        if last_chi2.size == 0 or not np.any(np.isfinite(last_chi2)):
+            logger.warning(
+                "remove_outliers: no finite chi2 in last training iteration; skipping."
+            )
+            return
+
+        chi2_ref = float(np.nanmax(last_chi2))
+        if not np.isfinite(chi2_ref):
+            logger.warning("remove_outliers: max(chi2_last) is non-finite; skipping.")
+            return
+
+        threshold = factor * chi2_ref
+        early = iter_ids < n_early
+        prune = early & np.isfinite(chi2) & (chi2 > threshold)
+        keep = ~prune
         n_keep = int(keep.sum())
+        n_pruned = int(prune.sum())
 
-        if n_keep == n_before:
+        if n_pruned == 0:
             logger.info(
-                f"remove_outliers: all {n_before} training points already lie "
-                f"within the {nsigma:g}-sigma ({fraction:.1%}) HPD box of the "
-                "last tempered chain."
+                f"remove_outliers: no early points exceed chi2 > {factor:g} * "
+                f"max(chi2_last)={chi2_ref:.3g} (threshold={threshold:.3g}); "
+                f"kept all {n_before}."
             )
             return
 
-        ndim = train.shape[1]
+        ndim = int(np.asarray(self.unit_sample).shape[1])
         min_keep = max(ndim + 1, 10)
         if n_keep < min_keep:
             logger.warning(
                 f"remove_outliers would leave only {n_keep} training points "
-                f"(need >= {min_keep}); skipping prune to avoid an unusable "
-                "training set. Consider a larger outlier_nsigma."
+                f"(need >= {min_keep}); skipping prune. Consider raising "
+                f"outlier_chi2_factor (now {factor:g})."
             )
             return
 
-        pruned = ~keep
-        # Diagnostic: Mahalanobis distance to the HPD cloud (not used for the cut).
-        mu = region_unit.mean(axis=0)
-        cov = np.cov(region_unit, rowvar=False)
-        if np.ndim(cov) == 0:
-            cov = np.array([[float(cov)]])
-        cov = np.asarray(cov, dtype=float) + np.eye(ndim) * 1e-12
-        try:
-            prec = np.linalg.inv(cov)
-        except np.linalg.LinAlgError:
-            prec = np.linalg.pinv(cov)
-        diff = train[pruned] - mu
-        d2 = np.einsum("ni,ij,nj->n", diff, prec, diff)
-
         self._pruned_training = {
-            "sample": self.sample[pruned],
-            "unit_sample": self.unit_sample[pruned],
+            "sample": self.sample[prune],
+            "unit_sample": self.unit_sample[prune],
             "sample_data_vectors": {
-                name: v[pruned] for name, v in self.sample_data_vectors.items()
+                name: v[prune] for name, v in self.sample_data_vectors.items()
             },
-            "sample_likes": self.sample_likes[pruned],
-            "sample_priors": self.sample_priors[pruned],
-            "sample_posts": self.sample_posts[pruned],
-            "mahalanobis_d": np.sqrt(np.maximum(d2, 0.0)),
-            "outlier_nsigma": nsigma,
-            "credible_fraction": fraction,
-            "unit_lo": lo,
-            "unit_hi": hi,
-            "points_per_iteration_before_prune": np.asarray(
-                self.points_per_iteration, dtype=int
-            ).copy(),
+            "sample_likes": self.sample_likes[prune],
+            "sample_priors": self.sample_priors[prune],
+            "sample_posts": self.sample_posts[prune],
+            "chi2": chi2[prune],
+            "chi2_threshold": threshold,
+            "chi2_ref_last_max": chi2_ref,
+            "outlier_chi2_factor": factor,
+            "outlier_prune_n_early": n_early,
+            "points_per_iteration_before_prune": ppi.copy(),
         }
 
-        # Recompute per-iteration counts on the pruned (still chronologically
-        # ordered) arrays so progression plots can still slice by iteration.
-        # Collapsing to ``[n_keep]`` used to wipe the history (e.g. turning
-        # ``[80, 40, 40, 40, 40]`` into ``[140]``).
-        ppi = np.asarray(self.points_per_iteration, dtype=int)
-        if ppi.size > 0 and int(ppi.sum()) == n_before:
-            iter_ids = np.repeat(np.arange(len(ppi)), ppi)
-            new_ppi = np.bincount(iter_ids[keep], minlength=len(ppi)).astype(int)
-        else:
-            logger.warning(
-                "remove_outliers: points_per_iteration (sum=%s) inconsistent "
-                "with training size (%d); falling back to a single count.",
-                int(ppi.sum()) if ppi.size else None,
-                n_before,
-            )
-            new_ppi = np.array([n_keep], dtype=int)
+        new_ppi = np.bincount(iter_ids[keep], minlength=len(ppi)).astype(int)
 
         self.sample = self.sample[keep]
         self.unit_sample = self.unit_sample[keep]
@@ -553,12 +774,16 @@ class RoseDataProcessingMixin:
         }
         self.points_per_iteration = new_ppi
 
+        early_before = int(np.sum(ppi[:n_early]))
+        early_after = int(np.sum(new_ppi[:n_early]))
         logger.info(
-            f"remove_outliers: kept {n_keep}/{n_before} training points inside "
-            f"the {nsigma:g}-sigma ({fraction:.1%} HPD) unit-space box of the "
-            f"last tempered chain; stashed {n_before - n_keep} outliers for "
-            f"total_training_set.npz. points_per_iteration: {ppi.tolist()} -> "
-            f"{new_ppi.tolist()}."
+            f"remove_outliers: pruned {n_pruned}/{early_before} early points "
+            f"(iterations 0..{n_early - 1}) with chi2 > {factor:g} * "
+            f"max(chi2_last)={chi2_ref:.3g} (threshold={threshold:.3g}); "
+            f"kept {n_keep}/{n_before} total "
+            f"(early {early_before}->{early_after}). "
+            f"points_per_iteration: {ppi.tolist()} -> {new_ppi.tolist()}. "
+            "Stashed outliers for total_training_set.npz."
         )
 
     def _update_test_set(self, sample_results_test: List, sample_test: np.ndarray,
@@ -625,19 +850,31 @@ class RoseDataProcessingMixin:
         sample = pruned["sample"]
         unit_sample = pruned["unit_sample"]
         data_vectors = pruned["sample_data_vectors"]
+        chi2 = pruned.get("chi2")
+        if chi2 is None:
+            chi2 = -2.0 * np.asarray(pruned["sample_likes"], dtype=float)
         entries: Dict[str, Any] = {
-            "pruned/outlier_nsigma": np.asarray(pruned["outlier_nsigma"]),
-            "pruned/mahalanobis_d": pruned["mahalanobis_d"],
-            "pruned/chi2": pruned["sample_likes"],
+            "pruned/chi2": np.asarray(chi2, dtype=float),
+            "pruned/likes": pruned["sample_likes"],
             "pruned/priors": pruned["sample_priors"],
             "pruned/posts": pruned["sample_posts"],
             "pruned/n_points": np.asarray(len(pruned["sample_likes"])),
         }
-        if "credible_fraction" in pruned:
-            entries["pruned/credible_fraction"] = np.asarray(pruned["credible_fraction"])
-        if "unit_lo" in pruned:
-            entries["pruned/unit_lo"] = pruned["unit_lo"]
-            entries["pruned/unit_hi"] = pruned["unit_hi"]
+        if "chi2_threshold" in pruned:
+            entries["pruned/chi2_threshold"] = np.asarray(pruned["chi2_threshold"])
+        if "chi2_ref_last_max" in pruned:
+            entries["pruned/chi2_ref_last_max"] = np.asarray(pruned["chi2_ref_last_max"])
+        if "outlier_chi2_factor" in pruned:
+            entries["pruned/outlier_chi2_factor"] = np.asarray(pruned["outlier_chi2_factor"])
+        if "outlier_prune_n_early" in pruned:
+            entries["pruned/outlier_prune_n_early"] = np.asarray(
+                pruned["outlier_prune_n_early"]
+            )
+        # Legacy keys from the old HPD-box prune (harmless if absent).
+        if "outlier_nsigma" in pruned:
+            entries["pruned/outlier_nsigma"] = np.asarray(pruned["outlier_nsigma"])
+        if "mahalanobis_d" in pruned:
+            entries["pruned/mahalanobis_d"] = pruned["mahalanobis_d"]
         if "points_per_iteration_before_prune" in pruned:
             entries["points_per_iteration_before_prune"] = pruned[
                 "points_per_iteration_before_prune"

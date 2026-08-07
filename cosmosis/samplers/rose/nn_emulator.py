@@ -27,9 +27,12 @@ import tensorflow as tf
 from sklearn.decomposition import IncrementalPCA
 import pickle
 from tqdm import trange
+import scipy
+import scipy.stats
 
 from .amplitude_prefactor import BlockAmplitudePrefactor, parse_amplitude_prefactor
-
+from .vector_blocks import iter_bin_pairs
+from .utils import SIGNED_LOG_NORM_TRANSFORM_SCALE
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -42,7 +45,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Value for the signed log norm transform
 # optimised for 3x2pt with C_ell ~1e-11-1e-9
-s = 1e-7
+s = SIGNED_LOG_NORM_TRANSFORM_SCALE
 
 # Device detection with better error handling
 def get_device() -> str:
@@ -107,15 +110,38 @@ class CosmoPowerNN(tf.keras.Model):
                  verbose: bool = False,
                  architecture_type: str = "MLP",
                  loss_function: str = "standard",
+                 loss_data_feat: Optional[np.ndarray] = None,
+                 loss_inv_feat: Optional[np.ndarray] = None,
                  **kwargs):
         
         super(CosmoPowerNN, self).__init__(**kwargs)
         
         self.architecture_type = architecture_type
         self.verbose = verbose
+        self.loss_data_feat = None
+        self.loss_inv_feat = None
+        self.n_loss_modes = None
         if loss_function == "standard":
             self.compute_loss = self.compute_loss_standard
         elif loss_function == "weighted_w_cov":
+            # Match linna.util.Auxilleryfunc / Loss_fn (github.com/chto/linna):
+            # compare NN vs M in *feature* space with C^{-1} transformed to that
+            # space; floor χ²(M,d) at 0.5 * n_modes.
+            if loss_data_feat is None or loss_inv_feat is None:
+                raise ValueError(
+                    "loss_function='weighted_w_cov' requires loss_data_feat and "
+                    "loss_inv_feat (feature-space data and C^{-1}, as in LINNA)"
+                )
+            d_feat = np.atleast_1d(np.asarray(loss_data_feat, dtype=np.float64))
+            ic_feat = np.atleast_2d(np.asarray(loss_inv_feat, dtype=np.float64))
+            if ic_feat.shape != (d_feat.shape[0], d_feat.shape[0]):
+                raise ValueError(
+                    "loss_data_feat / loss_inv_feat shape mismatch: "
+                    f"d={d_feat.shape}, inv={ic_feat.shape}"
+                )
+            self.n_loss_modes = int(d_feat.shape[0])
+            self.loss_data_feat = tf.constant(d_feat, dtype=DTYPE)
+            self.loss_inv_feat = tf.constant(ic_feat, dtype=DTYPE)
             self.compute_loss = self.compute_loss_weighted_w_cov
         else:
             raise ValueError(f"Unknown loss_function type: {loss_function}")
@@ -361,10 +387,10 @@ class CosmoPowerNN(tf.keras.Model):
             return np.stack([input_dict[k] for k in input_dict], axis=1)
 
     def update_emulator_parameters(self) -> None:
-        """Update emulator parameters for saving.
-        
-        This method extracts the current model parameters and stores them
-        in a format suitable for saving and later restoration.
+        """Snapshot current TF Variables into NumPy arrays (W_, b_, …).
+
+        Used as the early-stopping checkpoint: call when validation loss
+        improves so :meth:`restore_emulator_parameters` can roll back later.
         """
         if self.architecture_type == "MLP":
             self.emulator_parameters = {
@@ -380,6 +406,22 @@ class CosmoPowerNN(tf.keras.Model):
             self.betas_ = [b.numpy() for b in self.betas]
         else:
             raise NotImplementedError(f"Update emulator parameters not implemented for architecture: {self.architecture_type}")
+
+    def restore_emulator_parameters(self) -> None:
+        """Load the last ``update_emulator_parameters`` snapshot into TF Variables."""
+        if self.architecture_type != "MLP":
+            raise NotImplementedError(
+                f"Restore not implemented for architecture: {self.architecture_type}"
+            )
+        if not hasattr(self, "W_") or self.W_ is None:
+            logger.warning("No emulator parameter snapshot to restore")
+            return
+        for i in range(len(self.W_)):
+            self.W[i].assign(self.W_[i])
+            self.b[i].assign(self.b_[i])
+        for i in range(len(self.alphas_)):
+            self.alphas[i].assign(self.alphas_[i])
+            self.betas[i].assign(self.betas_[i])
 
     @tf.function
     def compute_loss_standard(self, training_parameters: tf.Tensor, training_features: tf.Tensor) -> tf.Tensor:
@@ -397,19 +439,43 @@ class CosmoPowerNN(tf.keras.Model):
 
     @tf.function
     def compute_loss_weighted_w_cov(self, training_parameters: tf.Tensor, training_features: tf.Tensor) -> tf.Tensor:
-        """Compute weighted loss using inverse covariance matrix.
-        
+        """LINNA cov-weighted loss (To et al. 2022; ``linna.util.Auxilleryfunc``).
+
+        Follows https://github.com/chto/linna exactly:
+
+        - ``y_pred`` / ``y_target`` live in **NN feature space** (after
+          ``y→y/σ`` and z-score / median–MAD), not physical space.
+        - ``C^{-1}`` is the inverse of the covariance transformed into that
+          same feature space.
+        - ``Loss = mean[ χ²(M,NN) / χ²(M,d) ]`` with
+          ``χ²(M,d) ← max(χ²(M,d), 0.5 * n_modes)``.
+
         Args:
-            training_parameters: Parameter tensor
-            training_features: Target features tensor
-            
+            training_parameters: Parameter tensor (NNEmulator-normalized space)
+            training_features: Target features already in feature space
+
         Returns:
-            Weighted loss using inverse covariance
+            Batch-mean LINNA loss
         """
-        predictions = self.predictions_tf(training_parameters)
-        diff = predictions - training_features
-        weighted_diff = tf.matmul(diff, self.data_inv_cov)
-        return tf.sqrt(tf.reduce_mean(tf.reduce_sum(diff * weighted_diff, axis=1)))
+        # Network output is already in feature space (same as training_features).
+        y_pred = self.predictions_tf(training_parameters)
+        y_target = training_features
+        # (M - NN) and (M - d) — same ordering as LINNA Auxilleryfunc.
+        delta_m_nn = y_target - y_pred
+        delta_m_d = y_target - self.loss_data_feat
+        chisq_mnn = tf.einsum(
+            "bi,ij,bj->b", delta_m_nn, self.loss_inv_feat, delta_m_nn
+        )
+        chisq_md = tf.einsum(
+            "bi,ij,bj->b", delta_m_d, self.loss_inv_feat, delta_m_d
+        )
+        floor = tf.constant(0.5 * float(self.n_loss_modes), dtype=DTYPE)
+        chisq_md = tf.maximum(chisq_md, floor)
+        ratio = chisq_mnn / chisq_md
+        # Cap per-sample ratio so a single outlier cannot blow up Adam steps
+        # (common with lr=1e-2 on the LINNA χ²-ratio loss).
+        ratio = tf.minimum(ratio, tf.constant(1.0e4, dtype=DTYPE))
+        return tf.reduce_mean(ratio)
 
     @tf.function
     def compute_loss_and_gradients(self, training_parameters: tf.Tensor, training_features: tf.Tensor) -> Tuple[tf.Tensor, List[tf.Tensor]]:
@@ -518,6 +584,8 @@ class CosmoPowerNN(tf.keras.Model):
             Training loss for this step
         """
         loss, gradients = self.compute_loss_and_gradients(training_parameters, training_features)
+        # Clip grads: LINNA χ²-ratio loss can spike and destroy weights at high lr.
+        gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         return loss
 
@@ -672,10 +740,18 @@ class CosmoPowerNN(tf.keras.Model):
                         logger.info(f"Early stopping at epoch {epoch} (patience={patience_values[stage]})")
                         break
                 
+                # Roll back to best validation weights (critical if loss exploded).
+                self.restore_emulator_parameters()
+                restored_val = float(self.compute_loss(val_params, val_features).numpy())
                 # Store stage diagnostics
                 diagnostics[f'learning_cycle_{stage}'] = stage_diagnostics
-                logger.info(f"Stage {stage + 1} completed. Best validation loss: {best_val_loss:.6f}")
+                logger.info(
+                    f"Stage {stage + 1} completed. Best validation loss: {best_val_loss:.6f} "
+                    f"(restored weights → val_loss={restored_val:.6f})"
+                )
         
+        # Ensure TF Variables match the best snapshot before writing to disk.
+        self.restore_emulator_parameters()
         # Final model save
         self.save(filename_saved_model, diagnostics)
         logger.info(f"Training completed. Final model saved to {filename_saved_model}")
@@ -829,10 +905,13 @@ class NNEmulator:
         modes: Output modes/features
         nn_model: Neural network architecture ('MLP' or other models of your choice -- to be implemented)
         iteration: Current training iteration (for naming)
-        data_transformation: Data transformation type ('log_norm', 'norm', 'PCA')
-        n_pca: Number of PCA components (if using PCA)
-        datavector: Reference data vector for weighted training
-        inv_cov: Inverse covariance matrix for weighted training
+        data_transformation: Data transformation type
+            ('log_norm', 'norm', 'signed_log_norm', 'weighted_norm',
+             'weighted_median_norm', 'PCA', 'PCA_per_bin')
+        n_pca: Number of PCA components (global PCA, or per bin-pair for PCA_per_bin)
+        datavector: Reference data vector for weighted training / weighted transforms
+        inv_cov: Inverse covariance matrix (used to build ``data_cov`` / ``cov_sigma``
+            for weighted transforms, and for cov-weighted loss)
     """
     
     def __init__(self,
@@ -858,15 +937,26 @@ class NNEmulator:
         self.data_transformation = data_transformation
         self.datavector = datavector
         self.data_inv_cov = inv_cov
+        # Covariance and per-mode σ = sqrt(diag(C)) for weighted_* transforms.
+        self.data_cov = None
+        self.cov_sigma = None
+        if inv_cov is not None:
+            inv = np.atleast_2d(np.asarray(inv_cov, dtype=float))
+            self.data_cov = np.linalg.inv(inv)
+            self.cov_sigma = np.maximum(np.sqrt(np.diag(self.data_cov)), 1e-30)
         self.n_pca = n_pca
         self.nn_model = nn_model
         self.loss_function = loss_function
         self.iteration = iteration
         self.amplitude_prefactor_enabled = parse_amplitude_prefactor(amplitude_prefactor)
         self.amplitude_prefactor: Optional[BlockAmplitudePrefactor] = None
+        # Metadata / probe list for PCA_per_bin (and name inference ≤3.19)
+        self.vector_metadata: Optional[Dict[str, Any]] = None
+        self.amplitude_prefactor_spectra: Optional[Any] = None
         
         # Initialize transformation attributes
         self.pca_transform_matrix = None
+        self.pca_blocks: Optional[List[Dict[str, Any]]] = None
         self.y_mean = None
         self.y_std = None
         self.features_mean = None
@@ -885,6 +975,10 @@ class NNEmulator:
         spectra: Optional[Any] = None,
     ) -> None:
         """Build the block-wise 3x2pt amplitude prefactor from vector metadata."""
+        if metadata is not None:
+            self.vector_metadata = metadata
+        if spectra is not None:
+            self.amplitude_prefactor_spectra = spectra
         if not self.amplitude_prefactor_enabled:
             self.amplitude_prefactor = None
             return
@@ -895,6 +989,29 @@ class NNEmulator:
         self.amplitude_prefactor = BlockAmplitudePrefactor.from_metadata(
             metadata, self.model_parameters, spectra=spectra
         )
+
+    def configure_bin_pair_pca(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        spectra: Optional[Any] = None,
+    ) -> None:
+        """Attach vector metadata needed by ``PCA_per_bin`` transforms."""
+        if not metadata:
+            raise ValueError(
+                "data_transformation=PCA_per_bin requires fiducial vector metadata "
+                "(name/bin1/bin2, or angle+bin1+bin2 for name inference)."
+            )
+        self.vector_metadata = metadata
+        if spectra is not None:
+            self.amplitude_prefactor_spectra = spectra
+
+    @staticmethod
+    def _is_pca_family(data_transformation: str) -> bool:
+        return data_transformation in ("PCA", "PCA_per_bin")
+
+    @staticmethod
+    def _is_weighted_norm_family(data_transformation: str) -> bool:
+        return data_transformation in ("weighted_norm", "weighted_median_norm")
 
     def transform(self, model_datavector: np.ndarray) -> np.ndarray:
         """Transform data vector for neural network training.
@@ -911,8 +1028,14 @@ class NNEmulator:
             return self._signed_log_norm_transform(model_datavector)
         elif self.data_transformation == 'norm':
             return self._norm_transform(model_datavector)
+        elif self.data_transformation == 'weighted_norm':
+            return self._weighted_norm_transform(model_datavector)
+        elif self.data_transformation == 'weighted_median_norm':
+            return self._weighted_median_norm_transform(model_datavector)
         elif self.data_transformation == 'PCA':
             return self._pca_transform(model_datavector)
+        elif self.data_transformation == 'PCA_per_bin':
+            return self._pca_per_bin_transform(model_datavector)
         else:
             raise ValueError(f"Unknown data transformation: {self.data_transformation}")
 
@@ -954,8 +1077,40 @@ class NNEmulator:
                
         return (data - self.y_mean) / self.y_std
 
+    def _weighted_norm_transform(self, data: np.ndarray) -> np.ndarray:
+        """Rescale by data σ, then z-score (mean/std).
+
+        Uses ``cov_sigma = sqrt(diag(C))`` with ``C = inv(inv_cov)``.
+        """
+        if self.cov_sigma is None:
+            raise ValueError(
+                "data_transformation='weighted_norm' requires inv_cov "
+                "(to build per-mode data σ)"
+            )
+        weighted_data = data / self.cov_sigma
+        self.y_mean = np.mean(weighted_data, axis=0)
+        self.y_std = np.maximum(np.std(weighted_data, axis=0), 1e-10)
+        return (weighted_data - self.y_mean) / self.y_std
+
+    def _weighted_median_norm_transform(self, data: np.ndarray) -> np.ndarray:
+        """Rescale by data σ, then robust median / MAD normalization.
+
+        Uses ``cov_sigma = sqrt(diag(C))`` with ``C = inv(inv_cov)``.
+        """
+        if self.cov_sigma is None:
+            raise ValueError(
+                "data_transformation='weighted_median_norm' requires inv_cov "
+                "(to build per-mode data σ)"
+            )
+        weighted_data = data / self.cov_sigma
+        self.y_mean = np.median(weighted_data, axis=0)
+        self.y_std = np.maximum(
+            scipy.stats.median_abs_deviation(weighted_data, axis=0), 1e-10
+        )
+        return (weighted_data - self.y_mean) / self.y_std
+
     def _pca_transform(self, data: np.ndarray) -> np.ndarray:
-        """Apply PCA transformation."""
+        """Apply global PCA transformation."""
         # Normalize first
         y_mean = np.mean(data, axis=0)
         y_std = np.std(data, axis=0)
@@ -968,20 +1123,187 @@ class NNEmulator:
         
         # Store transformation matrix and parameters
         self.pca_transform_matrix = pca.components_
+        self.pca_blocks = None
         self.features_mean = y_mean
         self.features_std = y_std
         
         # Transform data
         pca_data = pca.transform(normalized_data)
         
-        # Normalize PCA components
-        #self.y_mean = np.mean(pca_data, axis=0)
-        #self.y_std = np.std(pca_data, axis=0)
-        #self.y_std = np.maximum(self.y_std, 1e-10)
-        self.y_mean = np.zeros(pca_data.shape[1])
-        self.y_std = np.ones(pca_data.shape[1])
+        # Standardize PCA coefficients (CosmoPower PCAplusNN convention).
+        # Equalizes loss weight across components; leading PCs otherwise dominate.
+        self.y_mean = np.mean(pca_data, axis=0)
+        self.y_std = np.std(pca_data, axis=0)
+        self.y_std = np.maximum(self.y_std, 1e-10)
         
         return (pca_data - self.y_mean) / self.y_std
+
+    def _pca_per_bin_transform(self, data: np.ndarray) -> np.ndarray:
+        """PCA independently on each redshift-bin pair, then concatenate coeffs.
+
+        For each contiguous ``(name, bin1, bin2)`` block: z-score modes →
+        ``IncrementalPCA(n_components=min(n_pca, n_modes))`` → append coeffs.
+        Optional amplitude prefactor is applied *before* this (in ``train``).
+        """
+        if self.vector_metadata is None:
+            raise ValueError(
+                "PCA_per_bin requires vector metadata; call "
+                "configure_bin_pair_pca() or configure_amplitude_prefactor() first."
+            )
+        data = np.asarray(data, dtype=float)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        n_samples, n_modes = data.shape
+        blocks = iter_bin_pairs(
+            self.vector_metadata, spectra=self.amplitude_prefactor_spectra
+        )
+        if not blocks:
+            raise ValueError("PCA_per_bin: no bin-pair blocks found in metadata")
+
+        pca_blocks: List[Dict[str, Any]] = []
+        coeff_parts: List[np.ndarray] = []
+        for block in blocks:
+            idx = np.asarray(block["indices"], dtype=int)
+            if idx.size == 0:
+                continue
+            y = data[:, idx]
+            n_feat = y.shape[1]
+            n_comp = min(int(self.n_pca), n_feat, n_samples)
+            if n_comp < 1:
+                continue
+            feat_mean = np.mean(y, axis=0)
+            feat_std = np.maximum(np.std(y, axis=0), 1e-10)
+            normalized = (y - feat_mean) / feat_std
+            pca = IncrementalPCA(n_components=n_comp)
+            pca.fit(normalized)
+            coeffs = pca.transform(normalized)
+            pca_blocks.append(
+                {
+                    "name": block["name"],
+                    "bin1": int(block["bin1"]),
+                    "bin2": int(block["bin2"]),
+                    "indices": idx,
+                    "components": np.asarray(pca.components_, dtype=float),
+                    "features_mean": feat_mean,
+                    "features_std": feat_std,
+                    "n_comp": int(n_comp),
+                }
+            )
+            coeff_parts.append(coeffs)
+
+        if not coeff_parts:
+            raise ValueError("PCA_per_bin: no usable bin-pair blocks after clamping n_pca")
+
+        pca_data = np.concatenate(coeff_parts, axis=1)
+        self.pca_blocks = pca_blocks
+        self.pca_transform_matrix = None
+        # Full-vector placeholders unused by per-bin backtransform
+        self.features_mean = np.zeros(n_modes)
+        self.features_std = np.ones(n_modes)
+
+        self.y_mean = np.mean(pca_data, axis=0)
+        self.y_std = np.maximum(np.std(pca_data, axis=0), 1e-10)
+        logger.info(
+            "PCA_per_bin: %d bin-pairs, n_pca_per_bin<=%d → %d concatenated coeffs "
+            "(from %d modes)",
+            len(pca_blocks),
+            int(self.n_pca),
+            pca_data.shape[1],
+            n_modes,
+        )
+        return (pca_data - self.y_mean) / self.y_std
+
+    def _pca_per_bin_backtransform(self, model_datavector: np.ndarray) -> np.ndarray:
+        """Inverse of :meth:`_pca_per_bin_transform` (PCA-coeff space → data)."""
+        if not self.pca_blocks:
+            raise RuntimeError("PCA_per_bin backtransform: pca_blocks missing")
+        coeffs = np.asarray(model_datavector, dtype=float)
+        single = coeffs.ndim == 1
+        if single:
+            coeffs = coeffs.reshape(1, -1)
+        n_modes = int(len(self.modes)) if self.modes is not None else 0
+        if self.vector_metadata and self.vector_metadata.get("size"):
+            n_modes = int(self.vector_metadata["size"])
+        if n_modes <= 0:
+            n_modes = int(max(int(np.max(b["indices"])) for b in self.pca_blocks) + 1)
+        out = np.zeros((coeffs.shape[0], n_modes), dtype=float)
+        offset = 0
+        for block in self.pca_blocks:
+            n_comp = int(block["n_comp"])
+            c = coeffs[:, offset:offset + n_comp]
+            recon = np.dot(c, block["components"])
+            out[:, block["indices"]] = (
+                recon * block["features_std"] + block["features_mean"]
+            )
+            offset += n_comp
+        if offset != coeffs.shape[1]:
+            raise ValueError(
+                f"PCA_per_bin backtransform: expected {offset} coeffs, got {coeffs.shape[1]}"
+            )
+        return out[0] if single else out
+
+    @tf.autograph.experimental.do_not_convert
+    def _linna_feature_space_loss_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Build ``d`` and ``C^{-1}`` in NN feature space (LINNA ``Auxilleryfunc``).
+
+        LINNA transforms physical ``y`` by ``y/σ`` then z-score / median–MAD, and
+        applies the same Jacobians to ``C`` before inverting. The training loss
+        then compares NN outputs to targets in that feature space
+        (see ``linna.util.Auxilleryfunc``).
+        """
+        if self.datavector is None or self.data_inv_cov is None:
+            raise ValueError(
+                "weighted_w_cov requires datavector and inv_cov on NNEmulator"
+            )
+        if self.y_mean is None or self.y_std is None:
+            raise ValueError(
+                "weighted_w_cov requires y_mean/y_std from data_transformation"
+            )
+        d = np.atleast_1d(np.asarray(self.datavector, dtype=np.float64))
+        ic = np.atleast_2d(np.asarray(self.data_inv_cov, dtype=np.float64))
+        y_mean = np.atleast_1d(np.asarray(self.y_mean, dtype=np.float64))
+        y_std = np.maximum(
+            np.atleast_1d(np.asarray(self.y_std, dtype=np.float64)), 1e-30
+        )
+        n = d.shape[0]
+        if y_mean.shape[0] != n or y_std.shape[0] != n or ic.shape != (n, n):
+            raise ValueError(
+                "datavector / inv_cov / y_mean / y_std shape mismatch for "
+                f"weighted_w_cov: d={d.shape}, inv={ic.shape}, "
+                f"y_mean={y_mean.shape}, y_std={y_std.shape}"
+            )
+
+        if self._is_weighted_norm_family(self.data_transformation):
+            # Feature: ((y/σ) - μ) / s ; C_f^{-1} = diag(s σ) C^{-1} diag(s σ)
+            if self.cov_sigma is None:
+                raise ValueError(
+                    f"{self.data_transformation} + weighted_w_cov requires cov_sigma"
+                )
+            sigma = np.maximum(
+                np.atleast_1d(np.asarray(self.cov_sigma, dtype=np.float64)), 1e-30
+            )
+            if sigma.shape[0] != n:
+                raise ValueError(
+                    f"cov_sigma length {sigma.shape[0]} != datavector {n}"
+                )
+            d_feat = (d / sigma - y_mean) / y_std
+            scale = y_std * sigma
+        elif self.data_transformation == "norm":
+            # Feature: (y - μ) / s ; C_f^{-1} = diag(s) C^{-1} diag(s)
+            d_feat = (d - y_mean) / y_std
+            scale = y_std
+        else:
+            raise ValueError(
+                "loss_function='weighted_w_cov' currently supports "
+                "data_transformation in "
+                "{weighted_norm, weighted_median_norm, norm}; "
+                f"got {self.data_transformation!r}. "
+                "PCA / PCA_per_bin and amplitude_prefactor=T are not supported "
+                "with weighted_w_cov."
+            )
+
+        inv_feat = scale[:, None] * ic * scale[None, :]
+        return d_feat.astype(np.float64), inv_feat.astype(np.float64)
 
     def backtransform(self, model_datavector: np.ndarray) -> np.ndarray:
         """Transform predictions back to original space.
@@ -998,12 +1320,84 @@ class NNEmulator:
             return np.sign(model_datavector) * s * (10.0 ** np.abs(model_datavector) - 1.)
         elif self.data_transformation == 'norm':
             return model_datavector
+        elif self._is_weighted_norm_family(self.data_transformation):
+            if self.cov_sigma is None:
+                raise RuntimeError(
+                    f"{self.data_transformation} backtransform requires cov_sigma"
+                )
+            return model_datavector * self.cov_sigma
         elif self.data_transformation == 'PCA':
             # Reverse PCA transformation
             pca_reconstructed = np.dot(model_datavector, self.pca_transform_matrix)
             return pca_reconstructed * self.features_std + self.features_mean
+        elif self.data_transformation == 'PCA_per_bin':
+            return self._pca_per_bin_backtransform(model_datavector)
         else:
             raise ValueError(f"Unknown data transformation: {self.data_transformation}")
+
+    def backtransform_tf(self, pred_intermediate: "tf.Tensor", dtype=None) -> "tf.Tensor":
+        """TensorFlow inverse of ``data_transformation`` (for autodiff / NUTS)."""
+        if dtype is None:
+            dtype = DTYPE
+        if self.data_transformation == 'log_norm':
+            return tf.pow(10.0, pred_intermediate)
+        if self.data_transformation == 'signed_log_norm':
+            return tf.sign(pred_intermediate) * tf.multiply(
+                s, tf.subtract(tf.pow(10.0, tf.abs(pred_intermediate)), 1.0)
+            )
+        if self.data_transformation == 'norm':
+            return pred_intermediate
+        if self._is_weighted_norm_family(self.data_transformation):
+            if self.cov_sigma is None:
+                raise RuntimeError(
+                    f"{self.data_transformation} TF backtransform requires cov_sigma"
+                )
+            return pred_intermediate * tf.constant(self.cov_sigma, dtype=dtype)
+        if self.data_transformation == 'PCA':
+            pca_matrix_tf = tf.constant(self.pca_transform_matrix, dtype=dtype)
+            features_std_tf = tf.constant(self.features_std, dtype=dtype)
+            features_mean_tf = tf.constant(self.features_mean, dtype=dtype)
+            # Support both (n_comp,) and (batch, n_comp)
+            if len(pred_intermediate.shape) == 1:
+                pca_reconstructed = tf.matmul(
+                    tf.expand_dims(pred_intermediate, 0), pca_matrix_tf
+                )[0]
+            else:
+                pca_reconstructed = tf.matmul(pred_intermediate, pca_matrix_tf)
+            return pca_reconstructed * features_std_tf + features_mean_tf
+        if self.data_transformation == 'PCA_per_bin':
+            return self._pca_per_bin_backtransform_tf(pred_intermediate, dtype=dtype)
+        return pred_intermediate
+
+    def _pca_per_bin_backtransform_tf(
+        self, pred_intermediate: "tf.Tensor", dtype=None
+    ) -> "tf.Tensor":
+        """TF inverse of per-bin-pair PCA.
+
+        Bin-pair blocks are a contiguous partition of the flat theory vector in
+        metadata order, so reconstructed segments are concatenated.
+        """
+        if dtype is None:
+            dtype = DTYPE
+        if not self.pca_blocks:
+            raise RuntimeError("PCA_per_bin TF backtransform: pca_blocks missing")
+
+        single = len(pred_intermediate.shape) == 1
+        coeffs = (
+            tf.expand_dims(pred_intermediate, 0) if single else pred_intermediate
+        )
+        parts = []
+        offset = 0
+        for block in self.pca_blocks:
+            n_comp = int(block["n_comp"])
+            c = coeffs[:, offset:offset + n_comp]
+            components = tf.constant(block["components"], dtype=dtype)
+            feat_std = tf.constant(block["features_std"], dtype=dtype)
+            feat_mean = tf.constant(block["features_mean"], dtype=dtype)
+            parts.append(tf.matmul(c, components) * feat_std + feat_mean)
+            offset += n_comp
+        out = tf.concat(parts, axis=-1)
+        return out[0] if single else out
 
     def train(self,
               X: Dict[str, np.ndarray],
@@ -1088,6 +1482,13 @@ class NNEmulator:
         # Optional block-wise amplitude prefactor, then data_transformation
         y_for_transform = y
         if self.amplitude_prefactor is not None:
+            if self.loss_function == "weighted_w_cov":
+                raise ValueError(
+                    "loss_function=weighted_w_cov is incompatible with "
+                    "amplitude_prefactor=T (θ-dependent amplitude divide vs "
+                    "fixed physical d / C^{-1} in the LINNA feature-space loss). "
+                    "Use loss_function=standard or amplitude_prefactor=F."
+                )
             logger.info("Applying block-wise 3x2pt amplitude prefactor to training targets")
             y_for_transform = self.amplitude_prefactor.divide(X, y)
 
@@ -1101,8 +1502,23 @@ class NNEmulator:
         
         # Create neural network
         logger.info(f"Creating {self.nn_model} neural network with n_hidden={n_hidden}")
-        output_dim = self.n_pca if self.data_transformation == 'PCA' else len(self.modes)
-        
+        if self._is_pca_family(self.data_transformation):
+            output_dim = int(y_train.shape[1])
+        else:
+            output_dim = len(self.modes)
+
+        # LINNA-style cov-weighted loss: feature-space d and C^{-1}.
+        loss_data_feat = None
+        loss_inv_feat = None
+        if self.loss_function == "weighted_w_cov":
+            loss_data_feat, loss_inv_feat = self._linna_feature_space_loss_arrays()
+            logger.info(
+                "weighted_w_cov: LINNA feature-space loss "
+                "(n_modes=%d, floor χ²(M,d)=%.1f)",
+                loss_data_feat.shape[0],
+                0.5 * loss_data_feat.shape[0],
+            )
+
         self.cp_nn = CosmoPowerNN(
             parameters=self.model_parameters,
             modes=list(range(output_dim)),
@@ -1113,7 +1529,9 @@ class NNEmulator:
             n_hidden=n_hidden,
             verbose=True,
             architecture_type=self.nn_model,
-            loss_function=self.loss_function
+            loss_function=self.loss_function,
+            loss_data_feat=loss_data_feat,
+            loss_inv_feat=loss_inv_feat,
         )
         
         # Prepare training data
@@ -1145,13 +1563,18 @@ class NNEmulator:
         """Save additional emulator attributes."""
         save_dict = { "data_transformation": {
             "data_transformation": self.data_transformation,
+            "n_pca": self.n_pca,
             "X_mean": self.X_mean,
             "X_std": self.X_std,
             "y_mean": self.y_mean,
             "y_std": self.y_std,
             "features_mean": self.features_mean,
             "features_std": self.features_std,
+            "cov_sigma": self.cov_sigma,
             "pca_transform_matrix": self.pca_transform_matrix,
+            "pca_blocks": self.pca_blocks,
+            "vector_metadata": self.vector_metadata,
+            "amplitude_prefactor_spectra": self.amplitude_prefactor_spectra,
             "amplitude_prefactor_enabled": self.amplitude_prefactor_enabled,
             "amplitude_prefactor_state": (
                 self.amplitude_prefactor.to_state()
@@ -1196,13 +1619,21 @@ class NNEmulator:
         with np.load(npz_filename, allow_pickle=True) as data:
             data_transformation = data["data_transformation"].item()
             self.data_transformation = data_transformation["data_transformation"]
+            if "n_pca" in data_transformation and data_transformation["n_pca"] is not None:
+                self.n_pca = int(data_transformation["n_pca"])
             self.X_mean = data_transformation["X_mean"]
             self.X_std = data_transformation["X_std"]
             self.y_mean = data_transformation["y_mean"]
             self.y_std = data_transformation["y_std"]
             self.features_mean = data_transformation["features_mean"]
             self.features_std = data_transformation["features_std"]
+            self.cov_sigma = data_transformation.get("cov_sigma")
             self.pca_transform_matrix = data_transformation["pca_transform_matrix"]
+            self.pca_blocks = data_transformation.get("pca_blocks")
+            self.vector_metadata = data_transformation.get("vector_metadata")
+            self.amplitude_prefactor_spectra = data_transformation.get(
+                "amplitude_prefactor_spectra"
+            )
             self.amplitude_prefactor_enabled = bool(
                 data_transformation.get("amplitude_prefactor_enabled", False)
             )
@@ -1211,6 +1642,15 @@ class NNEmulator:
                 self.amplitude_prefactor = BlockAmplitudePrefactor.from_state(amp_state)
             else:
                 self.amplitude_prefactor = None
+            if (
+                self._is_weighted_norm_family(str(self.data_transformation))
+                and self.cov_sigma is None
+            ):
+                raise ValueError(
+                    f"Loaded emulator uses data_transformation="
+                    f"{self.data_transformation!r} but cov_sigma is missing. "
+                    "Retrain with a current ROSE that saves cov_sigma."
+                )
         
         self.trained = True
         logger.info("Emulator loaded successfully")
@@ -1380,22 +1820,8 @@ class NNEmulator:
             # Denormalize outputs (e.g., transform from NN normalization to log10 space)
             pred_intermediate = pred_norm * y_std_tf + y_mean_tf
             
-            # Apply backtransform (e.g., from log10 space to original space)
-            if self.data_transformation == 'log_norm':
-                pred_original = tf.pow(10.0, pred_intermediate)
-            elif self.data_transformation == 'signed_log_norm':
-                pred_original = tf.sign(pred_intermediate) * tf.multiply(s, tf.subtract(tf.pow(10.0, tf.abs(pred_intermediate)), 1.0))
-            elif self.data_transformation == 'norm':
-                pred_original = pred_intermediate
-            elif self.data_transformation == 'PCA':
-                # For PCA: pred_original = (pred_intermediate @ pca_transform_matrix) * features_std + features_mean
-                pca_matrix_tf = tf.constant(self.pca_transform_matrix, dtype=DTYPE)
-                features_std_tf = tf.constant(self.features_std, dtype=DTYPE)
-                features_mean_tf = tf.constant(self.features_mean, dtype=DTYPE)
-                pca_reconstructed = tf.matmul(pred_intermediate, pca_matrix_tf)
-                pred_original = pca_reconstructed * features_std_tf + features_mean_tf
-            else:
-                pred_original = pred_intermediate
+            # Apply backtransform (e.g., from log10 / PCA-coeff space to original space)
+            pred_original = self.backtransform_tf(pred_intermediate, dtype=DTYPE)
 
             if self.amplitude_prefactor is not None:
                 param_index = {p: i for i, p in enumerate(self.model_parameters)}
@@ -1472,6 +1898,11 @@ class NNEmulator:
         print(f"Data transformation: {self.data_transformation}")
         if self.data_transformation == 'PCA':
             print(f"PCA components: {self.n_pca}")
+        elif self.data_transformation == 'PCA_per_bin':
+            n_blocks = len(self.pca_blocks) if self.pca_blocks else 0
+            n_coeff = int(self.y_mean.shape[0]) if self.y_mean is not None else 0
+            print(f"PCA per bin-pair: n_pca_per_bin={self.n_pca}, "
+                  f"blocks={n_blocks}, total_coeffs={n_coeff}")
         print(f"Trained: {self.trained}")
         
         if self.trained and hasattr(self, 'cp_nn'):

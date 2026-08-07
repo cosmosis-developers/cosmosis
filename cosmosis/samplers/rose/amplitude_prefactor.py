@@ -8,7 +8,7 @@ S8 / sigma8 / As amplitude of each probe.
 WL (shear_cl):
     / S8^2  or  / (sigma8^2 * Omega_m/0.3)  or  / (As_1e9 * Omega_m/0.3)
 XC (galaxy_shear_cl), lens bin i:
-    / (b_i * S8^2)  or  / (b_i * As_1e9 * Omega_m/0.3)
+    / (b_i * S8^2)  or  / (b_i * sigma8^2)  or  / (b_i * As_1e9)
 GC (galaxy_cl), bins i,j:
     / (b_i * b_j * sigma8^2)  or  / (b_i * b_j * As_1e9)
 
@@ -17,6 +17,11 @@ where As_1e9 = As / 1e-9 keeps the As-proxy O(1), comparable to sigma8^2.
 S8 and sigma8 are used when present among the varied parameters; otherwise the
 As_1e9 proxy is used. If only S8 is varied, sigma8 is recovered as
 S8 / sqrt(Omega_m/0.3) for the GC block.
+
+Note: in As-proxy mode XC uses ``b_i * As_1e9`` (σ8-like), not
+``b_i * As_1e9 * Omega_m/0.3``. Galaxy–shear tracks bias × matter amplitude;
+folding Ωm into XC (an S8-style factor) leaves a strong spurious Ωm dependence
+in the residual when As and Ωm both vary.
 """
 
 from __future__ import annotations
@@ -385,12 +390,14 @@ class BlockAmplitudePrefactor:
             A[:, self.wl_mask] = s8_sq[:, None]
 
         if np.any(self.xc_mask):
+            # S8 family: b * S8^2. As-proxy: b * As_1e9 (σ8-like), not As*Om/0.3.
+            xc_matter = s8_sq if self.amp_family == "s8" else sigma8_sq
             for b, key in self.bias_keys.items():
                 sel = self.xc_mask & (self.bin1 == b)
                 if not np.any(sel):
                     continue
                 bias = _as_1d(X[key], n_samples)
-                A[:, sel] = (bias * s8_sq)[:, None]
+                A[:, sel] = (bias * xc_matter)[:, None]
 
         if np.any(self.gc_mask):
             for i, key_i in self.bias_keys.items():
@@ -461,12 +468,13 @@ class BlockAmplitudePrefactor:
             A = A * (1.0 - mask) + mask * s8_sq
 
         if np.any(self.xc_mask):
+            xc_matter = s8_sq if self.amp_family == "s8" else sigma8_sq
             for b, key in self.bias_keys.items():
                 sel = self.xc_mask & (self.bin1 == b)
                 if not np.any(sel):
                     continue
                 mask = tf.constant(sel, dtype=dtype)
-                amp = _get(key) * s8_sq
+                amp = _get(key) * xc_matter
                 A = A * (1.0 - mask) + mask * amp
 
         if np.any(self.gc_mask):
@@ -477,6 +485,73 @@ class BlockAmplitudePrefactor:
                         continue
                     mask = tf.constant(sel, dtype=dtype)
                     amp = _get(key_i) * _get(key_j) * sigma8_sq
+                    A = A * (1.0 - mask) + mask * amp
+
+        return tf.maximum(A, _AMP_FLOOR)
+
+    def factors_tf_batch(self, physical_params_tf, param_index: Dict[str, int], dtype):
+        """TensorFlow amplitudes of shape ``(batch, n_modes)``.
+
+        Args:
+            physical_params_tf: Physical parameters, shape ``(batch, n_params)``.
+            param_index: Map from parameter name to column index.
+            dtype: TensorFlow dtype.
+        """
+        import tensorflow as tf
+
+        def _get(key: str):
+            return physical_params_tf[:, param_index[key]]
+
+        if self.amp_family == "s8":
+            if self.s8_key is not None:
+                s8 = _get(self.s8_key)
+                s8_sq = s8 * s8
+                if self.sigma8_key is not None:
+                    s8p = _get(self.sigma8_key)
+                    sigma8_sq = s8p * s8p
+                else:
+                    om = _get(self.omega_m_key)
+                    sigma8_sq = s8_sq / tf.maximum(om / 0.3, _AMP_FLOOR)
+            else:
+                s8p = _get(self.sigma8_key)
+                sigma8_sq = s8p * s8p
+                om = _get(self.omega_m_key)
+                s8_sq = sigma8_sq * (om / 0.3)
+        else:
+            log_as = _get(self.log_as_key)
+            As_1e9 = (tf.exp(log_as) * 1e-10) / 1e-9
+            if self.omega_m_key:
+                om = _get(self.omega_m_key)
+            else:
+                om = tf.ones_like(log_as)
+            s8_sq = As_1e9 * (om / 0.3)
+            sigma8_sq = As_1e9
+
+        batch = tf.shape(physical_params_tf)[0]
+        A = tf.ones([batch, self.n_modes], dtype=dtype)
+
+        if np.any(self.wl_mask):
+            mask = tf.constant(self.wl_mask, dtype=dtype)[None, :]
+            A = A * (1.0 - mask) + mask * s8_sq[:, None]
+
+        if np.any(self.xc_mask):
+            xc_matter = s8_sq if self.amp_family == "s8" else sigma8_sq
+            for b, key in self.bias_keys.items():
+                sel = self.xc_mask & (self.bin1 == b)
+                if not np.any(sel):
+                    continue
+                mask = tf.constant(sel, dtype=dtype)[None, :]
+                amp = (_get(key) * xc_matter)[:, None]
+                A = A * (1.0 - mask) + mask * amp
+
+        if np.any(self.gc_mask):
+            for i, key_i in self.bias_keys.items():
+                for j, key_j in self.bias_keys.items():
+                    sel = self.gc_mask & (self.bin1 == i) & (self.bin2 == j)
+                    if not np.any(sel):
+                        continue
+                    mask = tf.constant(sel, dtype=dtype)[None, :]
+                    amp = (_get(key_i) * _get(key_j) * sigma8_sq)[:, None]
                     A = A * (1.0 - mask) + mask * amp
 
         return tf.maximum(A, _AMP_FLOOR)

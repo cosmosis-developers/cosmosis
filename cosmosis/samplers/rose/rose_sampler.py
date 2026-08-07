@@ -121,6 +121,7 @@ class RoseSampler(
         # additional times; each retrain bumps this so a fresh emumodel_N+1 dir
         # is written instead of overwriting the previous one.
         self._current_emu_version = 0
+        self._final_chain_already_sampled = False
         
         # Configure training parameters
         self._configure_training_parameters()
@@ -178,21 +179,36 @@ class RoseSampler(
         
         # Set up sampling
         tempering = self._get_current_tempering()
+        self._tempered_chain_archived = False
         
         # Check if this is the final iteration and we should use nautilus or NUTS
         is_final_iteration = (self.iterations == self.max_iterations - 1)
 
-        # Run convergence diagnostics on the test points collected from the
-        # 1-sigma region of the one-before-last chain, using the freshly trained
-        # emulator, just before entering the final sampling stage.
+        # Run convergence diagnostics on the held-out test points using the
+        # freshly trained emulator, just before (or instead of) the final
+        # sampling stage. May already run untempered final_sampler chains when
+        # kl_convergence_chain = T.
         if is_final_iteration:
             self.run_convergence_tests()
-        
+
+        already_sampled = bool(
+            getattr(self, "_final_chain_already_sampled", False)
+        )
+
         # Sampling methods return MCMC wall time only (excluding chain file I/O
         # in _process_*_results, which can dominate for large chains).
-        if is_final_iteration and self.final_sampler == "nuts":
+        if already_sampled:
+            logger.info(
+                "Skipping post-convergence final_sampler call; the convergence "
+                "loop already produced the last untempered chain."
+            )
+            time_sampling_s = 0.0
+        elif is_final_iteration and self.final_sampler == "nuts":
             logger.info("Using NUTS for final iteration")
             time_sampling_s = self._run_nuts_sampling(tempering)
+        elif is_final_iteration and self.final_sampler == "numpyro":
+            logger.info("Using NumPyro (jax2tf) NUTS for final iteration")
+            time_sampling_s = self._run_numpyro_sampling(tempering)
         elif is_final_iteration and self.final_sampler == "nautilus":
             logger.info("Using Nautilus for final iteration")
             time_sampling_s = self._run_nautilus_sampling(tempering)
@@ -200,10 +216,16 @@ class RoseSampler(
             logger.info("Using emcee for sampling")
             time_sampling_s = self._run_emcee_sampling(tempering)
 
-        # Compute a per-iteration KL divergence directly from the MCMC chains
-        # (ignoring the tempering used to produce them) and append it to
-        # rose_kl.txt, mirroring the per-iteration timing bookkeeping below.
-        self._record_iteration_kl()
+        # Per-iteration tempered-chain KL. Skip when the convergence loop
+        # already owns the final untempered chain (chain KL is in
+        # rose_convergence.txt).
+        if not already_sampled:
+            self._record_iteration_kl()
+        else:
+            logger.info(
+                "Skipping per-iteration rose_kl tempered-chain row; final chain "
+                "KL was recorded in rose_convergence.txt."
+            )
 
         self._append_timing_row(
             self.iterations + 1,

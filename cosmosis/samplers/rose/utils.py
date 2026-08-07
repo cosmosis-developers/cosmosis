@@ -22,6 +22,10 @@ SAVE_ALL = 2    # Save all training data, models, and diagnostics
 
 _sampler = None
 
+# Value for the signed log norm transform
+# optimised for 3x2pt with C_ell ~1e-11-1e-9
+SIGNED_LOG_NORM_TRANSFORM_SCALE = 1e-7  #1e-10
+
 # Sentinel used to detect "no emulator has been loaded yet on this process".
 _UNSET_EMU_PATH = object()
 
@@ -34,8 +38,8 @@ def _ensure_emulator(sampler: Any, model_path: Optional[str]) -> None:
     is no broadcast). Each worker therefore loads the emulator lazily from disk.
 
     Because the master retrains the emulator every iteration -- and, when
-    ``kl_convergence = T``, again at the final step after folding in the test
-    points -- a worker that loaded an emulator once must *reload* it whenever
+    ``kl_convergence = T``, again during the final-stage holdout retrain loop --
+    a worker that loaded an emulator once must *reload* it whenever
     the master moves on to a new model. We track the path of the emulator this
     process last loaded in ``sampler._loaded_emu_path`` and reload whenever the
     requested ``model_path`` differs from it.
@@ -235,6 +239,23 @@ def log_probability_function_nautilus(p, model_path=None):
     else:
         # Convert other types to scalar
         return log_prob, float(blobs)
+
+def nuts_chain_worker(task: dict) -> dict:
+    """Picklable MPI worker: run one NUTS chain on this process.
+
+    Uses the global RoseSampler (set in ``RoseSampler.config``) and loads the
+    emulator from disk via :func:`_ensure_emulator`, matching the emcee path.
+    ``task`` must be a plain dict of numpy / Python scalars (picklable).
+    """
+    global _sampler
+    if _sampler is None:
+        raise RuntimeError(
+            "Global sampler not set. This should be set in RoseSampler.config()"
+        )
+    model_path = task.get("model_path")
+    _ensure_emulator(_sampler, model_path)
+    return _sampler._execute_one_nuts_chain(task)
+
 
 def prior_transform(p, model_path=None):
     global _sampler

@@ -2,28 +2,26 @@
 Convergence tests for the ROSE sampler.
 
 Just before the final sampling stage, the sampler collects a set of test points
-from the 1-sigma (credible) region of the one-before-last MCMC chain (see
+from the tempered HPD of the one-before-last MCMC chain (see
 ``data_processing.generate_updated_sample``). This module runs convergence
 diagnostics on those test points using the freshly trained emulator:
 
 (a) Emulator accuracy on all emulated modes: relative-error percentiles between
-    the emulated data vectors and the true full-pipeline data vectors (the same
-    diagnostic as ``rose_test/salmon_plot.py``, but computed in-memory), plus a
-    covariance-normalized residual
-    ``|emu - truth| / sqrt(diag(C))``.
-(b) Delta chi^2: for every test point, the difference between the true
-    full-pipeline log-likelihood and the emulated log-likelihood.
-(c) KL divergence between consecutive-iteration likelihood estimates
-    (implemented separately; see ``_test_kl_divergence``).
+    the emulated data vectors and the true full-pipeline data vectors, plus a
+    covariance-normalized residual ``|emu - truth| / sqrt(diag(C))``.
+(b) Delta chi^2 on the held-out test set, including debiased scatter metrics
+    ``MAD(Δχ² − median)``, ``std(Δχ² − median)``, and
+    ``frac(|Δχ² − median| < 2)``, written to ``rose_convergence.txt``.
+(c) Optional final-stage retrain loop (``kl_convergence = T``): the test set
+    stays held out; new HPD training points are added until the MAD criterion
+    (and optionally chain-based KL on ``kl_params``) is met. Passive
+    importance-reweighted KL between consecutive emulators is logged to
+    ``rose_kl.txt`` only (no ``kl_convergence.png``).
 
 Separately, a lightweight per-iteration KL diagnostic is computed after every
-MCMC stage (see ``_record_iteration_kl``): the symmetric KL divergence between
-the current and previous iteration's MCMC chains after importance-reweighting
-both to the *untempered* posterior (so tempering changes no longer dominate the
-signal). Two estimators are reported side by side -- a closed-form Gaussian KL
-(``kl_gaussian``) and a non-parametric, sample-based k-nearest-neighbour KL
-(``kl_knn``; neighbour order set by ``kl_knn_k``). One row per iteration is
-appended to ``{save_dir}/rose_kl.txt`` (mirroring ``rose_timing.txt``).
+MCMC stage (see ``_record_iteration_kl``): symmetric Gaussian and k-NN KL
+between consecutive tempered chains after untempering, reported for all
+parameters and for the selected ``kl_params`` subspace in ``rose_kl.txt``.
 
 All numeric results are written to ``{save_dir}/convergence`` and, when
 matplotlib is available, summary figures are saved alongside them.
@@ -32,7 +30,7 @@ matplotlib is available, summary figures are saved alongside them.
 import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -46,12 +44,13 @@ class RoseConvergenceMixin:
     """Mixin providing convergence diagnostics for :class:`RoseSampler`."""
 
     def run_convergence_tests(self) -> None:
-        """Run all convergence tests on the collected test points.
+        """Run holdout diagnostics and optional final-stage retrain loop.
 
-        This is intended to be called in the last training iteration, after the
-        emulator has been trained but before the final sampling stage. It is a
-        no-op when no test points were collected (e.g. ``final_test_size = 0``).
+        Called in the last training iteration after the emulator has been
+        trained but before (or instead of) the final sampling stage. No-op when
+        no test points were collected (e.g. ``final_test_size = 0``).
         """
+        self._final_chain_already_sampled = False
         sample_test = getattr(self, "sample_test", None)
         if sample_test is None or len(sample_test) == 0:
             logger.warning(
@@ -65,8 +64,7 @@ class RoseConvergenceMixin:
             return
 
         logger.info(
-            "Running convergence tests on %d test points from the 1-sigma "
-            "credible region of the one-before-last MCMC chain",
+            "Running convergence tests on %d held-out test points",
             len(sample_test),
         )
 
@@ -74,41 +72,114 @@ class RoseConvergenceMixin:
         os.makedirs(self.convergence_dir, exist_ok=True)
 
         self.convergence_results: Dict[str, Any] = {}
-        # (a) and (b) use the emulator trained WITHOUT the test points, so the
-        # test points remain genuinely held-out for these accuracy diagnostics.
-        self.convergence_results["accuracy"] = self._test_emulator_accuracy()
-        self.convergence_results["delta_chi2"] = self._test_delta_chi2()
+        # Stash tempered HPD state before any untempered diagnostic chains.
+        self._stash_tempered_hpd_state()
 
-        # (c) is opt-in (kl_convergence = T). It folds the test points into the
-        # training set, retrains, and drives the KL-divergence convergence loop.
-        # This updates self.emulator, so it runs after the held-out diagnostics
-        # above.
-        if getattr(self, "kl_convergence", False):
-            logger.info("KL-divergence convergence test enabled (kl_convergence = T)")
-            self.convergence_results["kl"] = self._test_kl_divergence()
+        emu_version = int(getattr(self, "_current_emu_version", self.iterations + 1))
+        self.convergence_results["accuracy"] = self._test_emulator_accuracy(
+            emu_version=emu_version
+        )
+        dchi2 = self._test_delta_chi2(emu_version=emu_version)
+        self.convergence_results["delta_chi2"] = dchi2
+        self._append_rose_convergence_row(
+            emu_version=emu_version,
+            dchi2=dchi2,
+            kl_all=float("nan"),
+            kl_sel=float("nan"),
+            chain_kl_pass=False,
+            n_train_added=0,
+        )
+
+        mad_pass = bool(dchi2.get("mad_pass", False))
+        if mad_pass:
+            logger.info(
+                "Debiased Δχ² MAD=%.4g <= threshold %.4g; emulator accurate enough "
+                "(no extra retrain).",
+                dchi2["mad_r"], float(self.delta_chi2_mad_threshold),
+            )
+            self.kl_converged = True
+            self.convergence_results["kl"] = {
+                "converged": True,
+                "reason": "mad_pass",
+                "n_retrain": 0,
+            }
+        elif getattr(self, "kl_convergence", False):
+            logger.info(
+                "Final-stage convergence loop enabled (kl_convergence = T, "
+                "kl_convergence_chain = %s)",
+                bool(getattr(self, "kl_convergence_chain", False)),
+            )
+            self.convergence_results["kl"] = self._run_final_convergence_loop(
+                initial_dchi2=dchi2,
+            )
         else:
             logger.info(
-                "KL-divergence convergence test disabled; set kl_convergence = T "
-                "to enable it."
+                "kl_convergence = F; skipping extra retrain "
+                "(MAD not passed: MAD=%.4g > %.4g).",
+                dchi2.get("mad_r", float("nan")),
+                float(self.delta_chi2_mad_threshold),
             )
+            self.kl_converged = False
+            self.convergence_results["kl"] = {
+                "converged": False,
+                "reason": "kl_convergence_disabled",
+                "n_retrain": 0,
+            }
 
         self._save_convergence_results()
+
+    def _stash_tempered_hpd_state(self) -> None:
+        """Preserve tempered-chain arrays used for HPD resampling."""
+        chain = getattr(self, "chain", None)
+        if chain is None:
+            self._hpd_stash = None
+            return
+        self._hpd_stash = {
+            "chain": np.asarray(chain, dtype=float).copy(),
+            "unit_chain": (
+                np.asarray(self.unit_chain, dtype=float).copy()
+                if getattr(self, "unit_chain", None) is not None else None
+            ),
+            "chain_logpost": (
+                np.asarray(self.chain_logpost, dtype=float).copy()
+                if getattr(self, "chain_logpost", None) is not None else None
+            ),
+            "chain_log_weights": (
+                np.asarray(self.chain_log_weights, dtype=float).copy()
+                if getattr(self, "chain_log_weights", None) is not None else None
+            ),
+            "chain_tempering": float(getattr(self, "chain_tempering", 1.0)),
+        }
+
+    def _restore_tempered_hpd_state(self) -> None:
+        """Restore tempered HPD arrays before drawing new training points."""
+        stash = getattr(self, "_hpd_stash", None)
+        if not stash:
+            return
+        self.chain = stash["chain"]
+        if stash["unit_chain"] is not None:
+            self.unit_chain = stash["unit_chain"]
+        if stash["chain_logpost"] is not None:
+            self.chain_logpost = stash["chain_logpost"]
+        if stash["chain_log_weights"] is not None:
+            self.chain_log_weights = stash["chain_log_weights"]
+        self.chain_tempering = stash["chain_tempering"]
+
+    def _emu_version_tag(self, emu_version: Optional[int] = None) -> str:
+        v = int(
+            emu_version if emu_version is not None
+            else getattr(self, "_current_emu_version", self.iterations + 1)
+        )
+        return f"emumodel_{v}"
 
     # ------------------------------------------------------------------
     # (a) Emulator accuracy on all emulated modes
     # ------------------------------------------------------------------
-    def _test_emulator_accuracy(self) -> Dict[str, Any]:
-        """Relative-error percentiles between emulated and true data vectors.
-
-        For each likelihood the emulator is evaluated on the test parameters and
-        compared, mode by mode, to the true full-pipeline data vectors. We report
-        the 68/95/99/99.9 percentiles of (i) the absolute relative error and
-        (ii) the absolute covariance-normalized residual
-        ``|emu - truth| / sqrt(diag(C))`` across the test set for every emulated
-        mode.
-        """
+    def _test_emulator_accuracy(self, emu_version: Optional[int] = None) -> Dict[str, Any]:
+        """Relative-error percentiles between emulated and true data vectors."""
         param_names = [str(p) for p in self.pipeline.varied_params]
         X = {name: self.sample_test[:, i] for i, name in enumerate(param_names)}
+        tag = self._emu_version_tag(emu_version)
 
         results: Dict[str, Any] = {}
         for name in self.likelihood_names:
@@ -146,35 +217,32 @@ class RoseConvergenceMixin:
                 "max_rel_error": float(np.nanmax(rel_error)),
             }
 
-
             cov_percentiles = np.nanpercentile(rel_cov_error, _ACCURACY_PERCENTILES, axis=0)
             results[name]["cov_percentiles"] = cov_percentiles
             results[name]["median_rel_cov_error"] = float(np.nanmedian(rel_cov_error))
             results[name]["max_rel_cov_error"] = float(np.nanmax(rel_cov_error))
 
             logger.info(
-                "[%s] Accuracy on %d test points: median rel. error=%.3g, "
+                "[%s] Accuracy on %d test points (%s): median rel. error=%.3g, "
                 "68%%=%.3g, 95%%=%.3g, 99%%=%.3g (max mode-wise)",
-                name, len(truth),
+                name, len(truth), tag,
                 results[name]["median_rel_error"],
                 float(np.nanmax(percentiles[0])),
                 float(np.nanmax(percentiles[1])),
                 float(np.nanmax(percentiles[2])),
             )
-            if rel_cov_error is not None:
-                logger.info(
-                    "[%s] Cov-normalized accuracy: median=%.3g, "
-                    "68%%=%.3g, 95%%=%.3g, 99%%=%.3g (max mode-wise, in units of "
-                    "sqrt(diag(C)))",
-                    name,
-                    results[name]["median_rel_cov_error"],
-                    float(np.nanmax(results[name]["cov_percentiles"][0])),
-                    float(np.nanmax(results[name]["cov_percentiles"][1])),
-                    float(np.nanmax(results[name]["cov_percentiles"][2])),
-                )
+            logger.info(
+                "[%s] Cov-normalized accuracy (%s): median=%.3g, "
+                "68%%=%.3g, 95%%=%.3g, 99%%=%.3g (max mode-wise)",
+                name, tag,
+                results[name]["median_rel_cov_error"],
+                float(np.nanmax(results[name]["cov_percentiles"][0])),
+                float(np.nanmax(results[name]["cov_percentiles"][1])),
+                float(np.nanmax(results[name]["cov_percentiles"][2])),
+            )
 
-            self._plot_accuracy(name, results[name])
-            self._plot_accuracy_cov(name, results[name])
+            self._plot_accuracy(name, results[name], emu_version=emu_version)
+            self._plot_accuracy_cov(name, results[name], emu_version=emu_version)
 
         return results
 
@@ -202,15 +270,8 @@ class RoseConvergenceMixin:
     # ------------------------------------------------------------------
     # (b) Delta chi^2 between true and emulated likelihoods
     # ------------------------------------------------------------------
-    def _test_delta_chi2(self) -> Dict[str, Any]:
-        """Delta chi^2 between the true and emulated likelihoods per test point.
-
-        The true log-likelihoods were computed by the full pipeline when the test
-        points were collected (``self.sample_likes_test``). The emulated
-        log-likelihoods are obtained by running the emulated pipeline on the same
-        test parameters. We report ``delta_chi2 = chi2_emu - chi2_true`` where
-        ``chi2 = -2 * log_like``.
-        """
+    def _test_delta_chi2(self, emu_version: Optional[int] = None) -> Dict[str, Any]:
+        """Delta chi^2 and debiased scatter on the held-out test set."""
         if self.emu_pipeline is None:
             self.compute_fiducial_setup_emu_pipeline()
 
@@ -230,6 +291,18 @@ class RoseConvergenceMixin:
         delta_chi2 = chi2_emu - chi2_true
 
         valid_delta = delta_chi2[valid]
+        median = float(np.median(valid_delta)) if valid_delta.size else float("nan")
+        if valid_delta.size:
+            resid = valid_delta - median
+            mad_r = float(np.median(np.abs(resid)))
+            std_r = float(np.std(resid))
+            frac_abs_r_lt_2 = float(np.mean(np.abs(resid) < 2.0))
+        else:
+            mad_r = std_r = frac_abs_r_lt_2 = float("nan")
+
+        thresh = float(getattr(self, "delta_chi2_mad_threshold", 1.0))
+        mad_pass = bool(np.isfinite(mad_r) and mad_r <= thresh)
+
         results = {
             "delta_chi2": delta_chi2,
             "chi2_true": chi2_true,
@@ -237,156 +310,332 @@ class RoseConvergenceMixin:
             "n_valid": int(valid.sum()),
             "mean": float(np.mean(valid_delta)) if valid_delta.size else float("nan"),
             "std": float(np.std(valid_delta)) if valid_delta.size else float("nan"),
-            "median": float(np.median(valid_delta)) if valid_delta.size else float("nan"),
+            "median": median,
             "abs_median": float(np.median(np.abs(valid_delta))) if valid_delta.size else float("nan"),
             "abs_max": float(np.max(np.abs(valid_delta))) if valid_delta.size else float("nan"),
+            "mad_r": mad_r,
+            "std_r": std_r,
+            "frac_abs_r_lt_2": frac_abs_r_lt_2,
+            "mad_threshold": thresh,
+            "mad_pass": mad_pass,
         }
 
+        tag = self._emu_version_tag(emu_version)
         logger.info(
-            "Delta chi^2 over %d valid test points: mean=%.3g, std=%.3g, "
-            "median|dchi2|=%.3g, max|dchi2|=%.3g",
-            results["n_valid"], results["mean"], results["std"],
-            results["abs_median"], results["abs_max"],
+            "Delta chi^2 over %d valid test points (%s): mean=%.3g, "
+            "median=%.3g, MAD(r)=%.3g, std(r)=%.3g, frac(|r|<2)=%.3g, mad_pass=%s",
+            results["n_valid"], tag, results["mean"], median,
+            mad_r, std_r, frac_abs_r_lt_2, mad_pass,
         )
 
-        self._plot_delta_chi2(results)
+        self._plot_delta_chi2(results, emu_version=emu_version)
         return results
 
-    # ------------------------------------------------------------------
-    # (c) KL-divergence convergence loop
-    # ------------------------------------------------------------------
-    def _test_kl_divergence(self) -> Dict[str, Any]:
-        """Drive the KL-divergence convergence loop.
+    def _append_rose_convergence_row(
+        self,
+        emu_version: int,
+        dchi2: Dict[str, Any],
+        kl_all: float,
+        kl_sel: float,
+        chain_kl_pass: bool,
+        n_train_added: int,
+    ) -> None:
+        """Append one row to ``{save_dir}/rose_convergence.txt``."""
+        path = os.path.join(self.save_dir, "rose_convergence.txt")
+        write_header = not os.path.isfile(path)
+        mad_pass = bool(dchi2.get("mad_pass", False))
+        with open(path, "a") as f:
+            if write_header:
+                f.write(
+                    "emu_version\tn_test\tmad_r\tstd_r\tfrac_abs_r_lt_2\t"
+                    "median_dchi2\tmad_pass\tkl_all\tkl_sel\t"
+                    "chain_kl_pass\tn_train_added\n"
+                )
+            f.write(
+                f"{emu_version}\t{int(dchi2.get('n_valid', 0))}\t"
+                f"{float(dchi2.get('mad_r', float('nan'))):.6e}\t"
+                f"{float(dchi2.get('std_r', float('nan'))):.6e}\t"
+                f"{float(dchi2.get('frac_abs_r_lt_2', float('nan'))):.6e}\t"
+                f"{float(dchi2.get('median', float('nan'))):.6e}\t"
+                f"{int(mad_pass)}\t"
+                f"{float(kl_all):.6e}\t{float(kl_sel):.6e}\t"
+                f"{int(bool(chain_kl_pass))}\t{int(n_train_added)}\n"
+            )
+        logger.info("Appended convergence diagnostics to %s", path)
 
-        Steps:
-          1. Evaluate the emulated posterior of the current emulator (iteration
-             N, trained without the test points) on a fixed reference set of
-             chain samples.
-          2. Fold the test points into the training set and retrain -> N+1.
-          3. Estimate the KL divergence between the N and N+1 emulated posteriors
-             via importance reweighting of the one-before-last chain (Gaussian
-             approximation with the closed-form KL).
-          4. While KL >= kl_threshold and attempts remain, add more training
-             points, retrain, and recompute the KL against the previous
-             iteration until the criterion is met.
+    # ------------------------------------------------------------------
+    # (c) Final-stage MAD (+ optional chain KL) retrain loop
+    # ------------------------------------------------------------------
+    def _run_final_convergence_loop(self, initial_dchi2: Dict[str, Any]) -> Dict[str, Any]:
+        """Retrain until MAD and/or selected chain-KL criteria are met.
 
-        The (possibly repeatedly) retrained emulator is left in place and used
-        for the subsequent final sampling stage.
+        The held-out test set is never folded into training. New points are
+        drawn from the stashed tempered HPD. Optional untempered
+        ``final_sampler`` chains drive a Jeffreys KL stop on ``kl_params``.
+        Passive IW KL between consecutive emulators is logged to ``rose_kl.txt``.
         """
-        theta, logq = self._kl_reference_samples()
-        if theta is None:
-            logger.warning("KL convergence test skipped (no usable reference chain).")
-            return {"converged": False, "kl_history": [], "reason": "no_reference_chain"}
-
         threshold = float(self.kl_threshold)
         max_retrain = int(self.kl_max_retrain)
-
-        # Posterior of iteration N (emulator without test points). Each KL
-        # retrain writes a brand-new emumodel_{version} directory (rather than
-        # overwriting the current one) so the freshly trained model is both kept
-        # in memory and, being on disk, picked up by the MPI worker processes via
-        # _worker_emu_model_path()/_ensure_emulator.
-        logp_prev = self._emulated_log_posterior(theta)
-        emu_version = getattr(self, "_current_emu_version", self.iterations + 1)
-
-        # All KL-loop timing rows reuse the final-iteration label (max_iterations),
-        # so rose_timing.txt can show multiple rows for that iteration when
-        # kl_convergence = T. Sampling is not run in this loop, so time_sampling_s=0.
+        use_chains = bool(getattr(self, "kl_convergence_chain", False))
         timing_iteration = int(self.max_iterations)
+        emu_version = int(getattr(self, "_current_emu_version", self.iterations + 1))
 
-        # Fold the held-out test points into the training set and retrain -> N+1.
-        t0 = time.perf_counter()
-        n_added = self._append_test_points_to_training()
-        time_training_set_s = time.perf_counter() - t0
-        emu_version += 1
-        logger.info(
-            "Folded %d test points into the training set; retraining emulator "
-            "(emumodel_%d)", n_added, emu_version,
+        theta_ref, logq = self._kl_reference_samples_from_hpd_stash()
+        logp_prev = (
+            self._emulated_log_posterior(theta_ref) if theta_ref is not None else None
         )
-        t1 = time.perf_counter()
-        self.train_emulator(model_version=emu_version)
-        time_train_emulator_s = time.perf_counter() - t1
-        self._append_timing_row(
-            timing_iteration, time_training_set_s, time_train_emulator_s, 0.0,
-        )
-        logp_curr = self._emulated_log_posterior(theta)
 
-        kl, ess = self._gaussian_kl_via_importance(theta, logp_prev, logq, logp_curr)
-        kl_history = [kl]
-        ess_history = [ess]
-        logger.info(
-            "KL divergence after folding test points: %.4g (threshold %.4g, ESS~%.0f)",
-            kl, threshold, ess,
-        )
+        prev_chain = None
+        if use_chains:
+            logger.info(
+                "Running baseline untempered %s chain on %s for chain-KL",
+                self.final_sampler, self._emu_version_tag(emu_version),
+            )
+            t_samp = self._run_untempered_convergence_chain(emu_version)
+            self._append_timing_row(timing_iteration, 0.0, 0.0, t_samp)
+            prev_chain = np.asarray(self.chain, dtype=float).copy()
+            self._final_chain_already_sampled = True
+            # Baseline has no previous untempered chain → nan KL row for this emu.
+            self._append_rose_kl_row(
+                iteration=emu_version,
+                source="untempered_chain",
+                kl_gauss_all=float("nan"),
+                kl_knn_all=float("nan"),
+                kl_gauss_sel=float("nan"),
+                kl_knn_sel=float("nan"),
+                ess=float(len(prev_chain)),
+                tempering=1.0,
+            )
 
         attempt = 0
-        converged = np.isfinite(kl) and kl < threshold
-        while not converged and attempt < max_retrain:
+        converged = False
+        reason = "max_retrain"
+        dchi2 = initial_dchi2
+        kl_all = kl_sel = float("nan")
+        mad_history = [float(initial_dchi2.get("mad_r", float("nan")))]
+        kl_sel_history = []
+
+        while attempt < max_retrain:
             attempt += 1
+            self._restore_tempered_hpd_state()
             t0 = time.perf_counter()
             n_extra = self._add_training_points(self.kl_extra_size)
             time_training_set_s = time.perf_counter() - t0
             emu_version += 1
             logger.info(
-                "KL not converged (%.4g >= %.4g); retrain attempt %d/%d after "
-                "adding %d training points (emumodel_%d)",
-                kl, threshold, attempt, max_retrain, n_extra, emu_version,
+                "Convergence retrain %d/%d: added %d training points (%s)",
+                attempt, max_retrain, n_extra, self._emu_version_tag(emu_version),
             )
-            logp_prev = logp_curr
             t1 = time.perf_counter()
             self.train_emulator(model_version=emu_version)
             time_train_emulator_s = time.perf_counter() - t1
             self._append_timing_row(
                 timing_iteration, time_training_set_s, time_train_emulator_s, 0.0,
             )
-            logp_curr = self._emulated_log_posterior(theta)
-            kl, ess = self._gaussian_kl_via_importance(theta, logp_prev, logq, logp_curr)
-            kl_history.append(kl)
-            ess_history.append(ess)
-            logger.info("KL divergence after retrain attempt %d: %.4g (ESS~%.0f)", attempt, kl, ess)
-            converged = np.isfinite(kl) and kl < threshold
+
+            self.convergence_results["accuracy"] = self._test_emulator_accuracy(
+                emu_version=emu_version
+            )
+            dchi2 = self._test_delta_chi2(emu_version=emu_version)
+            self.convergence_results["delta_chi2"] = dchi2
+            mad_history.append(float(dchi2.get("mad_r", float("nan"))))
+
+            # Passive IW KL (all + selected) -> rose_kl.txt
+            if theta_ref is not None and logp_prev is not None:
+                logp_curr = self._emulated_log_posterior(theta_ref)
+                kl_iw_all, ess_all = self._gaussian_kl_via_importance(
+                    theta_ref, logp_prev, logq, logp_curr,
+                    param_indices=self._kl_all_param_indices(),
+                )
+                kl_iw_sel, ess_sel = self._gaussian_kl_via_importance(
+                    theta_ref, logp_prev, logq, logp_curr,
+                    param_indices=self._kl_selected_param_indices(),
+                )
+                self._append_rose_kl_row(
+                    iteration=emu_version,
+                    source="iw_emu",
+                    kl_gauss_all=kl_iw_all,
+                    kl_knn_all=float("nan"),
+                    kl_gauss_sel=kl_iw_sel,
+                    kl_knn_sel=float("nan"),
+                    ess=min(ess_all, ess_sel),
+                    tempering=1.0,
+                )
+                logp_prev = logp_curr
+                logger.info(
+                    "Passive IW KL after %s: all=%.4g, sel=%.4g (ESS~%.0f)",
+                    self._emu_version_tag(emu_version), kl_iw_all, kl_iw_sel,
+                    min(ess_all, ess_sel),
+                )
+
+            kl_all = kl_sel = float("nan")
+            chain_kl_pass = False
+            if use_chains:
+                logger.info(
+                    "Running untempered %s chain on %s",
+                    self.final_sampler, self._emu_version_tag(emu_version),
+                )
+                t_samp = self._run_untempered_convergence_chain(emu_version)
+                self._append_timing_row(timing_iteration, 0.0, 0.0, t_samp)
+                curr_chain = np.asarray(self.chain, dtype=float).copy()
+                self._final_chain_already_sampled = True
+                kl_knn_all = kl_knn_sel = float("nan")
+                if prev_chain is not None and len(prev_chain) > 1 and len(curr_chain) > 1:
+                    kl_all = self._jeffreys_kl_between_chains(
+                        prev_chain, curr_chain, self._kl_all_param_indices()
+                    )
+                    kl_sel = self._jeffreys_kl_between_chains(
+                        prev_chain, curr_chain, self._kl_selected_param_indices()
+                    )
+                    # Optional k-NN on equal-weight subsamples (same spirit as
+                    # per-iteration tempered KL).
+                    n_sub = min(
+                        int(getattr(self, "kl_n_samples", 2000)),
+                        len(prev_chain),
+                        len(curr_chain),
+                    )
+                    idx_a = np.random.choice(len(prev_chain), size=n_sub, replace=False)
+                    idx_b = np.random.choice(len(curr_chain), size=n_sub, replace=False)
+                    kl_knn_all = _knn_kl_symmetric(
+                        prev_chain[idx_a][:, self._kl_all_param_indices()],
+                        curr_chain[idx_b][:, self._kl_all_param_indices()],
+                        k=int(getattr(self, "kl_knn_k", 3)),
+                        debias=bool(getattr(self, "kl_knn_debias", True)),
+                    )
+                    kl_knn_sel = _knn_kl_symmetric(
+                        prev_chain[idx_a][:, self._kl_selected_param_indices()],
+                        curr_chain[idx_b][:, self._kl_selected_param_indices()],
+                        k=int(getattr(self, "kl_knn_k", 3)),
+                        debias=bool(getattr(self, "kl_knn_debias", True)),
+                    )
+                    chain_kl_pass = bool(np.isfinite(kl_sel) and kl_sel < threshold)
+                    kl_sel_history.append(kl_sel)
+                    logger.info(
+                        "Chain Jeffreys KL (%s vs previous): all=%.4g, sel=%.4g "
+                        "(threshold %.4g, pass=%s)",
+                        self._emu_version_tag(emu_version), kl_all, kl_sel,
+                        threshold, chain_kl_pass,
+                    )
+                self._append_rose_kl_row(
+                    iteration=emu_version,
+                    source="untempered_chain",
+                    kl_gauss_all=kl_all,
+                    kl_knn_all=kl_knn_all,
+                    kl_gauss_sel=kl_sel,
+                    kl_knn_sel=kl_knn_sel,
+                    ess=float(len(curr_chain)),
+                    tempering=1.0,
+                )
+                prev_chain = curr_chain
+
+            self._append_rose_convergence_row(
+                emu_version=emu_version,
+                dchi2=dchi2,
+                kl_all=kl_all,
+                kl_sel=kl_sel,
+                chain_kl_pass=chain_kl_pass,
+                n_train_added=n_extra,
+            )
+
+            mad_pass = bool(dchi2.get("mad_pass", False))
+            if mad_pass:
+                converged = True
+                reason = "mad_pass"
+                break
+            if use_chains and chain_kl_pass:
+                converged = True
+                reason = "chain_kl_pass"
+                break
 
         if converged:
             logger.info(
-                "KL convergence reached (KL=%.4g < %.4g) after %d extra retrain(s). "
-                "Proceeding to final sampling with the converged emulator.",
-                kl, threshold, attempt,
+                "Final-stage convergence reached (%s) after %d retrain(s).",
+                reason, attempt,
             )
         else:
             logger.warning(
-                "KL convergence NOT reached after %d retrain attempts (final KL=%.4g >= %.4g). "
-                "Proceeding to final sampling with the last emulator; consider increasing "
-                "kl_max_retrain, kl_extra_size, or the training budget.",
-                attempt, kl, threshold,
+                "Final-stage convergence NOT reached after %d retrain(s) "
+                "(last MAD=%.4g, last kl_sel=%.4g). Proceeding with last emulator.",
+                attempt,
+                dchi2.get("mad_r", float("nan")),
+                kl_sel if np.isfinite(kl_sel) else float("nan"),
             )
 
         self.kl_converged = bool(converged)
-        results = {
+        return {
             "converged": bool(converged),
-            "kl": float(kl),
-            "threshold": threshold,
+            "reason": reason,
             "n_retrain": int(attempt),
-            "kl_history": np.array(kl_history, dtype=float),
-            "ess_history": np.array(ess_history, dtype=float),
+            "mad_history": np.array(mad_history, dtype=float),
+            "kl_sel_history": np.array(kl_sel_history, dtype=float),
+            "threshold": threshold,
+            "mad_threshold": float(self.delta_chi2_mad_threshold),
         }
-        self._plot_kl_history(results)
-        return results
+
+    def _run_untempered_convergence_chain(self, emu_version: int) -> float:
+        """Run untempered ``final_sampler`` and save as ``_from_emumodel_{v}``."""
+        self._chain_save_suffix = f"_from_emumodel_{int(emu_version)}"
+        try:
+            return float(self._run_untempered_final_sampler())
+        finally:
+            self._chain_save_suffix = None
+
+    def _run_untempered_final_sampler(self) -> float:
+        """Run ``final_sampler`` at tempering=1 and return sampling wall time."""
+        tempering = 1.0
+        sampler = getattr(self, "final_sampler", "emcee")
+        if sampler == "nuts":
+            return float(self._run_nuts_sampling(tempering))
+        if sampler == "numpyro":
+            return float(self._run_numpyro_sampling(tempering))
+        if sampler == "nautilus":
+            return float(self._run_nautilus_sampling(tempering))
+        return float(self._run_emcee_sampling(tempering))
+
+    def _kl_reference_samples_from_hpd_stash(self):
+        """IW reference samples from the stashed tempered chain (not overwritten)."""
+        stash = getattr(self, "_hpd_stash", None)
+        if not stash or stash.get("chain") is None or len(stash["chain"]) < 2:
+            return None, None
+        chain = np.asarray(stash["chain"], dtype=float)
+        logpost = stash.get("chain_logpost")
+        if logpost is None or len(logpost) != len(chain):
+            logpost = np.zeros(len(chain))
+            tempering_prev = 1.0
+        else:
+            logpost = np.asarray(logpost, dtype=float)
+            tempering_prev = float(stash.get("chain_tempering", 1.0))
+        n = len(chain)
+        n_sub = min(int(self.kl_n_samples), n)
+        idx = np.random.choice(n, size=n_sub, replace=False)
+        return chain[idx], tempering_prev * logpost[idx]
+
+    def _jeffreys_kl_between_chains(
+        self,
+        chain_a: np.ndarray,
+        chain_b: np.ndarray,
+        param_indices: Sequence[int],
+    ) -> float:
+        """Symmetrized Gaussian KL between two equal-weight MCMC chains."""
+        idx = np.asarray(param_indices, dtype=int)
+        a = np.asarray(chain_a, dtype=float)[:, idx]
+        b = np.asarray(chain_b, dtype=float)[:, idx]
+        if len(a) < idx.size + 2 or len(b) < idx.size + 2:
+            return float("nan")
+        mean_a, cov_a = a.mean(axis=0), np.cov(a.T, ddof=1)
+        mean_b, cov_b = b.mean(axis=0), np.cov(b.T, ddof=1)
+        cov_a = np.atleast_2d(cov_a) + np.eye(len(idx)) * 1e-12
+        cov_b = np.atleast_2d(cov_b) + np.eye(len(idx)) * 1e-12
+        return 0.5 * (
+            _gaussian_kl(mean_a, cov_a, mean_b, cov_b)
+            + _gaussian_kl(mean_b, cov_b, mean_a, cov_a)
+        )
 
     # ------------------------------------------------------------------
     # Per-iteration KL divergence between consecutive MCMC chains
     # ------------------------------------------------------------------
     def _untempered_log_weights(self, chain: np.ndarray) -> np.ndarray:
-        """Log importance weights that map the current chain to the untempered posterior.
-
-        Emcee/NUTS draw from the tempered posterior
-        ``q(θ) ∝ exp(T * log π(θ))``. Reweighting to the untempered target
-        ``π(θ)`` therefore contributes ``(1 - T) * log π(θ)``.
-
-        Nautilus (and any future weighted sampler) may already carry its own
-        importance weights in ``chain_log_weights``; those are added on top.
-        When ``T = 1`` the tempering term vanishes and only the sampler weights
-        remain.
-        """
+        """Log importance weights that map the current chain to the untempered posterior."""
         n = len(chain)
         logw = getattr(self, "chain_log_weights", None)
         if logw is None or len(logw) != n:
@@ -405,19 +654,12 @@ class RoseConvergenceMixin:
                 )
             else:
                 logpost = np.asarray(logpost, dtype=float)
-                # w ∝ π / q ∝ exp((1 - T) * log π)
                 logw = logw + (1.0 - tempering) * logpost
         return logw
 
     def _resample_equal_weight(self, chain: np.ndarray, logw: np.ndarray,
                                cov: np.ndarray, n_sub: int) -> np.ndarray:
-        """Build an equal-weight subsample for the k-NN KL estimator.
-
-        Multinomial-resamples by ``logw`` when the weights are non-uniform
-        (tempering and/or sampler weights), with a tiny jitter to break the
-        exact duplicate ties that replacement creates. Falls back to plain
-        subsampling without replacement for equal-weight chains.
-        """
+        """Build an equal-weight subsample for the k-NN KL estimator."""
         finite = np.isfinite(logw)
         weighted = bool(finite.any() and np.ptp(logw[finite]) > 0)
         n_sub = min(n_sub, len(chain))
@@ -442,24 +684,8 @@ class RoseConvergenceMixin:
     def _record_iteration_kl(self):
         """Compute and persist per-iteration chain-to-chain KL divergences.
 
-        Called once per iteration right after the MCMC stage. Both the current
-        and previous chains are importance-reweighted to the *untempered*
-        posterior before the KL is computed, so changes in the tempering
-        schedule do not dominate the diagnostic. Sampler-native weights
-        (e.g. nautilus importance weights) are included as well.
-
-        Two symmetric (Jeffreys) KL divergences are reported:
-
-        * ``kl_gaussian`` -- closed-form Gaussian KL from weighted mean/cov.
-        * ``kl_knn`` -- sample-based k-NN KL (neighbour order ``kl_knn_k``)
-          on equal-weight resamples of the reweighted clouds. Uses Mahalanobis
-          whitening and, when ``kl_knn_debias = T``, subtracts a same-
-          distribution null to reduce the positive finite-sample bias.
-
-        One row per iteration is appended to ``{save_dir}/rose_kl.txt``.
-        The first iteration has no previous chain, so both KL entries are ``nan``.
-
-        Returns ``(kl_gaussian, kl_knn)``.
+        Reports Gaussian and k-NN Jeffreys KL for all parameters and for the
+        selected ``kl_params`` subspace. Appends one row to ``rose_kl.txt``.
         """
         chain = getattr(self, "chain", None)
         if chain is None or len(chain) < 2:
@@ -472,35 +698,64 @@ class RoseConvergenceMixin:
         logw = self._untempered_log_weights(chain)
         tempering = float(getattr(self, "chain_tempering", 1.0))
 
-        moments = self._weighted_moments(chain, logw)
-        if moments is None:
-            logger.warning(
-                "Could not compute tempering-reweighted chain moments "
-                "(tempering=%.4g); skipping per-iteration KL.",
-                tempering,
-            )
-            return float("nan"), float("nan")
-        mean, cov, ess = moments
-        if ess < 50:
-            logger.warning(
-                "Low ESS (%.0f) after tempering reweight (T=%.4g) for "
-                "per-iteration KL; the estimate may be noisy.",
-                ess, tempering,
-            )
+        kl_gauss_all, kl_knn_all, ess = self._chain_kl_pair(
+            chain, logw, self._kl_all_param_indices(), store_key="all"
+        )
+        kl_gauss_sel, kl_knn_sel, _ = self._chain_kl_pair(
+            chain, logw, self._kl_selected_param_indices(), store_key="sel"
+        )
 
-        n_sub = min(int(getattr(self, "kl_n_samples", 2000)), len(chain))
-        chain_samples = self._resample_equal_weight(chain, logw, cov, n_sub)
+        self._append_rose_kl_row(
+            iteration=self.iterations + 1,
+            source="tempered_chain",
+            kl_gauss_all=kl_gauss_all,
+            kl_knn_all=kl_knn_all,
+            kl_gauss_sel=kl_gauss_sel,
+            kl_knn_sel=kl_knn_sel,
+            ess=ess,
+            tempering=tempering,
+        )
+
+        logger.info(
+            "Iteration %d chain-to-chain KL (untempered): "
+            "all Gaussian=%.4g kNN=%.4g; sel Gaussian=%.4g kNN=%.4g; "
+            "ESS=%.0f, T=%.4g",
+            self.iterations + 1, kl_gauss_all, kl_knn_all,
+            kl_gauss_sel, kl_knn_sel, ess, tempering,
+        )
+        return float(kl_gauss_sel), float(kl_knn_sel)
+
+    def _chain_kl_pair(
+        self,
+        chain: np.ndarray,
+        logw: np.ndarray,
+        param_indices: Sequence[int],
+        store_key: str,
+    ) -> Tuple[float, float, float]:
+        """Gaussian + kNN KL vs previous stored moments for one subspace."""
+        idx = np.asarray(param_indices, dtype=int)
+        chain_kl = chain[:, idx]
+        moments = self._weighted_moments(chain_kl, logw)
+        if moments is None:
+            return float("nan"), float("nan"), float("nan")
+        mean, cov, ess = moments
+        n_sub = min(int(getattr(self, "kl_n_samples", 2000)), len(chain_kl))
+        chain_samples = self._resample_equal_weight(chain_kl, logw, cov, n_sub)
+
+        prev_attr = f"_kl_prev_chain_moments_{store_key}"
+        prev_samp_attr = f"_kl_prev_chain_samples_{store_key}"
+        prev_moments = getattr(self, prev_attr, None)
+        prev_samples = getattr(self, prev_samp_attr, None)
 
         kl_gauss = float("nan")
         kl_knn = float("nan")
-        prev_moments = getattr(self, "_kl_prev_chain_moments", None)
-        prev_samples = getattr(self, "_kl_prev_chain_samples", None)
         if prev_moments is not None:
             mean_prev, cov_prev = prev_moments
             if mean_prev.shape == mean.shape:
-                kl_ab = _gaussian_kl(mean_prev, cov_prev, mean, cov)
-                kl_ba = _gaussian_kl(mean, cov, mean_prev, cov_prev)
-                kl_gauss = 0.5 * (kl_ab + kl_ba)
+                kl_gauss = 0.5 * (
+                    _gaussian_kl(mean_prev, cov_prev, mean, cov)
+                    + _gaussian_kl(mean, cov, mean_prev, cov_prev)
+                )
         if prev_samples is not None and prev_samples.shape[1] == chain_samples.shape[1]:
             kl_knn = _knn_kl_symmetric(
                 prev_samples, chain_samples,
@@ -508,41 +763,79 @@ class RoseConvergenceMixin:
                 debias=bool(getattr(self, "kl_knn_debias", True)),
             )
 
-        self._kl_prev_chain_moments = (mean, cov)
-        self._kl_prev_chain_samples = chain_samples
+        setattr(self, prev_attr, (mean, cov))
+        setattr(self, prev_samp_attr, chain_samples)
+        return float(kl_gauss), float(kl_knn), float(ess)
 
+    def _append_rose_kl_row(
+        self,
+        iteration: int,
+        source: str,
+        kl_gauss_all: float,
+        kl_knn_all: float,
+        kl_gauss_sel: float,
+        kl_knn_sel: float,
+        ess: float,
+        tempering: float,
+    ) -> None:
         kl_file = os.path.join(self.save_dir, "rose_kl.txt")
         write_header = not os.path.isfile(kl_file)
         with open(kl_file, "a") as f:
             if write_header:
-                f.write("iteration\tkl_gaussian\tkl_knn\tess\ttempering\n")
+                f.write(
+                    "iteration\tsource\tkl_gaussian_all\tkl_knn_all\t"
+                    "kl_gaussian_sel\tkl_knn_sel\tess\ttempering\n"
+                )
             f.write(
-                f"{self.iterations + 1}\t{kl_gauss:.6e}\t{kl_knn:.6e}\t"
+                f"{iteration}\t{source}\t{kl_gauss_all:.6e}\t{kl_knn_all:.6e}\t"
+                f"{kl_gauss_sel:.6e}\t{kl_knn_sel:.6e}\t"
                 f"{ess:.1f}\t{tempering:.6g}\n"
             )
 
-        if np.isfinite(kl_gauss) or np.isfinite(kl_knn):
-            logger.info(
-                "Iteration %d chain-to-chain KL (untempered): Gaussian=%.4g, "
-                "k-NN=%.4g, ESS=%.0f, T=%.4g (saved to %s)",
-                self.iterations + 1, kl_gauss, kl_knn, ess, tempering, kl_file,
+    def _kl_all_param_indices(self) -> np.ndarray:
+        return np.arange(len(self.pipeline.varied_params), dtype=int)
+
+    def _kl_selected_param_indices(self) -> np.ndarray:
+        idx = getattr(self, "kl_param_indices", None)
+        if idx is None or len(idx) == 0:
+            return self._kl_active_param_indices()
+        return np.asarray(idx, dtype=int)
+
+    def _kl_active_param_indices(self) -> np.ndarray:
+        """Indices kept after ``kl_exclude_params`` (legacy default selected set)."""
+        ndim = len(self.pipeline.varied_params)
+        exclude = set(getattr(self, "kl_exclude_param_indices", None) or [])
+        keep = [i for i in range(ndim) if i not in exclude]
+        if not keep:
+            raise ValueError(
+                "No parameters remain for KL after kl_exclude_params / "
+                "resample_weak_params exclusions"
             )
-        else:
-            logger.info(
-                "Iteration %d chain-to-chain KL: nan "
-                "(no previous chain; T=%.4g, ESS=%.0f; saved to %s)",
-                self.iterations + 1, tempering, ess, kl_file,
-            )
-        return float(kl_gauss), float(kl_knn)
+        return np.asarray(keep, dtype=int)
+
+    def _project_theta_for_kl(
+        self, theta: np.ndarray, param_indices: Optional[Sequence[int]] = None
+    ) -> np.ndarray:
+        """Project ``theta`` onto KL subspace indices."""
+        theta = np.asarray(theta, dtype=float)
+        idx = (
+            np.asarray(param_indices, dtype=int)
+            if param_indices is not None
+            else self._kl_selected_param_indices()
+        )
+        if theta.ndim == 1:
+            return theta[idx]
+        if theta.shape[1] == len(self.pipeline.varied_params):
+            return theta[:, idx]
+        if theta.shape[1] == len(idx):
+            return theta
+        raise ValueError(
+            f"Cannot project theta of shape {theta.shape} for KL "
+            f"(ndim={len(self.pipeline.varied_params)}, keep={len(idx)})"
+        )
 
     def _kl_reference_samples(self):
-        """Return (theta, logq) reference samples for importance reweighting.
-
-        ``theta`` is a (subsampled) copy of the one-before-last MCMC chain and
-        ``logq`` is the log sampling density of those samples (up to an additive
-        constant), taken as the tempered emulated posterior of the previous
-        iteration stored in ``self.chain_logpost``.
-        """
+        """Return (theta, logq) reference samples for importance reweighting."""
         chain = getattr(self, "chain", None)
         if chain is None or len(chain) < 2:
             return None, None
@@ -558,7 +851,6 @@ class RoseConvergenceMixin:
             tempering_prev = 1.0
         else:
             logpost = np.asarray(logpost, dtype=float)
-            # Tempering used to produce the one-before-last chain.
             prev_idx = max(0, self.iterations - 1)
             try:
                 tempering_prev = float(self.tempering[prev_idx])
@@ -586,7 +878,11 @@ class RoseConvergenceMixin:
         return logp
 
     def _append_test_points_to_training(self) -> int:
-        """Append the already-evaluated test points to the training arrays."""
+        """Append the already-evaluated test points to the training arrays.
+
+        Kept for optional manual use; the final-stage convergence loop no longer
+        folds the held-out test set into training.
+        """
         n_added = len(self.sample_test)
         if n_added == 0:
             return 0
@@ -605,18 +901,16 @@ class RoseConvergenceMixin:
         return n_added
 
     def _add_training_points(self, n_points: int) -> int:
-        """Draw, evaluate, and append ``n_points`` new training points.
-
-        Points are drawn homogeneously from the tempered HPD credible region of
-        the one-before-last MCMC chain (``self.chain``), mirroring
-        ``generate_updated_sample`` but without collecting test points.
-        """
+        """Draw, evaluate, and append ``n_points`` new training points from tempered HPD."""
         from .data_processing import _task_wrapper
         from .utils import task
 
-        idx = self._select_credible_region_indices(n_points, homogeneous=True)
-        sample = self.chain[idx]
-        unit_sample = self.unit_chain[idx]
+        sample, unit_sample = self._sample_hpd_stratified_volume_lh(
+            n_points,
+            seed=None if self.seed is None else int(self.seed) + 4242 + int(
+                getattr(self, "_current_emu_version", 0)
+            ),
+        )
 
         if self.pool:
             results = self.pool.map(_task_wrapper, sample)
@@ -649,63 +943,34 @@ class RoseConvergenceMixin:
         denom = 1.0 - np.sum(w ** 2)
         if denom > 0:
             cov /= denom
-        # Regularize for numerical stability of the KL closed form.
         cov += np.eye(cov.shape[0]) * 1e-12
         return mean, cov, ess
 
-    def _gaussian_kl_via_importance(self, theta, logp_a, logq, logp_b):
-        """Symmetrized Gaussian KL between two emulated posteriors.
-
-        Each posterior is approximated by a Gaussian fit to the reference
-        samples reweighted by ``exp(logp - logq)``. Returns ``(kl, min_ess)``
-        where ``kl`` is the symmetrized (Jeffreys) divergence and ``min_ess`` is
-        the smaller effective sample size of the two reweightings.
-        """
-        moments_a = self._weighted_moments(theta, logp_a - logq)
-        moments_b = self._weighted_moments(theta, logp_b - logq)
+    def _gaussian_kl_via_importance(
+        self, theta, logp_a, logq, logp_b, param_indices: Optional[Sequence[int]] = None
+    ):
+        """Symmetrized Gaussian KL between two emulated posteriors via IW."""
+        theta_kl = self._project_theta_for_kl(theta, param_indices=param_indices)
+        moments_a = self._weighted_moments(theta_kl, logp_a - logq)
+        moments_b = self._weighted_moments(theta_kl, logp_b - logq)
         if moments_a is None or moments_b is None:
             return float("inf"), 0.0
 
         mean_a, cov_a, ess_a = moments_a
         mean_b, cov_b, ess_b = moments_b
 
-        kl_ab = _gaussian_kl(mean_a, cov_a, mean_b, cov_b)
-        kl_ba = _gaussian_kl(mean_b, cov_b, mean_a, cov_a)
-        kl_sym = 0.5 * (kl_ab + kl_ba)
-
+        kl_sym = 0.5 * (
+            _gaussian_kl(mean_a, cov_a, mean_b, cov_b)
+            + _gaussian_kl(mean_b, cov_b, mean_a, cov_a)
+        )
         min_ess = min(ess_a, ess_b)
         if min_ess < 50:
             logger.warning(
                 "Low effective sample size (%.0f) in KL importance reweighting; "
-                "the KL estimate may be noisy. Consider a less aggressive "
-                "tempering schedule for the one-before-last chain.",
+                "the KL estimate may be noisy.",
                 min_ess,
             )
         return float(kl_sym), float(min_ess)
-
-    def _plot_kl_history(self, result: Dict[str, Any]) -> None:
-        """Save a plot of the KL divergence versus retrain attempt."""
-        plt = _get_pyplot()
-        if plt is None:
-            return
-        history = np.asarray(result.get("kl_history", []), dtype=float)
-        if history.size == 0:
-            return
-        fig = plt.figure(figsize=(6, 5))
-        plt.plot(np.arange(len(history)), history, "o-", color="darkgreen")
-        plt.axhline(result["threshold"], color="grey", linestyle="--",
-                    label=f"threshold={result['threshold']:.3g}")
-        plt.yscale("log")
-        plt.xlabel("retrain attempt", fontsize=16)
-        plt.ylabel("symmetric KL divergence", fontsize=16)
-        plt.title("KL convergence" + (" (converged)" if result["converged"] else " (not converged)"),
-                  fontsize=13)
-        plt.legend(frameon=False, fontsize=12)
-        plt.tight_layout()
-        out_path = os.path.join(self.convergence_dir, "kl_convergence.png")
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        logger.info("Saved KL convergence figure to %s", out_path)
 
     # ------------------------------------------------------------------
     # Saving / plotting helpers
@@ -731,15 +996,19 @@ class RoseConvergenceMixin:
                 ]
 
         dchi2 = self.convergence_results.get("delta_chi2", {})
-        for key in ("delta_chi2", "chi2_true", "chi2_emu"):
-            if key in dchi2:
-                save_dict[f"delta_chi2/{key}"] = dchi2[key]
-        for key in ("mean", "std", "median", "abs_median", "abs_max", "n_valid"):
+        for key in (
+            "delta_chi2", "chi2_true", "chi2_emu",
+            "mean", "std", "median", "abs_median", "abs_max", "n_valid",
+            "mad_r", "std_r", "frac_abs_r_lt_2", "mad_threshold", "mad_pass",
+        ):
             if key in dchi2:
                 save_dict[f"delta_chi2/{key}"] = dchi2[key]
 
         kl = self.convergence_results.get("kl", {})
-        for key in ("converged", "kl", "threshold", "n_retrain", "kl_history", "ess_history"):
+        for key in (
+            "converged", "reason", "n_retrain", "threshold", "mad_threshold",
+            "mad_history", "kl_sel_history",
+        ):
             if key in kl:
                 save_dict[f"kl/{key}"] = kl[key]
 
@@ -747,7 +1016,9 @@ class RoseConvergenceMixin:
         np.savez(out_path, **save_dict)
         logger.info("Saved convergence diagnostics to %s", out_path)
 
-    def _plot_accuracy(self, name: str, result: Dict[str, Any]) -> None:
+    def _plot_accuracy(
+        self, name: str, result: Dict[str, Any], emu_version: Optional[int] = None
+    ) -> None:
         """Save an accuracy percentile figure (mirrors salmon_plot.py)."""
         plt = _get_pyplot()
         if plt is None:
@@ -755,6 +1026,7 @@ class RoseConvergenceMixin:
 
         modes = result["modes"]
         percentiles = result["percentiles"]
+        tag = self._emu_version_tag(emu_version)
 
         fig = plt.figure(figsize=(6, 5))
         plt.fill_between(modes, 0, percentiles[2], color="salmon", label="99%", alpha=0.8)
@@ -764,14 +1036,16 @@ class RoseConvergenceMixin:
         plt.legend(frameon=False, fontsize=16, loc="upper left")
         plt.ylabel(r"$\frac{|\mathrm{emu} - \mathrm{test}|}{\mathrm{test}}$", fontsize=24)
         plt.xlabel("modes", fontsize=16)
-        plt.title(f"Emulator accuracy: {name}", fontsize=14)
+        plt.title(f"Emulator accuracy: {name} ({tag})", fontsize=14)
         plt.tight_layout()
-        out_path = os.path.join(self.convergence_dir, f"accuracy_{name}.png")
+        out_path = os.path.join(self.convergence_dir, f"accuracy_{name}_{tag}.png")
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved accuracy figure to %s", out_path)
 
-    def _plot_accuracy_cov(self, name: str, result: Dict[str, Any]) -> None:
+    def _plot_accuracy_cov(
+        self, name: str, result: Dict[str, Any], emu_version: Optional[int] = None
+    ) -> None:
         """Save covariance-normalized accuracy percentiles ``|emu-test|/σ``."""
         plt = _get_pyplot()
         if plt is None:
@@ -779,6 +1053,7 @@ class RoseConvergenceMixin:
 
         modes = result["modes"]
         percentiles = result["cov_percentiles"]
+        tag = self._emu_version_tag(emu_version)
 
         fig = plt.figure(figsize=(6, 5))
         plt.fill_between(modes, 0, percentiles[2], color="salmon", label="99%", alpha=0.8)
@@ -791,14 +1066,16 @@ class RoseConvergenceMixin:
             fontsize=24,
         )
         plt.xlabel("modes", fontsize=16)
-        plt.title(f"Emulator accuracy (cov-normalized): {name}", fontsize=14)
+        plt.title(f"Emulator accuracy (cov-normalized): {name} ({tag})", fontsize=14)
         plt.tight_layout()
-        out_path = os.path.join(self.convergence_dir, f"accuracy_cov_{name}.png")
+        out_path = os.path.join(self.convergence_dir, f"accuracy_cov_{name}_{tag}.png")
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved cov-normalized accuracy figure to %s", out_path)
 
-    def _plot_delta_chi2(self, result: Dict[str, Any]) -> None:
+    def _plot_delta_chi2(
+        self, result: Dict[str, Any], emu_version: Optional[int] = None
+    ) -> None:
         """Save a histogram of the per-test-point Delta chi^2."""
         plt = _get_pyplot()
         if plt is None:
@@ -809,22 +1086,22 @@ class RoseConvergenceMixin:
         if delta.size == 0:
             return
 
+        tag = self._emu_version_tag(emu_version)
         fig = plt.figure(figsize=(6, 5))
         plt.hist(delta, bins=min(50, max(10, delta.size // 5)), color="steelblue", alpha=0.85)
         plt.axvline(0.0, color="k", linestyle="--", linewidth=1)
         plt.xlabel(r"$\Delta \chi^2 = \chi^2_{\mathrm{emu}} - \chi^2_{\mathrm{true}}$", fontsize=16)
         plt.ylabel("count", fontsize=16)
         plt.title(
-            rf"$\langle\Delta\chi^2\rangle$={result['mean']:.2g}, "
-            rf"med$|\Delta\chi^2|$={result['abs_median']:.2g}",
+            rf"{tag}: MAD(r)={result.get('mad_r', float('nan')):.2g}, "
+            rf"med$\Delta\chi^2$={result['median']:.2g}",
             fontsize=13,
         )
         plt.tight_layout()
-        out_path = os.path.join(self.convergence_dir, "delta_chi2.png")
+        out_path = os.path.join(self.convergence_dir, f"delta_chi2_{tag}.png")
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         logger.info("Saved Delta chi^2 figure to %s", out_path)
-
 
 def _gaussian_kl(mean0: np.ndarray, cov0: np.ndarray,
                  mean1: np.ndarray, cov1: np.ndarray) -> float:

@@ -9,13 +9,18 @@ likelihood so they can later be configured/tuned independently.
 import os
 import logging
 from timeit import default_timer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 
 from .utils import mkdir
 from .amplitude_prefactor import parse_amplitude_prefactor
+from .vector_blocks import (
+    slice_vector_metadata,
+    spectrum_mode_indices,
+    spectrum_model_parameters,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +147,7 @@ class RoseEmulatorManagementMixin:
                 (being on disk) picked up by the MPI worker processes.
         """
         from .nn_emulator import NNEmulator
+        from .spectrum_emulator import CompositeSpectrumEmulator
 
         if model_version is None:
             model_version = self.iterations + 1
@@ -170,103 +176,45 @@ class RoseEmulatorManagementMixin:
         X = {str(param): self.sample[:, i]
              for i, param in enumerate(self.pipeline.varied_params)}
 
-        trained_emulators: Dict[str, NNEmulator] = {}
+        trained_emulators: Dict[str, Any] = {}
         start_time = default_timer()
 
         for name in self.likelihood_names:
             y = self.sample_data_vectors[name]
             n_out = y.shape[1]
-            logger.info(
-                f"Training emulator for '{name}': {n_in} params -> {n_out} outputs "
-                f"using {n_samp} training points"
+            split = parse_amplitude_prefactor(
+                self._resolve_training_setting("spectrum_emulators", name)
             )
-
-            model_filename = os.path.join(iter_dir, name)
-            n_cycles_per_training = self._resolve_training_setting(
-                "n_cycles_per_training", name
-            )
-            n_hidden = list(self._resolve_training_setting("n_hidden", name))
-            batch_sizes = list(self._resolve_training_setting("batch_sizes", name))
-            if len(batch_sizes) == 1:
-                batch_sizes = batch_sizes * n_cycles_per_training
-            elif len(batch_sizes) != n_cycles_per_training:
-                raise ValueError(
-                    f"batch_sizes for likelihood '{name}' has length "
-                    f"{len(batch_sizes)} but n_cycles_per_training is "
-                    f"{n_cycles_per_training} (use a single value to broadcast)"
+            if split:
+                trained_emulators[name] = self._train_spectrum_emulators(
+                    name=name,
+                    X=X,
+                    y=y,
+                    model_parameters=model_parameters,
+                    n_samp=n_samp,
+                    n_in=n_in,
+                    iter_dir=iter_dir,
                 )
-            # Ini ``batch_sizes`` are for the first training iteration. Scale
-            # every entry by sqrt(current_n / first_n) as the training set grows
-            # (and shrinks, e.g. after outlier pruning).
-            ref_n = getattr(self, "_batch_sizes_ref_n", None)
-            if ref_n is None or ref_n <= 0:
-                self._batch_sizes_ref_n = n_samp
-                ref_n = n_samp
-            scale = np.sqrt(n_samp / ref_n)
-            val_split = float(self._resolve_training_setting("validation_split", name))
-            if scale != 1.0:
-                # cap the batch size at 1/5 of the training set size
-                # ignored for the first training iteration
-                #batch_sizes = [max(1, min(int((1.-val_split)*n_samp/5), int(round(b * scale)))) for b in batch_sizes]
-                batch_sizes = [max(1, int((1.-val_split)*n_samp/5)) for b in batch_sizes]
+            else:
                 logger.info(
-                    f"Scaled batch_sizes for '{name}' by {scale:.3f} "
-                    f"(n_train={n_samp}, ref={ref_n}): {batch_sizes}"
+                    f"Training emulator for '{name}': {n_in} params -> {n_out} outputs "
+                    f"using {n_samp} training points"
                 )
-            kwargs = {
-                "model_filename": model_filename,
-                "n_cycles_per_training": n_cycles_per_training,
-                "batch_sizes": batch_sizes,
-                "test_split": self._resolve_training_setting(
-                    "validation_split", name
-                ),
-                "n_hidden": n_hidden,
-            }
-            # Optional CosmoPowerNN schedule overrides. Length must match this
-            # likelihood's n_cycles_per_training. Partial per-likelihood dicts
-            # leave unlisted likelihoods on the auto schedule.
-            for attr, kw in (
-                ("learning_rates", "learning_rates"),
-                ("gradient_accumulation_steps", "gradient_accumulation_steps"),
-                ("patience_values", "patience_values"),
-                ("max_epochs", "max_epochs"),
-            ):
-                values = self._resolve_optional_training_setting(attr, name)
-                if values is None:
-                    continue
-                values = list(values)
-                if len(values) != n_cycles_per_training:
-                    raise ValueError(
-                        f"{attr} for likelihood '{name}' has length "
-                        f"{len(values)} but n_cycles_per_training is "
-                        f"{n_cycles_per_training}"
-                    )
-                kwargs[kw] = values
-
-            emu = NNEmulator(
-                model_parameters,
-                np.arange(n_out),
-                self._resolve_training_setting("nn_model", name),
-                self._resolve_training_setting("loss_function", name),
-                self.iterations + 1,
-                self._resolve_training_setting("data_transformation", name),
-                self._resolve_training_setting("n_pca", name),
-                self.data.get(name),
-                self.inv_cov.get(name),
-                amplitude_prefactor=self._resolve_training_setting(
-                    "amplitude_prefactor", name
-                ),
-            )
-            metadata_all = getattr(self, "fiducial_vector_metadata", None) or {}
-            emu.configure_amplitude_prefactor(
-                metadata_all.get(name),
-                spectra=self._resolve_training_setting(
-                    "amplitude_prefactor_spectra", name
-                ),
-            )
-            emu.train(X, y, **kwargs)
-            self._save_vector_metadata(model_filename, name)
-            trained_emulators[name] = emu
+                model_filename = os.path.join(iter_dir, name)
+                kwargs = self._training_kwargs(name, model_filename, n_samp)
+                emu = self._build_nn_emulator(
+                    name=name,
+                    model_parameters=model_parameters,
+                    n_out=n_out,
+                    datavector=self.data.get(name),
+                    inv_cov=self.inv_cov.get(name),
+                    metadata=(getattr(self, "fiducial_vector_metadata", None) or {}).get(
+                        name
+                    ),
+                )
+                emu.train(X, y, **kwargs)
+                self._save_vector_metadata(model_filename, name)
+                trained_emulators[name] = emu
 
         end_time = default_timer()
         logger.info(
@@ -281,6 +229,203 @@ class RoseEmulatorManagementMixin:
         # needlessly reload it. iter_dir is exactly the path that worker
         # processes are told to (re)load from via _worker_emu_model_path().
         self._loaded_emu_path = iter_dir
+
+    def _training_kwargs(
+        self, name: str, model_filename: str, n_samp: int
+    ) -> Dict[str, Any]:
+        """Build CosmoPowerNN / NNEmulator.train kwargs for one likelihood."""
+        n_cycles_per_training = self._resolve_training_setting(
+            "n_cycles_per_training", name
+        )
+        n_hidden = list(self._resolve_training_setting("n_hidden", name))
+        batch_sizes = list(self._resolve_training_setting("batch_sizes", name))
+        if len(batch_sizes) == 1:
+            batch_sizes = batch_sizes * n_cycles_per_training
+        elif len(batch_sizes) != n_cycles_per_training:
+            raise ValueError(
+                f"batch_sizes for likelihood '{name}' has length "
+                f"{len(batch_sizes)} but n_cycles_per_training is "
+                f"{n_cycles_per_training} (use a single value to broadcast)"
+            )
+        ref_n = getattr(self, "_batch_sizes_ref_n", None)
+        if ref_n is None or ref_n <= 0:
+            self._batch_sizes_ref_n = n_samp
+            ref_n = n_samp
+        scale = np.sqrt(n_samp / ref_n)
+        val_split = float(self._resolve_training_setting("validation_split", name))
+        if scale != 1.0:
+            batch_sizes = [max(1, int((1. - val_split) * n_samp / 5)) for b in batch_sizes]
+            logger.info(
+                f"Scaled batch_sizes for '{name}' by {scale:.3f} "
+                f"(n_train={n_samp}, ref={ref_n}): {batch_sizes}"
+            )
+        kwargs: Dict[str, Any] = {
+            "model_filename": model_filename,
+            "n_cycles_per_training": n_cycles_per_training,
+            "batch_sizes": batch_sizes,
+            "test_split": self._resolve_training_setting("validation_split", name),
+            "n_hidden": n_hidden,
+        }
+        for attr, kw in (
+            ("learning_rates", "learning_rates"),
+            ("gradient_accumulation_steps", "gradient_accumulation_steps"),
+            ("patience_values", "patience_values"),
+            ("max_epochs", "max_epochs"),
+        ):
+            values = self._resolve_optional_training_setting(attr, name)
+            if values is None:
+                continue
+            values = list(values)
+            if len(values) != n_cycles_per_training:
+                raise ValueError(
+                    f"{attr} for likelihood '{name}' has length "
+                    f"{len(values)} but n_cycles_per_training is "
+                    f"{n_cycles_per_training}"
+                )
+            kwargs[kw] = values
+        return kwargs
+
+    def _build_nn_emulator(
+        self,
+        *,
+        name: str,
+        model_parameters: List[str],
+        n_out: int,
+        datavector: Optional[np.ndarray],
+        inv_cov: Optional[np.ndarray],
+        metadata: Optional[Dict[str, Any]],
+        spectra: Optional[Any] = None,
+    ):
+        """Construct and configure an :class:`NNEmulator` for training."""
+        from .nn_emulator import NNEmulator
+
+        if spectra is None:
+            spectra = self._resolve_training_setting(
+                "amplitude_prefactor_spectra", name
+            )
+        emu = NNEmulator(
+            model_parameters,
+            np.arange(n_out),
+            self._resolve_training_setting("nn_model", name),
+            self._resolve_training_setting("loss_function", name),
+            self.iterations + 1,
+            self._resolve_training_setting("data_transformation", name),
+            self._resolve_training_setting("n_pca", name),
+            datavector,
+            inv_cov,
+            amplitude_prefactor=self._resolve_training_setting(
+                "amplitude_prefactor", name
+            ),
+        )
+        emu.configure_amplitude_prefactor(metadata, spectra=spectra)
+        if str(
+            self._resolve_training_setting("data_transformation", name)
+        ) == "PCA_per_bin":
+            emu.configure_bin_pair_pca(metadata, spectra=spectra)
+        return emu
+
+    def _train_spectrum_emulators(
+        self,
+        *,
+        name: str,
+        X: Dict[str, np.ndarray],
+        y: np.ndarray,
+        model_parameters: List[str],
+        n_samp: int,
+        n_in: int,
+        iter_dir: str,
+    ):
+        """Train one NNEmulator per spectrum and wrap as a composite."""
+        from .spectrum_emulator import CompositeSpectrumEmulator
+
+        metadata_all = getattr(self, "fiducial_vector_metadata", None) or {}
+        metadata = metadata_all.get(name)
+        if not metadata:
+            raise ValueError(
+                f"spectrum_emulators=T for '{name}' requires fiducial vector "
+                "metadata (name/bin1/bin2 or angle+bin1+bin2)."
+            )
+        spectra = self._resolve_training_setting("amplitude_prefactor_spectra", name)
+        mode_indices = spectrum_mode_indices(metadata, spectra=spectra)
+        spectrum_order = list(mode_indices.keys())
+        if not spectrum_order:
+            raise ValueError(
+                f"spectrum_emulators=T for '{name}' found no spectrum slices "
+                "in vector metadata."
+            )
+        n_out = int(y.shape[1])
+        logger.info(
+            f"Training spectrum emulators for '{name}': {n_out} modes -> "
+            f"{spectrum_order} ({n_samp} training points)"
+        )
+
+        data_full = self.data.get(name)
+        inv_full = self.inv_cov.get(name)
+        emulators = {}
+        for spectrum, idx in mode_indices.items():
+            params_s = spectrum_model_parameters(spectrum, model_parameters)
+            if not params_s:
+                raise ValueError(
+                    f"[{name}/{spectrum}] spectrum_model_parameters removed all "
+                    "varied parameters; check exclusion lists."
+                )
+            X_s = {p: X[p] for p in params_s}
+            y_s = y[:, idx]
+            meta_s = slice_vector_metadata(metadata, idx, spectrum=spectrum)
+            data_s = None
+            inv_s = None
+            if data_full is not None:
+                data_s = np.asarray(data_full).ravel()[idx]
+            if inv_full is not None:
+                inv_arr = np.atleast_2d(np.asarray(inv_full, dtype=float))
+                inv_s = inv_arr[np.ix_(idx, idx)]
+            dropped = [p for p in model_parameters if p not in params_s]
+            logger.info(
+                f"  [{name}/{spectrum}] {len(params_s)}/{len(model_parameters)} "
+                f"params -> {y_s.shape[1]} modes"
+                + (f" (dropped {dropped})" if dropped else "")
+            )
+            model_filename = os.path.join(iter_dir, f"{name}__{spectrum}")
+            kwargs = self._training_kwargs(name, model_filename, n_samp)
+            # Pass only this spectrum name so amp/PCA name inference matches the
+            # sliced vector (full data_sets list would expect 3 blocks).
+            emu = self._build_nn_emulator(
+                name=name,
+                model_parameters=params_s,
+                n_out=int(y_s.shape[1]),
+                datavector=data_s,
+                inv_cov=inv_s,
+                metadata=meta_s,
+                spectra=spectrum,
+            )
+            emu.ignore_extra_params = True
+            emu.train(X_s, y_s, **kwargs)
+            emulators[spectrum] = emu
+
+        composite = CompositeSpectrumEmulator(
+            emulators=emulators,
+            mode_indices=mode_indices,
+            n_modes=n_out,
+            spectrum_order=spectrum_order,
+            likelihood_name=name,
+        )
+        composite.trained = True
+        model_filename = os.path.join(iter_dir, name)
+        composite.save_to(model_filename)
+        # Persist sliced metadata onto each spectrum file (after save_to, which
+        # rewrites the npz) and full metadata onto the composite manifest.
+        for spectrum, idx in mode_indices.items():
+            meta_s = slice_vector_metadata(metadata, idx, spectrum=spectrum)
+            info_file = os.path.join(iter_dir, f"{name}__{spectrum}") + ".npz"
+            if os.path.exists(info_file):
+                with np.load(info_file, allow_pickle=True) as data:
+                    save_dict = {key: data[key] for key in data.files}
+                save_dict["rose_vector_metadata"] = np.array([meta_s], dtype=object)
+                save_dict["rose_likelihood_name"] = np.array(name)
+                save_dict["rose_spectrum_name"] = np.array(spectrum)
+                np.savez_compressed(info_file, **save_dict)
+        self._save_vector_metadata(model_filename, name)
+        return composite
 
     def _worker_emu_model_path(self) -> Optional[str]:
         """Path token identifying the emulator the master is currently using.
@@ -385,6 +530,7 @@ class RoseEmulatorManagementMixin:
                   When set this overrides ``load_emu_filename`` and iterations.
         """
         from .nn_emulator import NNEmulator
+        from .spectrum_emulator import CompositeSpectrumEmulator
 
         load_setting = self.load_emu_filename
         per_likelihood = path is None and isinstance(load_setting, dict)
@@ -412,7 +558,7 @@ class RoseEmulatorManagementMixin:
         else:
             logger.info("Loading pre-trained emulators from per-likelihood paths")
 
-        loaded_emulators: Dict[str, NNEmulator] = {}
+        loaded_emulators: Dict[str, Any] = {}
         output_indices: Dict[str, Optional[np.ndarray]] = {}
 
         for name in self.likelihood_names:
@@ -424,108 +570,79 @@ class RoseEmulatorManagementMixin:
                 )
 
             default_trafo = self._resolve_training_setting("data_transformation", name)
-            with np.load(info_file, allow_pickle=True) as data:
-                data_transformation_init = default_trafo
-                if "data_transformation" in data:
-                    dt = data["data_transformation"]
-                    if hasattr(dt, "item"):
-                        dt = dt.item()
-                    if isinstance(dt, dict) and "data_transformation" in dt:
-                        data_transformation_init = str(dt["data_transformation"])
-                if "parameters" in data:
-                    model_parameters = list(data["parameters"])
-                else:
-                    model_parameters = [str(p) for p in self.pipeline.varied_params]
-                    logger.warning(
-                        f"[{name}] Could not find parameters in info file, "
-                        "using pipeline parameters"
-                    )
-                if "modes" in data:
-                    output_size = len(data["modes"])
-                else:
-                    raise ValueError(
-                        f"[{name}] Could not determine output size from info file. "
-                        "Please ensure 'modes' is present, or retrain the emulator."
-                    )
-                trained_item = None
-                if "rose_vector_metadata" in data:
-                    md = list(data["rose_vector_metadata"])
-                    if md:
-                        trained_item = md[0]
-
-            emu = NNEmulator(
-                model_parameters,
-                np.ones(output_size),
-                data_transformation=data_transformation_init,
-            )
-            emu.load(base_path)
-
-            # amplitude_prefactor is baked into the trained weights. Always use
-            # the saved state; the ini flag only controls *training*, not loads.
-            ini_amp = parse_amplitude_prefactor(
-                self._resolve_training_setting("amplitude_prefactor", name)
-            )
-            if emu.amplitude_prefactor_enabled and emu.amplitude_prefactor is None:
-                md = trained_item or (
-                    getattr(self, "fiducial_vector_metadata", {}) or {}
-                ).get(name)
-                if md is None:
-                    raise ValueError(
-                        f"[{name}] Loaded emulator has amplitude_prefactor_enabled=T "
-                        "but no amplitude_prefactor_state and no rose_vector_metadata "
-                        "to rebuild it. Retrain with amplitude_prefactor=T."
-                    )
-                emu.amplitude_prefactor_enabled = True
-                emu.configure_amplitude_prefactor(
-                    md,
-                    spectra=self._resolve_training_setting(
-                        "amplitude_prefactor_spectra", name
-                    ),
+            if CompositeSpectrumEmulator.is_manifest(info_file):
+                emu = CompositeSpectrumEmulator.load(
+                    base_path, default_data_transformation=str(default_trafo)
                 )
-            if ini_amp and emu.amplitude_prefactor is None:
-                raise ValueError(
-                    f"[{name}] amplitude_prefactor=T in the ini, but the loaded "
-                    "emulator was trained without amplitude_prefactor. The prefactor "
-                    "cannot be applied after the fact (weights learned the unscaled "
-                    "vector). Load an emulator trained with amplitude_prefactor=T "
-                    "(e.g. rose_lssty1_nonlin_v4/emumodel_5), or retrain."
-                )
-            if (not ini_amp) and emu.amplitude_prefactor is not None:
-                logger.warning(
-                    "[%s] amplitude_prefactor=F in the ini, but the loaded emulator "
-                    "was trained with amplitude_prefactor=T. Keeping the saved "
-                    "prefactor (required for correct predictions). The ini flag "
-                    "only affects training, not trained_before loads.",
-                    name,
-                )
-            if emu.amplitude_prefactor is not None:
+                with np.load(info_file, allow_pickle=True) as data:
+                    output_size = int(np.asarray(data["n_modes"]).item())
+                    trained_item = None
+                    if "rose_vector_metadata" in data.files:
+                        md = list(data["rose_vector_metadata"])
+                        if md:
+                            trained_item = md[0]
+                for spectrum, sub in emu.emulators.items():
+                    self._restore_amplitude_prefactor_on_load(name, sub, None)
+                    sub.ignore_extra_params = True
                 logger.info(
-                    "[%s] Loaded emulator uses amplitude_prefactor (%s): "
-                    "WL=%d XC=%d GC=%d",
-                    name,
-                    emu.amplitude_prefactor.amp_family,
-                    int(emu.amplitude_prefactor.wl_mask.sum()),
-                    int(emu.amplitude_prefactor.xc_mask.sum()),
-                    int(emu.amplitude_prefactor.gc_mask.sum()),
+                    f"[{name}] Loaded composite spectrum emulators: "
+                    f"{list(emu.spectrum_order)} (n_modes={output_size})"
                 )
+            else:
+                with np.load(info_file, allow_pickle=True) as data:
+                    data_transformation_init = default_trafo
+                    if "data_transformation" in data:
+                        dt = data["data_transformation"]
+                        if hasattr(dt, "item"):
+                            dt = dt.item()
+                        if isinstance(dt, dict) and "data_transformation" in dt:
+                            data_transformation_init = str(dt["data_transformation"])
+                    if "parameters" in data:
+                        model_parameters = list(data["parameters"])
+                    else:
+                        model_parameters = [str(p) for p in self.pipeline.varied_params]
+                        logger.warning(
+                            f"[{name}] Could not find parameters in info file, "
+                            "using pipeline parameters"
+                        )
+                    if "modes" in data:
+                        output_size = len(data["modes"])
+                    else:
+                        raise ValueError(
+                            f"[{name}] Could not determine output size from info file. "
+                            "Please ensure 'modes' is present, or retrain the emulator."
+                        )
+                    trained_item = None
+                    if "rose_vector_metadata" in data:
+                        md = list(data["rose_vector_metadata"])
+                        if md:
+                            trained_item = md[0]
 
-            ignore_extra = getattr(self, "ignore_missing_emu_params", True)
-            emu.ignore_extra_params = ignore_extra
-            if ignore_extra:
-                trained_params = set(model_parameters)
-                current_params = [str(p) for p in self.pipeline.varied_params]
-                extra = [p for p in current_params if p not in trained_params]
-                missing = [p for p in trained_params if p not in current_params]
-                if extra:
-                    logger.info(
-                        f"[{name}] Ignoring pipeline parameter(s) not seen during "
-                        f"training: {extra}"
-                    )
-                if missing:
-                    logger.warning(
-                        f"[{name}] Emulator expects parameter(s) not varied by the "
-                        f"current pipeline: {missing}. Predictions may be invalid."
-                    )
+                emu = NNEmulator(
+                    model_parameters,
+                    np.ones(output_size),
+                    data_transformation=data_transformation_init,
+                )
+                emu.load(base_path)
+                self._restore_amplitude_prefactor_on_load(name, emu, trained_item)
+
+                ignore_extra = getattr(self, "ignore_missing_emu_params", True)
+                emu.ignore_extra_params = ignore_extra
+                if ignore_extra:
+                    trained_params = set(model_parameters)
+                    current_params = [str(p) for p in self.pipeline.varied_params]
+                    extra = [p for p in current_params if p not in trained_params]
+                    missing = [p for p in trained_params if p not in current_params]
+                    if extra:
+                        logger.info(
+                            f"[{name}] Ignoring pipeline parameter(s) not seen during "
+                            f"training: {extra}"
+                        )
+                    if missing:
+                        logger.warning(
+                            f"[{name}] Emulator expects parameter(s) not varied by the "
+                            f"current pipeline: {missing}. Predictions may be invalid."
+                        )
 
             loaded_emulators[name] = emu
 
@@ -561,4 +678,60 @@ class RoseEmulatorManagementMixin:
         self.emulator_output_indices = output_indices
         self.emu_module.data.set_emulator(loaded_emulators)
         self.emu_module.data.output_indices = output_indices
+
+    def _restore_amplitude_prefactor_on_load(
+        self,
+        name: str,
+        emu,
+        trained_item: Optional[Dict[str, Any]],
+    ) -> None:
+        """Rebuild / validate amplitude_prefactor after loading an NNEmulator."""
+        ini_amp = parse_amplitude_prefactor(
+            self._resolve_training_setting("amplitude_prefactor", name)
+        )
+        if emu.amplitude_prefactor_enabled and emu.amplitude_prefactor is None:
+            md = trained_item or (
+                getattr(self, "fiducial_vector_metadata", {}) or {}
+            ).get(name)
+            if md is None and getattr(emu, "vector_metadata", None) is not None:
+                md = emu.vector_metadata
+            if md is None:
+                raise ValueError(
+                    f"[{name}] Loaded emulator has amplitude_prefactor_enabled=T "
+                    "but no amplitude_prefactor_state and no rose_vector_metadata "
+                    "to rebuild it. Retrain with amplitude_prefactor=T."
+                )
+            emu.amplitude_prefactor_enabled = True
+            emu.configure_amplitude_prefactor(
+                md,
+                spectra=self._resolve_training_setting(
+                    "amplitude_prefactor_spectra", name
+                ),
+            )
+        if ini_amp and emu.amplitude_prefactor is None:
+            raise ValueError(
+                f"[{name}] amplitude_prefactor=T in the ini, but the loaded "
+                "emulator was trained without amplitude_prefactor. The prefactor "
+                "cannot be applied after the fact (weights learned the unscaled "
+                "vector). Load an emulator trained with amplitude_prefactor=T "
+                "(e.g. rose_lssty1_nonlin_v4/emumodel_5), or retrain."
+            )
+        if (not ini_amp) and emu.amplitude_prefactor is not None:
+            logger.warning(
+                "[%s] amplitude_prefactor=F in the ini, but the loaded emulator "
+                "was trained with amplitude_prefactor=T. Keeping the saved "
+                "prefactor (required for correct predictions). The ini flag "
+                "only affects training, not trained_before loads.",
+                name,
+            )
+        if emu.amplitude_prefactor is not None:
+            logger.info(
+                "[%s] Loaded emulator uses amplitude_prefactor (%s): "
+                "WL=%d XC=%d GC=%d",
+                name,
+                emu.amplitude_prefactor.amp_family,
+                int(emu.amplitude_prefactor.wl_mask.sum()),
+                int(emu.amplitude_prefactor.xc_mask.sum()),
+                int(emu.amplitude_prefactor.gc_mask.sum()),
+            )
 
