@@ -10,8 +10,10 @@ diagnostics on those test points using the freshly trained emulator:
     the emulated data vectors and the true full-pipeline data vectors, plus a
     covariance-normalized residual ``|emu - truth| / sqrt(diag(C))``.
 (b) Delta chi^2 on the held-out test set, including debiased scatter metrics
-    ``MAD(Δχ² − median)``, ``std(Δχ² − median)``, and
+    ``MAD(Δχ² − median)``, ``std(Δχ² − median)``, ``max|Δχ² − median|``, and
     ``frac(|Δχ² − median| < 2)``, written to ``rose_convergence.txt``.
+    ``mad_pass`` requires ``MAD(r) <= delta_chi2_mad_threshold`` and, when
+    ``delta_chi2_max_abs_r > 0``, also ``max|r| <= delta_chi2_max_abs_r``.
 (c) Optional final-stage retrain loop (``kl_convergence = T``): the test set
     stays held out; new HPD training points are added until the MAD criterion
     (and optionally chain-based KL on ``kl_params``) is met. Passive
@@ -81,14 +83,6 @@ class RoseConvergenceMixin:
         )
         dchi2 = self._test_delta_chi2(emu_version=emu_version)
         self.convergence_results["delta_chi2"] = dchi2
-        self._append_rose_convergence_row(
-            emu_version=emu_version,
-            dchi2=dchi2,
-            kl_all=float("nan"),
-            kl_sel=float("nan"),
-            chain_kl_pass=False,
-            n_train_added=0,
-        )
 
         mad_pass = bool(dchi2.get("mad_pass", False))
         if mad_pass:
@@ -96,6 +90,16 @@ class RoseConvergenceMixin:
                 "Debiased Δχ² MAD=%.4g <= threshold %.4g; emulator accurate enough "
                 "(no extra retrain).",
                 dchi2["mad_r"], float(self.delta_chi2_mad_threshold),
+            )
+            # Still log IW KL vs previous on-disk emulator for the record.
+            self._log_iw_emu_for_version(emu_version)
+            self._append_rose_convergence_row(
+                emu_version=emu_version,
+                dchi2=dchi2,
+                kl_all=float("nan"),
+                kl_sel=float("nan"),
+                chain_kl_pass=False,
+                n_train_added=0,
             )
             self.kl_converged = True
             self.convergence_results["kl"] = {
@@ -109,6 +113,8 @@ class RoseConvergenceMixin:
                 "kl_convergence_chain = %s)",
                 bool(getattr(self, "kl_convergence_chain", False)),
             )
+            # Convergence / KL rows (including the initial emu version) are
+            # written inside the loop so baseline chain KL is not left as nan.
             self.convergence_results["kl"] = self._run_final_convergence_loop(
                 initial_dchi2=dchi2,
             )
@@ -118,6 +124,15 @@ class RoseConvergenceMixin:
                 "(MAD not passed: MAD=%.4g > %.4g).",
                 dchi2.get("mad_r", float("nan")),
                 float(self.delta_chi2_mad_threshold),
+            )
+            self._log_iw_emu_for_version(emu_version)
+            self._append_rose_convergence_row(
+                emu_version=emu_version,
+                dchi2=dchi2,
+                kl_all=float("nan"),
+                kl_sel=float("nan"),
+                chain_kl_pass=False,
+                n_train_added=0,
             )
             self.kl_converged = False
             self.convergence_results["kl"] = {
@@ -297,11 +312,20 @@ class RoseConvergenceMixin:
             mad_r = float(np.median(np.abs(resid)))
             std_r = float(np.std(resid))
             frac_abs_r_lt_2 = float(np.mean(np.abs(resid) < 2.0))
+            max_abs_r = float(np.max(np.abs(resid)))
         else:
-            mad_r = std_r = frac_abs_r_lt_2 = float("nan")
+            mad_r = std_r = frac_abs_r_lt_2 = max_abs_r = float("nan")
 
         thresh = float(getattr(self, "delta_chi2_mad_threshold", 1.0))
-        mad_pass = bool(np.isfinite(mad_r) and mad_r <= thresh)
+        max_cap = float(getattr(self, "delta_chi2_max_abs_r", 0.0))
+        mad_ok = bool(np.isfinite(mad_r) and mad_r <= thresh)
+        # Optional hard cap: catch rare catastrophic outliers MAD can miss.
+        # <= 0 disables the cap (backward-compatible default).
+        if max_cap > 0:
+            max_ok = bool(np.isfinite(max_abs_r) and max_abs_r <= max_cap)
+        else:
+            max_ok = True
+        mad_pass = bool(mad_ok and max_ok)
 
         results = {
             "delta_chi2": delta_chi2,
@@ -316,17 +340,29 @@ class RoseConvergenceMixin:
             "mad_r": mad_r,
             "std_r": std_r,
             "frac_abs_r_lt_2": frac_abs_r_lt_2,
+            "max_abs_r": max_abs_r,
             "mad_threshold": thresh,
+            "max_abs_r_threshold": max_cap,
             "mad_pass": mad_pass,
         }
 
         tag = self._emu_version_tag(emu_version)
-        logger.info(
-            "Delta chi^2 over %d valid test points (%s): mean=%.3g, "
-            "median=%.3g, MAD(r)=%.3g, std(r)=%.3g, frac(|r|<2)=%.3g, mad_pass=%s",
-            results["n_valid"], tag, results["mean"], median,
-            mad_r, std_r, frac_abs_r_lt_2, mad_pass,
-        )
+        if max_cap > 0:
+            logger.info(
+                "Delta chi^2 over %d valid test points (%s): mean=%.3g, "
+                "median=%.3g, MAD(r)=%.3g (thresh %.3g), max|r|=%.3g "
+                "(cap %.3g), std(r)=%.3g, frac(|r|<2)=%.3g, mad_pass=%s",
+                results["n_valid"], tag, results["mean"], median,
+                mad_r, thresh, max_abs_r, max_cap, std_r, frac_abs_r_lt_2, mad_pass,
+            )
+        else:
+            logger.info(
+                "Delta chi^2 over %d valid test points (%s): mean=%.3g, "
+                "median=%.3g, MAD(r)=%.3g, max|r|=%.3g, std(r)=%.3g, "
+                "frac(|r|<2)=%.3g, mad_pass=%s",
+                results["n_valid"], tag, results["mean"], median,
+                mad_r, max_abs_r, std_r, frac_abs_r_lt_2, mad_pass,
+            )
 
         self._plot_delta_chi2(results, emu_version=emu_version)
         return results
@@ -348,7 +384,7 @@ class RoseConvergenceMixin:
             if write_header:
                 f.write(
                     "emu_version\tn_test\tmad_r\tstd_r\tfrac_abs_r_lt_2\t"
-                    "median_dchi2\tmad_pass\tkl_all\tkl_sel\t"
+                    "max_abs_r\tmedian_dchi2\tmad_pass\tkl_all\tkl_sel\t"
                     "chain_kl_pass\tn_train_added\n"
                 )
             f.write(
@@ -356,6 +392,7 @@ class RoseConvergenceMixin:
                 f"{float(dchi2.get('mad_r', float('nan'))):.6e}\t"
                 f"{float(dchi2.get('std_r', float('nan'))):.6e}\t"
                 f"{float(dchi2.get('frac_abs_r_lt_2', float('nan'))):.6e}\t"
+                f"{float(dchi2.get('max_abs_r', float('nan'))):.6e}\t"
                 f"{float(dchi2.get('median', float('nan'))):.6e}\t"
                 f"{int(mad_pass)}\t"
                 f"{float(kl_all):.6e}\t{float(kl_sel):.6e}\t"
@@ -373,6 +410,11 @@ class RoseConvergenceMixin:
         drawn from the stashed tempered HPD. Optional untempered
         ``final_sampler`` chains drive a Jeffreys KL stop on ``kl_params``.
         Passive IW KL between consecutive emulators is logged to ``rose_kl.txt``.
+
+        For the first final-stage emulator (after the last tempered train):
+        - ``iw_emu`` compares it to the previous on-disk emulator
+        - ``untempered_chain`` KL (if enabled) is vs the last tempered chain
+          (importance-reweighted to the untempered posterior)
         """
         threshold = float(self.kl_threshold)
         max_retrain = int(self.kl_max_retrain)
@@ -381,11 +423,15 @@ class RoseConvergenceMixin:
         emu_version = int(getattr(self, "_current_emu_version", self.iterations + 1))
 
         theta_ref, logq = self._kl_reference_samples_from_hpd_stash()
-        logp_prev = (
-            self._emulated_log_posterior(theta_ref) if theta_ref is not None else None
+        # IW: current emu vs previous on-disk model (natural pair for this version).
+        logp_curr = self._log_iw_emu_for_version(
+            emu_version, theta_ref=theta_ref, logq=logq,
         )
+        logp_prev = logp_curr
 
         prev_chain = None
+        prev_logw = None
+        kl_all = kl_sel = float("nan")
         if use_chains:
             logger.info(
                 "Running baseline untempered %s chain on %s for chain-KL",
@@ -393,25 +439,59 @@ class RoseConvergenceMixin:
             )
             t_samp = self._run_untempered_convergence_chain(emu_version)
             self._append_timing_row(timing_iteration, 0.0, 0.0, t_samp)
-            prev_chain = np.asarray(self.chain, dtype=float).copy()
+            curr_chain = np.asarray(self.chain, dtype=float).copy()
             self._final_chain_already_sampled = True
-            # Baseline has no previous untempered chain → nan KL row for this emu.
+
+            # Baseline KL vs last tempered chain (untempered via importance weights).
+            tempered_chain, tempered_logw = self._tempered_stash_chain_and_logw()
+            kl_knn_all = kl_knn_sel = float("nan")
+            if (
+                tempered_chain is not None
+                and len(tempered_chain) > 1
+                and len(curr_chain) > 1
+            ):
+                (
+                    kl_all, kl_knn_all, kl_sel, kl_knn_sel, _
+                ) = self._chain_kl_metrics_between(
+                    tempered_chain, curr_chain,
+                    logw_a=tempered_logw, logw_b=None,
+                )
+                logger.info(
+                    "Baseline chain Jeffreys KL (%s vs last tempered): "
+                    "all=%.4g, sel=%.4g",
+                    self._emu_version_tag(emu_version), kl_all, kl_sel,
+                )
+            else:
+                logger.warning(
+                    "No usable tempered stash for baseline chain KL on %s",
+                    self._emu_version_tag(emu_version),
+                )
             self._append_rose_kl_row(
                 iteration=emu_version,
                 source="untempered_chain",
-                kl_gauss_all=float("nan"),
-                kl_knn_all=float("nan"),
-                kl_gauss_sel=float("nan"),
-                kl_knn_sel=float("nan"),
-                ess=float(len(prev_chain)),
+                kl_gauss_all=kl_all,
+                kl_knn_all=kl_knn_all,
+                kl_gauss_sel=kl_sel,
+                kl_knn_sel=kl_knn_sel,
+                ess=float(len(curr_chain)),
                 tempering=1.0,
             )
+            prev_chain = curr_chain
+            prev_logw = None
+
+        self._append_rose_convergence_row(
+            emu_version=emu_version,
+            dchi2=initial_dchi2,
+            kl_all=kl_all,
+            kl_sel=kl_sel,
+            chain_kl_pass=False,
+            n_train_added=0,
+        )
 
         attempt = 0
         converged = False
         reason = "max_retrain"
         dchi2 = initial_dchi2
-        kl_all = kl_sel = float("nan")
         mad_history = [float(initial_dchi2.get("mad_r", float("nan")))]
         kl_sel_history = []
 
@@ -467,6 +547,9 @@ class RoseConvergenceMixin:
                     self._emu_version_tag(emu_version), kl_iw_all, kl_iw_sel,
                     min(ess_all, ess_sel),
                 )
+            elif theta_ref is not None:
+                # Fallback if baseline IW failed (e.g. missing previous model).
+                logp_prev = self._emulated_log_posterior(theta_ref)
 
             kl_all = kl_sel = float("nan")
             chain_kl_pass = False
@@ -481,32 +564,11 @@ class RoseConvergenceMixin:
                 self._final_chain_already_sampled = True
                 kl_knn_all = kl_knn_sel = float("nan")
                 if prev_chain is not None and len(prev_chain) > 1 and len(curr_chain) > 1:
-                    kl_all = self._jeffreys_kl_between_chains(
-                        prev_chain, curr_chain, self._kl_all_param_indices()
-                    )
-                    kl_sel = self._jeffreys_kl_between_chains(
-                        prev_chain, curr_chain, self._kl_selected_param_indices()
-                    )
-                    # Optional k-NN on equal-weight subsamples (same spirit as
-                    # per-iteration tempered KL).
-                    n_sub = min(
-                        int(getattr(self, "kl_n_samples", 2000)),
-                        len(prev_chain),
-                        len(curr_chain),
-                    )
-                    idx_a = np.random.choice(len(prev_chain), size=n_sub, replace=False)
-                    idx_b = np.random.choice(len(curr_chain), size=n_sub, replace=False)
-                    kl_knn_all = _knn_kl_symmetric(
-                        prev_chain[idx_a][:, self._kl_all_param_indices()],
-                        curr_chain[idx_b][:, self._kl_all_param_indices()],
-                        k=int(getattr(self, "kl_knn_k", 3)),
-                        debias=bool(getattr(self, "kl_knn_debias", True)),
-                    )
-                    kl_knn_sel = _knn_kl_symmetric(
-                        prev_chain[idx_a][:, self._kl_selected_param_indices()],
-                        curr_chain[idx_b][:, self._kl_selected_param_indices()],
-                        k=int(getattr(self, "kl_knn_k", 3)),
-                        debias=bool(getattr(self, "kl_knn_debias", True)),
+                    (
+                        kl_all, kl_knn_all, kl_sel, kl_knn_sel, _
+                    ) = self._chain_kl_metrics_between(
+                        prev_chain, curr_chain,
+                        logw_a=prev_logw, logw_b=None,
                     )
                     chain_kl_pass = bool(np.isfinite(kl_sel) and kl_sel < threshold)
                     kl_sel_history.append(kl_sel)
@@ -527,6 +589,7 @@ class RoseConvergenceMixin:
                     tempering=1.0,
                 )
                 prev_chain = curr_chain
+                prev_logw = None
 
             self._append_rose_convergence_row(
                 emu_version=emu_version,
@@ -592,6 +655,136 @@ class RoseConvergenceMixin:
             return float(self._run_nautilus_sampling(tempering))
         return float(self._run_emcee_sampling(tempering))
 
+    def _tempered_stash_chain_and_logw(self):
+        """Return (chain, untempered log-weights) from the tempered HPD stash."""
+        stash = getattr(self, "_hpd_stash", None)
+        if not stash or stash.get("chain") is None or len(stash["chain"]) < 2:
+            return None, None
+        chain = np.asarray(stash["chain"], dtype=float)
+        n = len(chain)
+        logw = stash.get("chain_log_weights")
+        if logw is None or len(logw) != n:
+            logw = np.zeros(n, dtype=float)
+        else:
+            logw = np.asarray(logw, dtype=float).copy()
+        tempering = float(stash.get("chain_tempering", 1.0))
+        logpost = stash.get("chain_logpost")
+        if abs(tempering - 1.0) > 1e-12:
+            if logpost is None or len(logpost) != n:
+                logger.warning(
+                    "Stashed chain_logpost unavailable; cannot reweight "
+                    "tempering=%.4g for baseline chain KL.",
+                    tempering,
+                )
+            else:
+                logw = logw + (1.0 - tempering) * np.asarray(logpost, dtype=float)
+        return chain, logw
+
+    def _emulated_log_posterior_at_version(
+        self, theta: np.ndarray, emu_version: int
+    ) -> Optional[np.ndarray]:
+        """Evaluate emulated log-posterior under a previously saved emulator.
+
+        Temporarily loads ``emumodel_{emu_version}`` from ``save_dir``, then
+        restores the currently loaded emulator in memory.
+        """
+        path = os.path.join(self.save_dir, f"emumodel_{int(emu_version)}")
+        if not os.path.isdir(path):
+            logger.warning(
+                "Cannot evaluate log-posterior for %s: directory not found",
+                path,
+            )
+            return None
+        saved_emu = getattr(self, "emulator", None)
+        saved_indices = getattr(self, "emulator_output_indices", None)
+        saved_loaded_path = getattr(self, "_loaded_emu_path", None)
+        if saved_emu is None:
+            logger.warning(
+                "No current emulator to restore after loading %s; skipping",
+                path,
+            )
+            return None
+        try:
+            self.load_emulator(path)
+            return self._emulated_log_posterior(theta)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Failed to load/evaluate %s for IW KL: %s", path, exc,
+            )
+            return None
+        finally:
+            self.emulator = saved_emu
+            if saved_indices is not None:
+                self.emulator_output_indices = saved_indices
+            self._loaded_emu_path = saved_loaded_path
+            if getattr(self, "emu_module", None) is not None:
+                self.emu_module.data.set_emulator(saved_emu)
+                if saved_indices is not None:
+                    self.emu_module.data.output_indices = saved_indices
+
+    def _log_iw_emu_for_version(
+        self,
+        emu_version: int,
+        theta_ref: Optional[np.ndarray] = None,
+        logq: Optional[np.ndarray] = None,
+    ) -> Optional[np.ndarray]:
+        """Log passive IW KL of ``emumodel_{v}`` vs ``emumodel_{v-1}``.
+
+        Returns the current emulator's log-posterior on ``theta_ref`` (for
+        chaining into the next IW comparison), or ``None`` if unavailable.
+        """
+        if theta_ref is None or logq is None:
+            theta_ref, logq = self._kl_reference_samples_from_hpd_stash()
+        if theta_ref is None or logq is None:
+            logger.warning(
+                "No tempered reference samples; skipping IW KL for %s",
+                self._emu_version_tag(emu_version),
+            )
+            return None
+
+        logp_curr = self._emulated_log_posterior(theta_ref)
+        prev_version = int(emu_version) - 1
+        if prev_version < 1:
+            logger.info(
+                "No previous emulator before %s; skipping IW KL",
+                self._emu_version_tag(emu_version),
+            )
+            return logp_curr
+
+        logp_prev = self._emulated_log_posterior_at_version(theta_ref, prev_version)
+        if logp_prev is None:
+            logger.warning(
+                "Skipping IW KL for %s (could not evaluate previous emulator)",
+                self._emu_version_tag(emu_version),
+            )
+            return logp_curr
+
+        kl_iw_all, ess_all = self._gaussian_kl_via_importance(
+            theta_ref, logp_prev, logq, logp_curr,
+            param_indices=self._kl_all_param_indices(),
+        )
+        kl_iw_sel, ess_sel = self._gaussian_kl_via_importance(
+            theta_ref, logp_prev, logq, logp_curr,
+            param_indices=self._kl_selected_param_indices(),
+        )
+        self._append_rose_kl_row(
+            iteration=int(emu_version),
+            source="iw_emu",
+            kl_gauss_all=kl_iw_all,
+            kl_knn_all=float("nan"),
+            kl_gauss_sel=kl_iw_sel,
+            kl_knn_sel=float("nan"),
+            ess=min(ess_all, ess_sel),
+            tempering=1.0,
+        )
+        logger.info(
+            "Passive IW KL for %s vs %s: all=%.4g, sel=%.4g (ESS~%.0f)",
+            self._emu_version_tag(emu_version),
+            self._emu_version_tag(prev_version),
+            kl_iw_all, kl_iw_sel, min(ess_all, ess_sel),
+        )
+        return logp_curr
+
     def _kl_reference_samples_from_hpd_stash(self):
         """IW reference samples from the stashed tempered chain (not overwritten)."""
         stash = getattr(self, "_hpd_stash", None)
@@ -609,6 +802,64 @@ class RoseConvergenceMixin:
         n_sub = min(int(self.kl_n_samples), n)
         idx = np.random.choice(n, size=n_sub, replace=False)
         return chain[idx], tempering_prev * logpost[idx]
+
+    def _chain_kl_metrics_between(
+        self,
+        chain_a: np.ndarray,
+        chain_b: np.ndarray,
+        logw_a: Optional[np.ndarray] = None,
+        logw_b: Optional[np.ndarray] = None,
+    ) -> Tuple[float, float, float, float, float]:
+        """Gaussian + kNN Jeffreys KL (all + selected) between two chains.
+
+        Optional log-weights reweight each chain to the untempered posterior
+        (used when comparing a tempered stash to an untempered chain).
+        Returns ``(kl_gauss_all, kl_knn_all, kl_gauss_sel, kl_knn_sel, ess)``.
+        """
+        chain_a = np.asarray(chain_a, dtype=float)
+        chain_b = np.asarray(chain_b, dtype=float)
+        n_a, n_b = len(chain_a), len(chain_b)
+        if n_a < 2 or n_b < 2:
+            return (
+                float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
+            )
+
+        if logw_a is None or len(logw_a) != n_a:
+            logw_a = np.zeros(n_a, dtype=float)
+        else:
+            logw_a = np.asarray(logw_a, dtype=float)
+        if logw_b is None or len(logw_b) != n_b:
+            logw_b = np.zeros(n_b, dtype=float)
+        else:
+            logw_b = np.asarray(logw_b, dtype=float)
+
+        def _one(indices: Sequence[int]) -> Tuple[float, float, float]:
+            idx = np.asarray(indices, dtype=int)
+            a = chain_a[:, idx]
+            b = chain_b[:, idx]
+            moments_a = self._weighted_moments(a, logw_a)
+            moments_b = self._weighted_moments(b, logw_b)
+            if moments_a is None or moments_b is None:
+                return float("nan"), float("nan"), float("nan")
+            mean_a, cov_a, ess_a = moments_a
+            mean_b, cov_b, ess_b = moments_b
+            kl_gauss = 0.5 * (
+                _gaussian_kl(mean_a, cov_a, mean_b, cov_b)
+                + _gaussian_kl(mean_b, cov_b, mean_a, cov_a)
+            )
+            n_sub = min(int(getattr(self, "kl_n_samples", 2000)), n_a, n_b)
+            samp_a = self._resample_equal_weight(a, logw_a, cov_a, n_sub)
+            samp_b = self._resample_equal_weight(b, logw_b, cov_b, n_sub)
+            kl_knn = _knn_kl_symmetric(
+                samp_a, samp_b,
+                k=int(getattr(self, "kl_knn_k", 3)),
+                debias=bool(getattr(self, "kl_knn_debias", True)),
+            )
+            return float(kl_gauss), float(kl_knn), float(min(ess_a, ess_b))
+
+        kl_g_all, kl_k_all, ess = _one(self._kl_all_param_indices())
+        kl_g_sel, kl_k_sel, _ = _one(self._kl_selected_param_indices())
+        return kl_g_all, kl_k_all, kl_g_sel, kl_k_sel, ess
 
     def _jeffreys_kl_between_chains(
         self,
@@ -999,7 +1250,8 @@ class RoseConvergenceMixin:
         for key in (
             "delta_chi2", "chi2_true", "chi2_emu",
             "mean", "std", "median", "abs_median", "abs_max", "n_valid",
-            "mad_r", "std_r", "frac_abs_r_lt_2", "mad_threshold", "mad_pass",
+            "mad_r", "std_r", "frac_abs_r_lt_2", "max_abs_r",
+            "mad_threshold", "max_abs_r_threshold", "mad_pass",
         ):
             if key in dchi2:
                 save_dict[f"delta_chi2/{key}"] = dchi2[key]
@@ -1094,6 +1346,7 @@ class RoseConvergenceMixin:
         plt.ylabel("count", fontsize=16)
         plt.title(
             rf"{tag}: MAD(r)={result.get('mad_r', float('nan')):.2g}, "
+            rf"max$|r|$={result.get('max_abs_r', float('nan')):.2g}, "
             rf"med$\Delta\chi^2$={result['median']:.2g}",
             fontsize=13,
         )

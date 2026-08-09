@@ -33,6 +33,8 @@
 - `pipeline_setup.py` - Pipeline setup and configuration
 - `emulator_management.py` - Emulator training and loading
 - `nn_emulator.py` - Neural network emulator
+- `shared_trunk.py` - Probe partition and parameter routing for `nn_model = SharedTrunkMLP` / `SharedTrunkEmbMLP`
+- `bin_embedding.py`- Tomographic bin-pair embedding layout for `nn_model = EmbMLP` / `SharedTrunkEmbMLP`
 - `data_processing.py` - Data processing and sample generation
 - `sampling.py` - MCMC sampling methods
 - `convergence.py` - Emulator accuracy, Δχ², and Kullback-Leibler divergence (KL) diagnostics

@@ -348,24 +348,7 @@ class RoseSamplingMixin:
         if len(params_nn_norm.shape) == 1:
             params_nn_norm = tf.expand_dims(params_nn_norm, 0)
 
-        layers = [params_nn_norm]
-        if emulator.cp_nn.architecture_type == "MLP":
-            for i in range(emulator.cp_nn.n_layers - 1):
-                linear_out = (
-                    tf.matmul(layers[-1], emulator.cp_nn.W[i]) + emulator.cp_nn.b[i]
-                )
-                activated = emulator.cp_nn.activation(
-                    linear_out, emulator.cp_nn.alphas[i], emulator.cp_nn.betas[i]
-                )
-                layers.append(activated)
-            output = tf.matmul(layers[-1], emulator.cp_nn.W[-1]) + emulator.cp_nn.b[-1]
-        else:
-            raise NotImplementedError(
-                f"NUTS autodiff not implemented for architecture "
-                f"{emulator.cp_nn.architecture_type}"
-            )
-
-        pred_norm = output * emulator.cp_nn.features_std + emulator.cp_nn.features_mean
+        pred_norm = emulator.cp_nn.predictions_normalized_tf(params_nn_norm)
         if len(pred_norm.shape) == 2:
             pred_norm = pred_norm[0]
 

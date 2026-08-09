@@ -282,8 +282,9 @@ class RoseConfigMixin:
         # Final-stage convergence (opt-in via kl_convergence = T).
         # The held-out test set is NEVER folded into training. After the last
         # tempered train, ROSE scores Δχ² on that holdout and stops when
-        # MAD(Δχ² − median) <= delta_chi2_mad_threshold. If not, it adds new
-        # HPD training points and retrains up to kl_max_retrain times.
+        # MAD(Δχ² − median) <= delta_chi2_mad_threshold (and, if set, the
+        # optional max|r| hard cap). If not, it adds new HPD training points
+        # and retrains up to kl_max_retrain times.
         # With kl_convergence_chain = T, each (re)trained emulator also gets an
         # untempered final_sampler chain; Jeffreys KL on kl_params vs the
         # previous chain can stop the loop when < kl_threshold.
@@ -296,6 +297,13 @@ class RoseConfigMixin:
         self.kl_n_samples = self.read_ini("kl_n_samples", int, 7000)
         self.delta_chi2_mad_threshold = self.read_ini(
             "delta_chi2_mad_threshold", float, 1.0
+        )
+        # Optional hard cap on debiased residuals r_i = Δχ²_i − median.
+        # mad_pass also requires max|r_i| <= this value. <= 0 disables the
+        # cap; typical values are 5–10 to catch rare catastrophic failures
+        # that MAD alone can miss.
+        self.delta_chi2_max_abs_r = self.read_ini(
+            "delta_chi2_max_abs_r", float, 0.0
         )
         # Neighbour order for the per-iteration sample-based (k-NN) KL
         # estimator. k=1 is the classic Wang–Kulkarni–Verdú estimator; k=3–5
@@ -447,6 +455,7 @@ class RoseConfigMixin:
             raise ValueError("kl_knn_k must be >= 1")
         if self.delta_chi2_mad_threshold <= 0:
             raise ValueError("delta_chi2_mad_threshold must be > 0")
+        # delta_chi2_max_abs_r <= 0 means the hard cap is disabled.
         if self.kl_convergence_chain and not self.kl_convergence:
             logger.warning(
                 "kl_convergence_chain=T has no effect unless kl_convergence=T"
@@ -797,6 +806,62 @@ class RoseConfigMixin:
         self.loss_function = _parse_per_likelihood(
             self.read_ini("loss_function", str, "standard"), str
         )
+        # Neural network architecture (scalar or per-likelihood dict).
+        # ``MLP``: continuous params -> the whole theory vector.
+        # ``EmbMLP``: params + learned tomographic bin-pair embeddings -> one
+        # bin pair's ell nodes, gathered back into the theory vector.
+        # ``SharedTrunkMLP``: one trunk over the cosmological parameters shared
+        # by all probes, then one head per probe (shear / cross / clustering)
+        # fed with the trunk latent plus only that probe's nuisance parameters.
+        # ``SharedTrunkEmbMLP``: the same trunk and probe heads, but each head
+        # predicts one tomographic bin pair's ell nodes, so all pairs of a
+        # probe share that head's weights (bin identity enters through a
+        # lookup table shared across probes).
+        self.nn_model = _parse_per_likelihood(
+            self.read_ini("nn_model", str, "MLP"), str
+        )
+        for model in _setting_values(self.nn_model):
+            if model not in (
+                "MLP", "EmbMLP", "SharedTrunkMLP", "SharedTrunkEmbMLP"
+            ):
+                raise ValueError(
+                    f"nn_model must be one of 'MLP', 'EmbMLP', "
+                    f"'SharedTrunkMLP', 'SharedTrunkEmbMLP'; got {model!r}"
+                )
+        # Per-probe head widths (shared-trunk models only). ``n_hidden`` becomes
+        # the shared trunk; blank defaults the heads to the last two trunk widths.
+        self.head_n_hidden = _parse_number_list_setting(
+            self.read_ini("head_n_hidden", str, ""), int
+        )
+        for widths in _setting_values(self.head_n_hidden):
+            if widths is not None and (not widths or any(n < 1 for n in widths)):
+                raise ValueError(
+                    "head_n_hidden must be a non-empty list of integers >= 1 "
+                    "(or blank to derive it from n_hidden)"
+                )
+        # Feed the raw cosmological parameters to every head alongside the
+        # trunk latent, so the trunk width does not cap cosmological
+        # sensitivity (shared-trunk models only).
+        self.trunk_skip_connection = self.read_ini(
+            "trunk_skip_connection", bool, True
+        )
+        # Parameters carried by the shared trunk (shared-trunk models only). Blank
+        # defaults to every varied parameter in the cosmological_parameters
+        # section. Space- or comma-separated ``section--name`` entries.
+        _trunk_params_raw = self.read_ini("trunk_params", str, "")
+        _trunk_params_tok = [
+            p.strip() for p in _trunk_params_raw.replace(",", " ").split() if p.strip()
+        ]
+        self.trunk_params = _trunk_params_tok or None
+        # Width of each learned bin embedding (EmbMLP only). With 5 tomographic
+        # bins per side, a dimension >= 5 is equivalent to a one-hot input, so
+        # smaller values act as a prior that neighbouring bins behave similarly.
+        self.embedding_dim = _parse_per_likelihood(
+            self.read_ini("embedding_dim", str, "4"), int
+        )
+        for dim in _setting_values(self.embedding_dim):
+            if dim < 1:
+                raise ValueError(f"embedding_dim must be >= 1; got {dim}")
         self._validate_loss_transform_compatibility()
 
         if any(
@@ -838,10 +903,6 @@ class RoseConfigMixin:
             logger.info(f"Final sampler is emcee, so using the same settings as the intermediate sampling cycles")
 
         
-        # Neural network architecture (scalar or per-likelihood dict)
-        self.nn_model = _parse_per_likelihood(
-            self.read_ini("nn_model", str, "MLP"), str
-        )
         # Hidden-layer widths for the MLP. Global: ``n_hidden = 512 512 512``.
         # Per-likelihood: ``n_hidden = lsst:512,512,512 desi_bao:256,256,256,256``.
         # Defaults to four layers of 512 (the previous hard-coded ROSE layout).
@@ -888,7 +949,8 @@ class RoseConfigMixin:
         if pipe_names and pipe_names != "no_likelihood_names_sentinel":
             like_names = [str(n) for n in pipe_names]
         for attr in (
-            "loss_function", "data_transformation", "amplitude_prefactor"
+            "loss_function", "data_transformation", "amplitude_prefactor",
+            "nn_model", "spectrum_emulators",
         ):
             setting = getattr(self, attr)
             if isinstance(setting, dict):
@@ -908,12 +970,42 @@ class RoseConfigMixin:
                     self._peek_training_setting(self.data_transformation, name)
                 ).strip()
                 amp_raw = self._peek_training_setting(self.amplitude_prefactor, name)
+                model = str(self._peek_training_setting(self.nn_model, name)).strip()
+                split_raw = self._peek_training_setting(
+                    self.spectrum_emulators, name
+                )
             except KeyError:
                 # Per-likelihood dict without this name and without __default__:
                 # leave for train-time resolution.
                 continue
 
             label = "all likelihoods" if name == "*" else f"likelihood '{name}'"
+            if model == "EmbMLP" and transform in pca_transforms:
+                raise ValueError(
+                    f"Incompatible ROSE settings for {label}: "
+                    f"nn_model=EmbMLP cannot be combined with "
+                    f"data_transformation={transform}. EmbMLP predicts one "
+                    "tomographic bin pair's ell nodes at a time, but PCA "
+                    "coefficients have no bin-pair structure."
+                )
+            shared_trunk = model in ("SharedTrunkMLP", "SharedTrunkEmbMLP")
+            if shared_trunk and transform in pca_transforms:
+                raise ValueError(
+                    f"Incompatible ROSE settings for {label}: "
+                    f"nn_model={model} cannot be combined with "
+                    f"data_transformation={transform}. Each head predicts one "
+                    "probe's modes, but PCA coefficients mix probes and have "
+                    "no per-probe structure."
+                )
+            if shared_trunk and parse_amplitude_prefactor(split_raw):
+                raise ValueError(
+                    f"Incompatible ROSE settings for {label}: "
+                    f"nn_model={model} cannot be combined with "
+                    "spectrum_emulators=T. Both split the theory vector by "
+                    "probe; the shared trunk keeps them in one network so the "
+                    "cosmology is learned once instead of once per probe. Set "
+                    "spectrum_emulators=F."
+                )
             if loss != "weighted_w_cov":
                 continue
 

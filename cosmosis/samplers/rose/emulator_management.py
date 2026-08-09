@@ -303,10 +303,19 @@ class RoseEmulatorManagementMixin:
             spectra = self._resolve_training_setting(
                 "amplitude_prefactor_spectra", name
             )
+        nn_model = str(self._resolve_training_setting("nn_model", name))
+        if nn_model in (
+            "EmbMLP", "SharedTrunkMLP", "SharedTrunkEmbMLP"
+        ) and not metadata:
+            raise ValueError(
+                f"nn_model={nn_model} for '{name}' requires fiducial vector metadata "
+                "(name/bin1/bin2, or angle+bin1+bin2 for name inference)."
+            )
+        head_n_hidden = self._resolve_optional_training_setting("head_n_hidden", name)
         emu = NNEmulator(
             model_parameters,
             np.arange(n_out),
-            self._resolve_training_setting("nn_model", name),
+            nn_model,
             self._resolve_training_setting("loss_function", name),
             self.iterations + 1,
             self._resolve_training_setting("data_transformation", name),
@@ -316,6 +325,10 @@ class RoseEmulatorManagementMixin:
             amplitude_prefactor=self._resolve_training_setting(
                 "amplitude_prefactor", name
             ),
+            embedding_dim=self._resolve_training_setting("embedding_dim", name),
+            head_n_hidden=list(head_n_hidden) if head_n_hidden else None,
+            trunk_skip_connection=self.trunk_skip_connection,
+            trunk_params=self.trunk_params,
         )
         emu.configure_amplitude_prefactor(metadata, spectra=spectra)
         if str(

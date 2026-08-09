@@ -31,10 +31,17 @@ import scipy
 import scipy.stats
 
 from .amplitude_prefactor import BlockAmplitudePrefactor, parse_amplitude_prefactor
+from .bin_embedding import build_bin_pair_spec
+from .shared_trunk import build_shared_trunk_spec
 from .vector_blocks import iter_bin_pairs
 from .utils import SIGNED_LOG_NORM_TRANSFORM_SCALE
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Architectures whose weights are one flat dense stack (params -> outputs).
+DENSE_ARCHITECTURES = ("MLP", "EmbMLP")
+# Architectures with a cosmology trunk shared across probe-specific heads.
+SHARED_TRUNK_ARCHITECTURES = ("SharedTrunkMLP", "SharedTrunkEmbMLP")
 
 # Set TensorFlow data type
 DTYPE = tf.float32
@@ -92,7 +99,12 @@ class CosmoPowerNN(tf.keras.Model):
         trainable: Whether model parameters are trainable
         optimizer: TensorFlow optimizer to use
         verbose: Whether to print detailed information
-        architecture_type: Type of architecture ('MLP' or implement other architecture of your choice)
+        architecture_type: 'MLP', 'EmbMLP', 'SharedTrunkMLP' or 'SharedTrunkEmbMLP'
+        shared_trunk_spec: Probe partition / parameter routing (shared-trunk only)
+        head_n_hidden: Per-probe head widths (shared-trunk only); defaults to
+            the last two trunk widths
+        trunk_skip_connection: Feed the raw cosmological parameters to each head
+            alongside the trunk latent (shared-trunk only)
     """
     
     def __init__(self,
@@ -112,11 +124,23 @@ class CosmoPowerNN(tf.keras.Model):
                  loss_function: str = "standard",
                  loss_data_feat: Optional[np.ndarray] = None,
                  loss_inv_feat: Optional[np.ndarray] = None,
+                 bin_pair_spec: Optional[Dict[str, Any]] = None,
+                 embedding_dim: int = 4,
+                 shared_trunk_spec: Optional[Dict[str, Any]] = None,
+                 head_n_hidden: Optional[List[int]] = None,
+                 trunk_skip_connection: bool = True,
                  **kwargs):
         
         super(CosmoPowerNN, self).__init__(**kwargs)
         
         self.architecture_type = architecture_type
+        # EmbMLP only; restore() overwrites these from the saved model.
+        self.bin_pair_spec = bin_pair_spec
+        self.embedding_dim = int(embedding_dim)
+        # SharedTrunkMLP only; restore() overwrites these from the saved model.
+        self.shared_trunk_spec = shared_trunk_spec
+        self.head_n_hidden = list(head_n_hidden) if head_n_hidden else []
+        self.trunk_skip_connection = bool(trunk_skip_connection)
         self.verbose = verbose
         self.loss_data_feat = None
         self.loss_inv_feat = None
@@ -165,14 +189,8 @@ class CosmoPowerNN(tf.keras.Model):
         self._build_network(trainable)
         
         # If we restored from file, assign loaded weights to Variables
-        if restore and hasattr(self, 'W_'):
-            if self.architecture_type == "MLP":
-                for i in range(len(self.W_)):
-                    self.W[i].assign(self.W_[i])
-                    self.b[i].assign(self.b_[i])
-                for i in range(len(self.alphas_)):
-                    self.alphas[i].assign(self.alphas_[i])
-                    self.betas[i].assign(self.betas_[i])
+        if restore:
+            self.restore_emulator_parameters()
         
         # Set up optimizer
         self.optimizer = optimizer or tf.keras.optimizers.Adam()
@@ -224,15 +242,214 @@ class CosmoPowerNN(tf.keras.Model):
         """Build the neural network architecture."""
         if self.architecture_type == "MLP":
             self._build_mlp_network(trainable)
+        elif self.architecture_type == "EmbMLP":
+            self._build_embmlp_network(trainable)
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            self._build_shared_trunk_network(trainable)
         else:
             raise ValueError(f"Unknown architecture type: {self.architecture_type}")
+
+    def _build_embmlp_network(self, trainable: bool) -> None:
+        """Build the bin-pair-conditioned MLP.
+
+        The trunk maps ``[params | probe emb | slot1 emb | slot2 emb]`` to one
+        bin pair's ell nodes, so its output width is the shared ell grid rather
+        than the full theory vector. Pair predictions are gathered back into
+        flat-vector order in :meth:`_embmlp_core`.
+        """
+        if not self.bin_pair_spec:
+            raise ValueError(
+                "architecture_type='EmbMLP' requires bin_pair_spec "
+                "(build it with bin_embedding.build_bin_pair_spec)"
+            )
+        spec = self.bin_pair_spec
+        if int(spec["n_modes"]) != int(self.n_modes):
+            raise ValueError(
+                f"EmbMLP: bin_pair_spec covers {spec['n_modes']} modes but the "
+                f"network declares {self.n_modes}"
+            )
+
+        self.n_pairs = int(spec["n_pairs"])
+        self.n_ell_grid = int(spec["n_ell_grid"])
+        self.slot_rows = tf.constant(
+            np.asarray(spec["slot_rows"], dtype=np.int64), dtype=tf.int64
+        )
+        self.gather_index = tf.constant(
+            np.asarray(spec["gather_index"], dtype=np.int64), dtype=tf.int64
+        )
+        self.n_slots = int(self.slot_rows.shape[1])
+
+        trunk_input = self.n_parameters + self.n_slots * self.embedding_dim
+        self.architecture = [trunk_input] + self.n_hidden + [self.n_ell_grid]
+        self.n_layers = len(self.architecture) - 1
+
+        self.E = tf.Variable(
+            tf.random.normal([int(spec["table_size"]), self.embedding_dim], 0., 1e-1),
+            name="bin_embedding",
+            trainable=trainable,
+        )
+        self._create_dense_variables(trainable)
 
     def _build_mlp_network(self, trainable: bool) -> None:
         """Build MLP architecture with custom activation functions."""
         # Architecture definition
         self.architecture = [self.n_parameters] + self.n_hidden + [self.n_modes]
         self.n_layers = len(self.architecture) - 1
-        
+        self._create_dense_variables(trainable)
+
+    @property
+    def _uses_bin_embedding(self) -> bool:
+        """True when each head predicts one bin pair's ell nodes at a time."""
+        return self.architecture_type == "SharedTrunkEmbMLP"
+
+    def _build_shared_trunk_network(self, trainable: bool) -> None:
+        """Build one cosmology trunk plus one head per probe.
+
+        The trunk maps the cosmological parameters to a latent ``z`` that every
+        probe reuses; each head maps ``[z | cosmo params | that probe's nuisance
+        params]`` to that probe's modes. Head outputs are concatenated and
+        gathered back into likelihood order in :meth:`_shared_trunk_core_tf`.
+
+        For ``SharedTrunkEmbMLP`` the head input also carries two bin-embedding
+        rows and the head emits a single bin pair's ell nodes, so every pair of
+        a probe shares that head's weights.
+
+        Unlike :meth:`_create_dense_variables`, the trunk activates *every*
+        layer: its output is a hidden representation, not a prediction.
+        """
+        if not self.shared_trunk_spec:
+            raise ValueError(
+                f"architecture_type='{self.architecture_type}' requires "
+                "shared_trunk_spec (build it with "
+                "shared_trunk.build_shared_trunk_spec)"
+            )
+        spec = self.shared_trunk_spec
+        if int(spec["n_modes"]) != int(self.n_modes):
+            raise ValueError(
+                f"{self.architecture_type}: shared_trunk_spec covers "
+                f"{spec['n_modes']} modes but the network declares "
+                f"{self.n_modes}"
+            )
+        if self._uses_bin_embedding and "per_probe_pairs" not in spec:
+            raise ValueError(
+                "architecture_type='SharedTrunkEmbMLP' requires a "
+                "shared_trunk_spec built with bin_embedding=True"
+            )
+
+        self.probe_names = [str(p) for p in spec["probes"]]
+        self.trunk_param_index = tf.constant(
+            np.asarray(spec["trunk_param_index"], dtype=np.int64), dtype=tf.int64
+        )
+        self.head_param_index = [
+            tf.constant(np.asarray(idx, dtype=np.int64), dtype=tf.int64)
+            for idx in spec["head_param_index"]
+        ]
+        self.mode_gather_index = tf.constant(
+            np.asarray(spec["gather_index"], dtype=np.int64), dtype=tf.int64
+        )
+
+        if not self.head_n_hidden:
+            # Heads default to the last two trunk widths (or the only one).
+            self.head_n_hidden = list(self.n_hidden[-2:])
+
+        n_trunk_in = int(np.asarray(spec["trunk_param_index"]).size)
+        self.trunk_architecture = [n_trunk_in] + list(self.n_hidden)
+        latent = self.trunk_architecture[-1]
+        # The skip connection lets a head see the raw cosmology as well as the
+        # latent, so the trunk width does not cap cosmological sensitivity.
+        head_shared_in = latent + (n_trunk_in if self.trunk_skip_connection else 0)
+
+        self.trunk_W, self.trunk_b, self.trunk_alphas, self.trunk_betas = (
+            self._dense_block_variables(
+                self.trunk_architecture, trainable, "trunk", activate_last=True
+            )
+        )
+
+        if self._uses_bin_embedding:
+            pairs = spec["per_probe_pairs"]
+            self.head_slot_rows = [
+                tf.constant(np.asarray(p["slot_rows"], dtype=np.int64), dtype=tf.int64)
+                for p in pairs
+            ]
+            self.head_n_pairs = [int(p["n_pairs"]) for p in pairs]
+            self.head_n_ell_grid = [int(p["n_ell_grid"]) for p in pairs]
+            self.n_slots = int(np.asarray(pairs[0]["slot_rows"]).shape[1])
+            self.E = tf.Variable(
+                tf.random.normal(
+                    [int(spec["table_size"]), self.embedding_dim], 0., 1e-1
+                ),
+                name="bin_embedding",
+                trainable=trainable,
+            )
+
+        self.head_architectures = []
+        self.head_W, self.head_b, self.head_alphas, self.head_betas = [], [], [], []
+        for i, probe in enumerate(self.probe_names):
+            n_head_params = int(np.asarray(spec["head_param_index"][i]).size)
+            if self._uses_bin_embedding:
+                head_in = (
+                    head_shared_in
+                    + n_head_params
+                    + self.n_slots * self.embedding_dim
+                )
+                head_out = self.head_n_ell_grid[i]
+            else:
+                head_in = head_shared_in + n_head_params
+                head_out = int(np.asarray(spec["probe_mode_index"][i]).size)
+            widths = [head_in] + list(self.head_n_hidden) + [head_out]
+            self.head_architectures.append(widths)
+            W, b, alphas, betas = self._dense_block_variables(
+                widths, trainable, f"head_{i}", activate_last=False
+            )
+            self.head_W.append(W)
+            self.head_b.append(b)
+            self.head_alphas.append(alphas)
+            self.head_betas.append(betas)
+
+        logger.info(
+            "%s: trunk %s shared by %d head(s) %s",
+            self.architecture_type,
+            self.trunk_architecture,
+            len(self.probe_names),
+            {p: w for p, w in zip(self.probe_names, self.head_architectures)},
+        )
+
+    def _dense_block_variables(
+        self,
+        widths: List[int],
+        trainable: bool,
+        prefix: str,
+        activate_last: bool = False,
+    ) -> Tuple[List[tf.Variable], List[tf.Variable], List[tf.Variable], List[tf.Variable]]:
+        """Allocate weights/biases/activation parameters for one dense block."""
+        W, b, alphas, betas = [], [], [], []
+        n_layers = len(widths) - 1
+        for i in range(n_layers):
+            W.append(tf.Variable(
+                tf.random.normal([widths[i], widths[i + 1]], 0., 1e-3),
+                name=f"{prefix}_W_{i}",
+                trainable=trainable,
+            ))
+            b.append(tf.Variable(
+                tf.zeros([widths[i + 1]]),
+                name=f"{prefix}_b_{i}",
+                trainable=trainable,
+            ))
+        for i in range(n_layers if activate_last else n_layers - 1):
+            alphas.append(tf.Variable(
+                tf.random.normal([widths[i + 1]]),
+                name=f"{prefix}_alphas_{i}",
+                trainable=trainable,
+            ))
+            betas.append(tf.Variable(
+                tf.random.normal([widths[i + 1]]),
+                name=f"{prefix}_betas_{i}",
+                trainable=trainable,
+            ))
+        return W, b, alphas, betas
+
+    def _create_dense_variables(self, trainable: bool) -> None:
+        """Allocate dense weights/biases and activation parameters."""
         # Initialize weights and biases
         self.W, self.b, self.alphas, self.betas = [], [], [], []
         
@@ -290,6 +507,122 @@ class CosmoPowerNN(tf.keras.Model):
         sigmoid_part = tf.sigmoid(alpha * x)
         return (beta + (1.0 - beta) * sigmoid_part) * x
 
+    def _dense_stack_tf(self, h: tf.Tensor) -> tf.Tensor:
+        """Run the shared dense trunk (hidden layers + linear output)."""
+        for i in range(self.n_layers - 1):
+            linear_out = tf.matmul(h, self.W[i]) + self.b[i]
+            h = self.activation(linear_out, self.alphas[i], self.betas[i])
+        return tf.matmul(h, self.W[-1]) + self.b[-1]
+
+    def _embmlp_core_tf(self, x: tf.Tensor) -> tf.Tensor:
+        """Evaluate every bin pair, then gather back into flat-vector order.
+
+        Pairs are stacked along the batch axis, so all pairs share the trunk
+        weights and differ only through their embedding rows.
+        """
+        batch = tf.shape(x)[0]
+        # (n_pairs, n_slots * embedding_dim): fixed for a trained model.
+        emb = tf.reshape(
+            tf.gather(self.E, self.slot_rows),
+            [self.n_pairs, self.n_slots * self.embedding_dim],
+        )
+        x_pairs = tf.tile(tf.expand_dims(x, 1), [1, self.n_pairs, 1])
+        emb_pairs = tf.tile(tf.expand_dims(emb, 0), [batch, 1, 1])
+        h = tf.reshape(
+            tf.concat([x_pairs, emb_pairs], axis=-1),
+            [-1, self.architecture[0]],
+        )
+        out = self._dense_stack_tf(h)
+        out = tf.reshape(out, [batch, self.n_pairs * self.n_ell_grid])
+        return tf.gather(out, self.gather_index, axis=1)
+
+    def _run_dense_block_tf(
+        self,
+        h: tf.Tensor,
+        W: List[tf.Variable],
+        b: List[tf.Variable],
+        alphas: List[tf.Variable],
+        betas: List[tf.Variable],
+    ) -> tf.Tensor:
+        """Run one dense block; layers past ``len(alphas)`` stay linear."""
+        n_activated = len(alphas)
+        for i in range(len(W)):
+            linear_out = tf.matmul(h, W[i]) + b[i]
+            if i < n_activated:
+                h = self.activation(linear_out, alphas[i], betas[i])
+            else:
+                h = linear_out
+        return h
+
+    def _shared_trunk_core_tf(self, x: tf.Tensor) -> tf.Tensor:
+        """Run the shared cosmology trunk, then each probe head.
+
+        Heads write disjoint slices of the theory vector, so their outputs are
+        concatenated and gathered back into likelihood order. For
+        ``SharedTrunkEmbMLP`` a head's bin pairs are stacked along the batch
+        axis, so they all share that head's weights and differ only through
+        their embedding rows.
+        """
+        trunk_in = tf.gather(x, self.trunk_param_index, axis=1)
+        z = self._run_dense_block_tf(
+            trunk_in, self.trunk_W, self.trunk_b, self.trunk_alphas, self.trunk_betas
+        )
+        if self.trunk_skip_connection:
+            z = tf.concat([z, trunk_in], axis=1)
+
+        batch = tf.shape(x)[0]
+        outputs = []
+        for i in range(len(self.probe_names)):
+            head_in = z
+            if int(self.head_param_index[i].shape[0]) > 0:
+                head_in = tf.concat(
+                    [z, tf.gather(x, self.head_param_index[i], axis=1)], axis=1
+                )
+            if self._uses_bin_embedding:
+                n_pairs = self.head_n_pairs[i]
+                n_ell = self.head_n_ell_grid[i]
+                # (n_pairs, n_slots * embedding_dim): fixed for a trained model.
+                emb = tf.reshape(
+                    tf.gather(self.E, self.head_slot_rows[i]),
+                    [n_pairs, self.n_slots * self.embedding_dim],
+                )
+                ctx_pairs = tf.tile(tf.expand_dims(head_in, 1), [1, n_pairs, 1])
+                emb_pairs = tf.tile(tf.expand_dims(emb, 0), [batch, 1, 1])
+                head_in = tf.reshape(
+                    tf.concat([ctx_pairs, emb_pairs], axis=-1),
+                    [-1, self.head_architectures[i][0]],
+                )
+            out = self._run_dense_block_tf(
+                head_in,
+                self.head_W[i],
+                self.head_b[i],
+                self.head_alphas[i],
+                self.head_betas[i],
+            )
+            if self._uses_bin_embedding:
+                out = tf.reshape(out, [batch, n_pairs * n_ell])
+            outputs.append(out)
+        out = tf.concat(outputs, axis=1) if len(outputs) > 1 else outputs[0]
+        return tf.gather(out, self.mode_gather_index, axis=1)
+
+    def predictions_normalized_tf(self, x: tf.Tensor) -> tf.Tensor:
+        """Forward pass from already-normalized parameters to features.
+
+        Split out from :meth:`predictions_tf` so the NUTS autodiff path can
+        share one implementation per architecture.
+        """
+        if self.architecture_type == "MLP":
+            output = self._dense_stack_tf(x)
+        elif self.architecture_type == "EmbMLP":
+            output = self._embmlp_core_tf(x)
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            output = self._shared_trunk_core_tf(x)
+        else:
+            raise NotImplementedError(f"Prediction not implemented for architecture: {self.architecture_type}")
+
+        # Denormalize output
+        return output * self.features_std + self.features_mean
+
     @tf.function
     def predictions_tf(self, parameters_tensor: tf.Tensor) -> tf.Tensor:
         """TensorFlow forward pass for predictions.
@@ -302,26 +635,7 @@ class CosmoPowerNN(tf.keras.Model):
         """
         # Normalize inputs
         x = (parameters_tensor - self.parameters_mean) / self.parameters_std
-        
-        if self.architecture_type == "MLP":
-            # MLP forward pass
-            layers = [x]
-            
-            for i in range(self.n_layers - 1):
-                # Linear transformation
-                linear_out = tf.matmul(layers[-1], self.W[i]) + self.b[i]
-                # Apply custom activation
-                activated = self.activation(linear_out, self.alphas[i], self.betas[i])
-                layers.append(activated)
-            
-            # Output layer (linear)
-            output = tf.matmul(layers[-1], self.W[-1]) + self.b[-1]
-            
-        else:
-            raise NotImplementedError(f"Prediction not implemented for architecture: {self.architecture_type}")
-        
-        # Denormalize output
-        return output * self.features_std + self.features_mean
+        return self.predictions_normalized_tf(x)
 
     def forward_pass_np(self, parameters_arr: np.ndarray) -> np.ndarray:
         """NumPy forward pass for CPU predictions.
@@ -335,30 +649,118 @@ class CosmoPowerNN(tf.keras.Model):
         Returns:
             Predicted features array
         """
-        if self.architecture_type != "MLP":
-            raise NotImplementedError("NumPy forward pass only implemented for MLP")
-        
         # Normalize inputs
-        layers = [(parameters_arr - self.parameters_mean_) / self.parameters_std_]
-        
-        # Forward pass through layers
-        for i in range(self.n_layers - 1):
-            # Linear transformation
-            linear_out = np.dot(layers[-1], self.W_[i]) + self.b_[i]
-            
-            # Custom activation function
-            sigmoid_part = 1.0 / (1.0 + np.exp(-self.alphas_[i] * linear_out))
-            activated = (self.betas_[i] + (1.0 - self.betas_[i]) * sigmoid_part) * linear_out
-            layers.append(activated)
-        
-        # Output layer
-        output = np.dot(layers[-1], self.W_[-1]) + self.b_[-1]
-        
+        x = (parameters_arr - self.parameters_mean_) / self.parameters_std_
+
+        if self.architecture_type == "MLP":
+            output = self._dense_stack_np(x)
+        elif self.architecture_type == "EmbMLP":
+            output = self._embmlp_core_np(x)
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            output = self._shared_trunk_core_np(x)
+        else:
+            raise NotImplementedError(
+                f"NumPy forward pass not implemented for architecture: "
+                f"{self.architecture_type}"
+            )
+
         # Denormalize and return
         return output * self.features_std_ + self.features_mean_
 
+    def _dense_stack_np(self, h: np.ndarray) -> np.ndarray:
+        """NumPy equivalent of :meth:`_dense_stack_tf`."""
+        for i in range(self.n_layers - 1):
+            linear_out = np.dot(h, self.W_[i]) + self.b_[i]
+            sigmoid_part = 1.0 / (1.0 + np.exp(-self.alphas_[i] * linear_out))
+            h = (self.betas_[i] + (1.0 - self.betas_[i]) * sigmoid_part) * linear_out
+
+        return np.dot(h, self.W_[-1]) + self.b_[-1]
+
+    def _run_dense_block_np(
+        self,
+        h: np.ndarray,
+        W: List[np.ndarray],
+        b: List[np.ndarray],
+        alphas: List[np.ndarray],
+        betas: List[np.ndarray],
+    ) -> np.ndarray:
+        """NumPy equivalent of :meth:`_run_dense_block_tf`."""
+        n_activated = len(alphas)
+        for i in range(len(W)):
+            linear_out = np.dot(h, W[i]) + b[i]
+            if i < n_activated:
+                sigmoid_part = 1.0 / (1.0 + np.exp(-alphas[i] * linear_out))
+                h = (betas[i] + (1.0 - betas[i]) * sigmoid_part) * linear_out
+            else:
+                h = linear_out
+        return h
+
+    def _shared_trunk_core_np(self, x: np.ndarray) -> np.ndarray:
+        """NumPy equivalent of :meth:`_shared_trunk_core_tf`."""
+        spec = self.shared_trunk_spec
+        trunk_idx = np.asarray(spec["trunk_param_index"], dtype=int)
+        gather_index = np.asarray(spec["gather_index"], dtype=int)
+
+        trunk_in = x[:, trunk_idx]
+        z = self._run_dense_block_np(
+            trunk_in,
+            self.trunk_W_,
+            self.trunk_b_,
+            self.trunk_alphas_,
+            self.trunk_betas_,
+        )
+        if self.trunk_skip_connection:
+            z = np.concatenate([z, trunk_in], axis=1)
+
+        batch = x.shape[0]
+        outputs = []
+        for i in range(len(spec["probes"])):
+            head_idx = np.asarray(spec["head_param_index"][i], dtype=int)
+            head_in = z if head_idx.size == 0 else np.concatenate(
+                [z, x[:, head_idx]], axis=1
+            )
+            if self._uses_bin_embedding:
+                pair = spec["per_probe_pairs"][i]
+                slot_rows = np.asarray(pair["slot_rows"], dtype=int)
+                n_pairs = int(pair["n_pairs"])
+                n_ell = int(pair["n_ell_grid"])
+                emb = self.E_[slot_rows].reshape(n_pairs, -1)
+                ctx_pairs = np.repeat(head_in[:, None, :], n_pairs, axis=1)
+                emb_pairs = np.broadcast_to(emb, (batch, *emb.shape))
+                head_in = np.concatenate(
+                    [ctx_pairs, emb_pairs], axis=-1
+                ).reshape(batch * n_pairs, -1)
+            out = self._run_dense_block_np(
+                head_in,
+                self.head_W_[i],
+                self.head_b_[i],
+                self.head_alphas_[i],
+                self.head_betas_[i],
+            )
+            if self._uses_bin_embedding:
+                out = out.reshape(batch, n_pairs * n_ell)
+            outputs.append(out)
+        out = np.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
+        return out[:, gather_index]
+
+    def _embmlp_core_np(self, x: np.ndarray) -> np.ndarray:
+        """NumPy equivalent of :meth:`_embmlp_core_tf`."""
+        spec = self.bin_pair_spec
+        slot_rows = np.asarray(spec["slot_rows"], dtype=int)
+        gather_index = np.asarray(spec["gather_index"], dtype=int)
+        n_pairs = int(spec["n_pairs"])
+        n_ell_grid = int(spec["n_ell_grid"])
+
+        batch = x.shape[0]
+        emb = self.E_[slot_rows].reshape(n_pairs, -1)
+        x_pairs = np.repeat(x[:, None, :], n_pairs, axis=1)
+        emb_pairs = np.broadcast_to(emb, (batch, *emb.shape))
+        h = np.concatenate([x_pairs, emb_pairs], axis=-1).reshape(batch * n_pairs, -1)
+        out = self._dense_stack_np(h).reshape(batch, n_pairs * n_ell_grid)
+        return out[:, gather_index]
+
     def predictions_np(self, parameters_dict: Dict[str, np.ndarray]) -> np.ndarray:
-        """Make predictions using NumPy forward pass (MLP).
+        """Make predictions using NumPy forward pass.
         
         Args:
             parameters_dict: Dictionary mapping parameter names to values
@@ -366,11 +768,8 @@ class CosmoPowerNN(tf.keras.Model):
         Returns:
             Predicted features array
         """
-        if self.architecture_type == "MLP":
-            parameters_arr = self.dict_to_ordered_arr_np(parameters_dict)
-            return self.forward_pass_np(parameters_arr)
-        else:
-            raise NotImplementedError(f"Prediction not implemented for architecture: {self.architecture_type}")
+        parameters_arr = self.dict_to_ordered_arr_np(parameters_dict)
+        return self.forward_pass_np(parameters_arr)
 
     def dict_to_ordered_arr_np(self, input_dict: Dict[str, np.ndarray]) -> np.ndarray:
         """Convert parameter dictionary to ordered array.
@@ -392,7 +791,7 @@ class CosmoPowerNN(tf.keras.Model):
         Used as the early-stopping checkpoint: call when validation loss
         improves so :meth:`restore_emulator_parameters` can roll back later.
         """
-        if self.architecture_type == "MLP":
+        if self.architecture_type in DENSE_ARCHITECTURES:
             self.emulator_parameters = {
                 "W": [w.numpy() for w in self.W],
                 "b": [b.numpy() for b in self.b],
@@ -404,24 +803,71 @@ class CosmoPowerNN(tf.keras.Model):
             self.b_ = [b.numpy() for b in self.b]
             self.alphas_ = [a.numpy() for a in self.alphas]
             self.betas_ = [b.numpy() for b in self.betas]
+            if self.architecture_type == "EmbMLP":
+                self.emulator_parameters["E"] = self.E.numpy()
+                self.E_ = self.E.numpy()
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            self.trunk_W_ = [w.numpy() for w in self.trunk_W]
+            self.trunk_b_ = [b.numpy() for b in self.trunk_b]
+            self.trunk_alphas_ = [a.numpy() for a in self.trunk_alphas]
+            self.trunk_betas_ = [b.numpy() for b in self.trunk_betas]
+            self.head_W_ = [[w.numpy() for w in head] for head in self.head_W]
+            self.head_b_ = [[b.numpy() for b in head] for head in self.head_b]
+            self.head_alphas_ = [[a.numpy() for a in head] for head in self.head_alphas]
+            self.head_betas_ = [[b.numpy() for b in head] for head in self.head_betas]
+            self.emulator_parameters = {
+                "trunk_W": self.trunk_W_,
+                "trunk_b": self.trunk_b_,
+                "trunk_alphas": self.trunk_alphas_,
+                "trunk_betas": self.trunk_betas_,
+                "head_W": self.head_W_,
+                "head_b": self.head_b_,
+                "head_alphas": self.head_alphas_,
+                "head_betas": self.head_betas_,
+            }
+            if self._uses_bin_embedding:
+                self.E_ = self.E.numpy()
+                self.emulator_parameters["E"] = self.E_
         else:
             raise NotImplementedError(f"Update emulator parameters not implemented for architecture: {self.architecture_type}")
 
     def restore_emulator_parameters(self) -> None:
         """Load the last ``update_emulator_parameters`` snapshot into TF Variables."""
-        if self.architecture_type != "MLP":
+        if self.architecture_type in DENSE_ARCHITECTURES:
+            if not hasattr(self, "W_") or self.W_ is None:
+                logger.warning("No emulator parameter snapshot to restore")
+                return
+            for i in range(len(self.W_)):
+                self.W[i].assign(self.W_[i])
+                self.b[i].assign(self.b_[i])
+            for i in range(len(self.alphas_)):
+                self.alphas[i].assign(self.alphas_[i])
+                self.betas[i].assign(self.betas_[i])
+            if self.architecture_type == "EmbMLP":
+                self.E.assign(self.E_)
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            if not hasattr(self, "trunk_W_") or self.trunk_W_ is None:
+                logger.warning("No emulator parameter snapshot to restore")
+                return
+            for i in range(len(self.trunk_W_)):
+                self.trunk_W[i].assign(self.trunk_W_[i])
+                self.trunk_b[i].assign(self.trunk_b_[i])
+            for i in range(len(self.trunk_alphas_)):
+                self.trunk_alphas[i].assign(self.trunk_alphas_[i])
+                self.trunk_betas[i].assign(self.trunk_betas_[i])
+            for h in range(len(self.head_W_)):
+                for i in range(len(self.head_W_[h])):
+                    self.head_W[h][i].assign(self.head_W_[h][i])
+                    self.head_b[h][i].assign(self.head_b_[h][i])
+                for i in range(len(self.head_alphas_[h])):
+                    self.head_alphas[h][i].assign(self.head_alphas_[h][i])
+                    self.head_betas[h][i].assign(self.head_betas_[h][i])
+            if self._uses_bin_embedding:
+                self.E.assign(self.E_)
+        else:
             raise NotImplementedError(
                 f"Restore not implemented for architecture: {self.architecture_type}"
             )
-        if not hasattr(self, "W_") or self.W_ is None:
-            logger.warning("No emulator parameter snapshot to restore")
-            return
-        for i in range(len(self.W_)):
-            self.W[i].assign(self.W_[i])
-            self.b[i].assign(self.b_[i])
-        for i in range(len(self.alphas_)):
-            self.alphas[i].assign(self.alphas_[i])
-            self.betas[i].assign(self.betas_[i])
 
     @tf.function
     def compute_loss_standard(self, training_parameters: tf.Tensor, training_features: tf.Tensor) -> tf.Tensor:
@@ -493,85 +939,6 @@ class CosmoPowerNN(tf.keras.Model):
         gradients = tape.gradient(loss, self.trainable_variables)
         return loss, gradients
 
-    # def compute_prediction_gradients(self, parameters_tensor: tf.Tensor) -> tf.Tensor:
-    #     """Compute gradients of predictions with respect to input parameters using autodifferentiation.
-        
-    #     This method uses TensorFlow's automatic differentiation to compute the Jacobian
-    #     matrix: d(predictions)/d(parameters). This is useful for Fisher matrix calculations,
-    #     optimization, and sensitivity analysis.
-        
-    #     Args:
-    #         parameters_tensor: Input parameters tensor of shape (batch_size, n_parameters)
-            
-    #     Returns:
-    #         Gradient tensor of shape (batch_size, n_modes, n_parameters)
-    #         where gradient[i, j, k] = d(prediction[i, j])/d(parameter[i, k])
-    #     """
-    #     # Ensure we have a proper tensor
-    #     if not isinstance(parameters_tensor, tf.Variable):
-    #         parameters_tensor = tf.Variable(parameters_tensor, trainable=False)
-        
-    #     # Get batch size as Python int
-    #     try:
-    #         # Try to get static shape first
-    #         batch_size = int(parameters_tensor.shape[0])
-    #     except (TypeError, ValueError):
-    #         # If static shape is None, get from tensor
-    #         batch_size_tensor = tf.shape(parameters_tensor)[0]
-    #         try:
-    #             batch_size = int(batch_size_tensor.numpy())
-    #         except (AttributeError, ValueError, tf.errors.InvalidArgumentError):
-    #             # If we can't evaluate, default to 1 (will process first sample)
-    #             batch_size = 1
-        
-    #     n_modes = self.n_modes
-    #     n_params = self.n_parameters
-        
-    #     # Compute gradients for each sample in the batch
-    #     # We need to compute gradients separately for each sample because
-    #     # GradientTape computes gradients element-wise
-    #     all_gradients = []
-        
-    #     for batch_idx in range(batch_size):
-    #         # Extract single sample (keep batch dimension for compatibility)
-    #         sample_params = parameters_tensor[batch_idx:batch_idx+1]
-    #         # Use a regular tensor and watch it (not a Variable)
-    #         sample_params_tensor = tf.identity(sample_params)
-            
-    #         with tf.GradientTape(persistent=True) as tape:
-    #             tape.watch(sample_params_tensor)
-    #             sample_predictions = self.predictions_tf(sample_params_tensor)
-    #             # Remove batch dimension for jacobian computation: (1, n_modes) -> (n_modes,)
-    #             sample_predictions_flat = sample_predictions[0]
-            
-    #         # Compute full Jacobian at once: d(predictions)/d(parameters)
-    #         # This is more efficient and avoids indexing issues
-    #         # jacobian shape: (n_modes, 1, n_params) -> squeeze to (n_modes, n_params)
-    #         try:
-    #             jacobian = tape.jacobian(sample_predictions_flat, sample_params_tensor)
-    #             # jacobian shape is (n_modes, 1, n_params), squeeze middle dimension
-    #             if len(jacobian.shape) == 3:
-    #                 jacobian = tf.squeeze(jacobian, axis=1)  # (n_modes, n_params)
-    #             sample_gradient_matrix = jacobian
-    #         except (AttributeError, ValueError) as e:
-    #             # Fallback: compute gradients element by element if jacobian fails
-    #             sample_gradients = []
-    #             for mode_idx in range(n_modes):
-    #                 output_element = sample_predictions_flat[mode_idx]
-    #                 grad = tape.gradient(output_element, sample_params_tensor)
-    #                 if grad is not None:
-    #                     sample_gradients.append(tf.reshape(grad, [n_params]))
-    #                 else:
-    #                     sample_gradients.append(tf.zeros([n_params], dtype=DTYPE))
-    #             sample_gradient_matrix = tf.stack(sample_gradients, axis=0)
-            
-    #         del tape
-    #         all_gradients.append(sample_gradient_matrix)
-        
-    #     # Stack all samples to get shape (batch_size, n_modes, n_parameters)
-    #     gradient_tensor = tf.stack(all_gradients, axis=0)
-        
-    #     return gradient_tensor
 
     def training_step(self, training_parameters: tf.Tensor, training_features: tf.Tensor) -> tf.Tensor:
         """Perform one training step.
@@ -784,7 +1151,7 @@ class CosmoPowerNN(tf.keras.Model):
             "n_hidden": getattr(self, 'n_hidden', [])
         }
         
-        if self.architecture_type == "MLP":
+        if self.architecture_type in DENSE_ARCHITECTURES:
             # Use the extracted numpy weights (W_, b_, etc.) instead of TF variables
             save_dict["weights"] = {
                 "W": [w.tolist() for w in self.W_],
@@ -792,12 +1159,80 @@ class CosmoPowerNN(tf.keras.Model):
                 "alphas": [a.tolist() for a in self.alphas_],
                 "betas": [b.tolist() for b in self.betas_]
             }
+            if self.architecture_type == "EmbMLP":
+                save_dict["weights"]["E"] = self.E_.tolist()
+                save_dict["bin_pair_spec"] = self.bin_pair_spec
+                save_dict["embedding_dim"] = self.embedding_dim
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            save_dict["weights"] = {
+                "trunk_W": [w.tolist() for w in self.trunk_W_],
+                "trunk_b": [b.tolist() for b in self.trunk_b_],
+                "trunk_alphas": [a.tolist() for a in self.trunk_alphas_],
+                "trunk_betas": [b.tolist() for b in self.trunk_betas_],
+                "head_W": [[w.tolist() for w in head] for head in self.head_W_],
+                "head_b": [[b.tolist() for b in head] for head in self.head_b_],
+                "head_alphas": [
+                    [a.tolist() for a in head] for head in self.head_alphas_
+                ],
+                "head_betas": [
+                    [b.tolist() for b in head] for head in self.head_betas_
+                ],
+            }
+            if self._uses_bin_embedding:
+                save_dict["weights"]["E"] = self.E_.tolist()
+                save_dict["embedding_dim"] = self.embedding_dim
+            save_dict["shared_trunk_spec"] = self._shared_trunk_spec_state()
+            save_dict["head_n_hidden"] = list(self.head_n_hidden)
+            save_dict["trunk_skip_connection"] = self.trunk_skip_connection
         else:
             raise NotImplementedError(f"Save not implemented for architecture: {self.architecture_type}")
 
         # Save main model file
         np.savez_compressed(filename + ".npz", **save_dict)
         logger.info(f"Model saved to {filename}.npz")
+
+    def _shared_trunk_spec_state(self) -> Dict[str, Any]:
+        """Plain-container copy of the spec for ``.npz`` storage.
+
+        Keras wraps list/dict attributes of a Model, and those wrappers would
+        otherwise be pickled into the saved file.
+        """
+        spec = self.shared_trunk_spec
+        state: Dict[str, Any] = {
+            "probes": [str(p) for p in spec["probes"]],
+            "parameters": [str(p) for p in spec["parameters"]],
+            "probe_mode_index": [
+                np.asarray(idx, dtype=np.int64) for idx in spec["probe_mode_index"]
+            ],
+            "gather_index": np.asarray(spec["gather_index"], dtype=np.int64),
+            "n_modes": int(spec["n_modes"]),
+            "trunk_parameters": [str(p) for p in spec["trunk_parameters"]],
+            "trunk_param_index": np.asarray(
+                spec["trunk_param_index"], dtype=np.int64
+            ),
+            "head_parameters": [
+                [str(p) for p in head] for head in spec["head_parameters"]
+            ],
+            "head_param_index": [
+                np.asarray(idx, dtype=np.int64) for idx in spec["head_param_index"]
+            ],
+        }
+        if "per_probe_pairs" in spec:
+            state["table_size"] = int(spec["table_size"])
+            state["source_bins"] = [int(b) for b in spec["source_bins"]]
+            state["lens_bins"] = [int(b) for b in spec["lens_bins"]]
+            state["per_probe_pairs"] = [
+                {
+                    "name": str(p["name"]),
+                    "slot_rows": np.asarray(p["slot_rows"], dtype=np.int64),
+                    "n_pairs": int(p["n_pairs"]),
+                    "n_ell_grid": int(p["n_ell_grid"]),
+                    "output_offset": int(p["output_offset"]),
+                    "pairs": [list(t) for t in p["pairs"]],
+                }
+                for p in spec["per_probe_pairs"]
+            ]
+        return state
 
     def restore(self, filename: str) -> None:
         """Load pre-trained model from file.
@@ -833,13 +1268,43 @@ class CosmoPowerNN(tf.keras.Model):
         if "n_hidden" in data:
             self.n_hidden = list(data["n_hidden"])
         
-        # Restore weights for MLP architecture
-        if self.architecture_type == "MLP" and "weights" in data:
+        # Restore weights for the dense-trunk architectures
+        if self.architecture_type in DENSE_ARCHITECTURES and "weights" in data:
             weights = data["weights"].item()
             self.W_ = [np.array(w) for w in weights["W"]]
             self.b_ = [np.array(b) for b in weights["b"]]
             self.alphas_ = [np.array(a) for a in weights["alphas"]]
             self.betas_ = [np.array(b) for b in weights["betas"]]
+            if self.architecture_type == "EmbMLP":
+                from .bin_embedding import spec_from_state
+
+                self.E_ = np.array(weights["E"])
+                self.bin_pair_spec = spec_from_state(data["bin_pair_spec"])
+                self.embedding_dim = int(data["embedding_dim"])
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES and "weights" in data:
+            from .shared_trunk import spec_from_state as shared_trunk_spec_from_state
+
+            weights = data["weights"].item()
+            self.trunk_W_ = [np.array(w) for w in weights["trunk_W"]]
+            self.trunk_b_ = [np.array(b) for b in weights["trunk_b"]]
+            self.trunk_alphas_ = [np.array(a) for a in weights["trunk_alphas"]]
+            self.trunk_betas_ = [np.array(b) for b in weights["trunk_betas"]]
+            self.head_W_ = [[np.array(w) for w in head] for head in weights["head_W"]]
+            self.head_b_ = [[np.array(b) for b in head] for head in weights["head_b"]]
+            self.head_alphas_ = [
+                [np.array(a) for a in head] for head in weights["head_alphas"]
+            ]
+            self.head_betas_ = [
+                [np.array(b) for b in head] for head in weights["head_betas"]
+            ]
+            self.shared_trunk_spec = shared_trunk_spec_from_state(
+                data["shared_trunk_spec"]
+            )
+            self.head_n_hidden = [int(n) for n in np.atleast_1d(data["head_n_hidden"])]
+            self.trunk_skip_connection = bool(data["trunk_skip_connection"])
+            if self.architecture_type == "SharedTrunkEmbMLP":
+                self.E_ = np.array(weights["E"])
+                self.embedding_dim = int(data["embedding_dim"])
         else:
             raise ValueError(f"Unknown architecture type: {self.architecture_type}")
         
@@ -852,12 +1317,64 @@ class CosmoPowerNN(tf.keras.Model):
         print(f" CosmoPower Model Summary ({self.architecture_type})")
         print("="*60)
         
-        if self.architecture_type == "MLP":
+        if self.architecture_type in DENSE_ARCHITECTURES:
             self._print_mlp_summary()
+        elif self.architecture_type in SHARED_TRUNK_ARCHITECTURES:
+            self._print_shared_trunk_summary()
         else:
             raise NotImplementedError(f"Summary not implemented for architecture: {self.architecture_type}")
         
         print("="*60 + "\\n")
+
+    def _print_shared_trunk_summary(self) -> None:
+        """Print trunk / per-head parameter counts."""
+        def block_params(widths: List[int], activate_last: bool) -> int:
+            n_layers = len(widths) - 1
+            total = sum(
+                widths[i] * widths[i + 1] + widths[i + 1] for i in range(n_layers)
+            )
+            n_activated = n_layers if activate_last else n_layers - 1
+            total += sum(2 * widths[i + 1] for i in range(n_activated))
+            return total
+
+        print(f"{'Block':<25} {'Shape':<28} {'Param #':<10}")
+        print("-" * 65)
+
+        total_embedding = 0
+        if self._uses_bin_embedding:
+            table_size = int(self.shared_trunk_spec["table_size"])
+            total_embedding = table_size * self.embedding_dim
+            print(
+                f"{'BinEmbedding (shared)':<25} "
+                f"{str([table_size, self.embedding_dim]):<28} "
+                f"{total_embedding:>10}"
+            )
+
+        trunk_params = block_params(self.trunk_architecture, activate_last=True)
+        print(
+            f"{'Trunk (shared)':<25} {str(list(self.trunk_architecture)):<28} "
+            f"{trunk_params:>10}"
+        )
+        total = trunk_params + total_embedding
+        for i, (probe, widths) in enumerate(
+            zip(self.probe_names, self.head_architectures)
+        ):
+            head_params = block_params(widths, activate_last=False)
+            total += head_params
+            label = "Head " + probe
+            if self._uses_bin_embedding:
+                pair = self.shared_trunk_spec["per_probe_pairs"][i]
+                label += f" (x{int(pair['n_pairs'])} pairs)"
+            print(f"{label:<25} {str(list(widths)):<28} {head_params:>10}")
+
+        print("-" * 65)
+        print(f"Trunk parameters: {list(self.shared_trunk_spec['trunk_parameters'])}")
+        for probe, head in zip(
+            self.probe_names, self.shared_trunk_spec["head_parameters"]
+        ):
+            print(f"Head parameters [{probe}]: {list(head) if head else '(none)'}")
+        print(f"Skip connection into heads: {self.trunk_skip_connection}")
+        print(f"Total params: {total:,}")
 
     def _print_mlp_summary(self) -> None:
         """Print MLP-specific summary."""
@@ -866,7 +1383,16 @@ class CosmoPowerNN(tf.keras.Model):
         print(f"{'Layer (type)':<25} {'Output Shape':<15} {'Param #':<10}")
         print("-" * 50)
         
-        input_dim = self.n_parameters
+        if self.architecture_type == "EmbMLP":
+            emb_params = int(self.bin_pair_spec["table_size"]) * self.embedding_dim
+            total_params += emb_params
+            print(
+                f"{'BinEmbedding':<25} "
+                f"({int(self.bin_pair_spec['table_size']):>3},{self.embedding_dim:>3})"
+                f"{'':<4} {emb_params:>10}"
+            )
+
+        input_dim = self.architecture[0]
         for i in range(self.n_layers):
             output_dim = self.architecture[i + 1]
             
@@ -903,7 +1429,8 @@ class NNEmulator:
     Args:
         model_parameters: List of parameter names
         modes: Output modes/features
-        nn_model: Neural network architecture ('MLP' or other models of your choice -- to be implemented)
+        nn_model: Neural network architecture ('MLP', 'EmbMLP', 'SharedTrunkMLP'
+            or 'SharedTrunkEmbMLP')
         iteration: Current training iteration (for naming)
         data_transformation: Data transformation type
             ('log_norm', 'norm', 'signed_log_norm', 'weighted_norm',
@@ -924,7 +1451,11 @@ class NNEmulator:
                  n_pca: int = 64,
                  datavector: Optional[np.ndarray] = None,
                  inv_cov: Optional[np.ndarray] = None,
-                 amplitude_prefactor: Union[bool, str] = False):
+                 amplitude_prefactor: Union[bool, str] = False,
+                 embedding_dim: int = 4,
+                 head_n_hidden: Optional[List[int]] = None,
+                 trunk_skip_connection: bool = True,
+                 trunk_params: Optional[List[str]] = None):
         
         self.trained = False
         # When True, parameters passed to predict()/compute_gradients() that are
@@ -946,6 +1477,10 @@ class NNEmulator:
             self.cov_sigma = np.maximum(np.sqrt(np.diag(self.data_cov)), 1e-30)
         self.n_pca = n_pca
         self.nn_model = nn_model
+        self.embedding_dim = int(embedding_dim)
+        self.head_n_hidden = list(head_n_hidden) if head_n_hidden else []
+        self.trunk_skip_connection = bool(trunk_skip_connection)
+        self.trunk_params = list(trunk_params) if trunk_params else None
         self.loss_function = loss_function
         self.iteration = iteration
         self.amplitude_prefactor_enabled = parse_amplitude_prefactor(amplitude_prefactor)
@@ -1507,6 +2042,41 @@ class NNEmulator:
         else:
             output_dim = len(self.modes)
 
+        bin_pair_spec = None
+        if self.nn_model == "EmbMLP":
+            if self._is_pca_family(self.data_transformation):
+                raise ValueError(
+                    "nn_model=EmbMLP is incompatible with "
+                    f"data_transformation={self.data_transformation!r}: the "
+                    "network predicts one bin pair's ell nodes at a time, but "
+                    "PCA coefficients have no bin-pair structure. Use "
+                    "weighted_norm / weighted_median_norm / norm / log_norm."
+                )
+            bin_pair_spec = build_bin_pair_spec(
+                self.vector_metadata,
+                output_dim,
+                spectra=self.amplitude_prefactor_spectra,
+            )
+
+        shared_trunk_spec = None
+        if self.nn_model in ("SharedTrunkMLP", "SharedTrunkEmbMLP"):
+            if self._is_pca_family(self.data_transformation):
+                raise ValueError(
+                    f"nn_model={self.nn_model} is incompatible with "
+                    f"data_transformation={self.data_transformation!r}: each "
+                    "head predicts one probe's modes, but PCA coefficients "
+                    "mix probes and have no per-probe structure. Use "
+                    "weighted_norm / weighted_median_norm / norm / log_norm."
+                )
+            shared_trunk_spec = build_shared_trunk_spec(
+                self.vector_metadata,
+                output_dim,
+                self.model_parameters,
+                spectra=self.amplitude_prefactor_spectra,
+                trunk_params=self.trunk_params,
+                bin_embedding=self.nn_model == "SharedTrunkEmbMLP",
+            )
+
         # LINNA-style cov-weighted loss: feature-space d and C^{-1}.
         loss_data_feat = None
         loss_inv_feat = None
@@ -1532,6 +2102,11 @@ class NNEmulator:
             loss_function=self.loss_function,
             loss_data_feat=loss_data_feat,
             loss_inv_feat=loss_inv_feat,
+            bin_pair_spec=bin_pair_spec,
+            embedding_dim=self.embedding_dim,
+            shared_trunk_spec=shared_trunk_spec,
+            head_n_hidden=self.head_n_hidden,
+            trunk_skip_connection=self.trunk_skip_connection,
         )
         
         # Prepare training data
@@ -1613,6 +2188,13 @@ class NNEmulator:
         
         # Load neural network
         self.cp_nn = CosmoPowerNN(restore=True, restore_filename=filename)
+        # The saved model, not the constructor default, defines the architecture.
+        self.nn_model = self.cp_nn.architecture_type
+        self.embedding_dim = int(getattr(self.cp_nn, "embedding_dim", self.embedding_dim))
+        self.head_n_hidden = list(getattr(self.cp_nn, "head_n_hidden", []) or [])
+        self.trunk_skip_connection = bool(
+            getattr(self.cp_nn, "trunk_skip_connection", self.trunk_skip_connection)
+        )
         
         # Load additional attributes
         npz_filename = filename + ".npz"
@@ -1791,25 +2373,7 @@ class NNEmulator:
             # Manually do forward pass through NN to avoid @tf.function gradient issues
             # This is equivalent to self.cp_nn.predictions_tf but without the decorator
             x = (params_norm_batch - self.cp_nn.parameters_mean) / self.cp_nn.parameters_std
-            
-            if self.cp_nn.architecture_type == "MLP":
-                # MLP forward pass
-                layers = [x]
-                
-                for i in range(self.cp_nn.n_layers - 1):
-                    # Linear transformation
-                    linear_out = tf.matmul(layers[-1], self.cp_nn.W[i]) + self.cp_nn.b[i]
-                    # Apply custom activation
-                    activated = self.cp_nn.activation(linear_out, self.cp_nn.alphas[i], self.cp_nn.betas[i])
-                    layers.append(activated)
-                
-                # Output layer (linear)
-                output = tf.matmul(layers[-1], self.cp_nn.W[-1]) + self.cp_nn.b[-1]
-            else:
-                raise NotImplementedError(f"Gradient computation not implemented for architecture: {self.cp_nn.architecture_type}")
-            
-            # Denormalize output (this gives pred_norm in normalized output space)
-            pred_norm_batch = output * self.cp_nn.features_std + self.cp_nn.features_mean
+            pred_norm_batch = self.cp_nn.predictions_normalized_tf(x)
             
             # Remove batch dimension if it was added
             if len(params_norm.shape) == 1 and len(pred_norm_batch.shape) == 2:
