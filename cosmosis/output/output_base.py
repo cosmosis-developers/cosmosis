@@ -1,7 +1,7 @@
 import abc
 import numpy as np
 import fcntl
-
+import shutil
 output_registry = {}
 
 class OutputMetaclass(abc.ABCMeta):
@@ -122,12 +122,24 @@ class OutputBase(metaclass=OutputMetaclass):
         self._write_parameters(params)
 
     def reset_to_chain_start(self):
-        """
-        Seek the start of the chain so previous output can be overwritten.
+        # On the first iteration the start mark is not set until we call
+        # output the first time.
+        if self._start_mark is None:
+            return
+        self._file.seek(self._start_mark)
+        self._file.truncate()
+        self._file.flush()
 
-        Subclasses can override this to actually do something.
-        """
-        pass
+    def save_and_reset_to_chain_start(self, copy_ending):
+        # On the first iteration the start mark is not set until we call
+        # output the first time.
+        if self._start_mark is None:
+            return
+        # Duplicate the file to the new filename
+        shutil.copyfile(self._filename, self.filename_base+copy_ending+self.FILE_EXTENSION)
+        self._file.seek(self._start_mark)
+        self._file.truncate()
+        self._file.flush()   
 
     def flush(self):
         """

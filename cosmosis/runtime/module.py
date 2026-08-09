@@ -323,6 +323,12 @@ class Module(object):
     def load_function(library, function_name,
                       module_type=MODULE_TYPE_EXECUTE_SIMPLE, set_types=True):
         u"""Load a Module's functions from a shared library."""
+
+        if callable(function_name):
+            # This is already a python function, so just return it.
+            # i.e. the module has already been loaded
+            return function_name
+
         function = getattr(library, function_name, None)
         if not function:
             function = getattr(library, function_name + "_", None)
@@ -438,7 +444,7 @@ class ClassModule(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractmethod
-    def execute(self, block, config):
+    def execute(self, block):
         return 0
 
     def cleanup(config):
