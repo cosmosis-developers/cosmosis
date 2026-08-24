@@ -601,8 +601,10 @@ bool cosmosis::DataBlock::deserialize(const std::vector<uint8_t>& blob)
     uint32_t version;
     if (!r.read(version) || version != DATABLOCK_SERIAL_VERSION) return false;
 
-    sections_.clear();
-    access_log_.clear();
+    // Parse into temporary containers so that on failure the original
+    // contents of sections_ and access_log_ are left intact.
+    std::map<std::string, Section> tmp_sections;
+    std::vector<log_entry> tmp_log;
 
     // --- sections ---
     uint32_t nsections;
@@ -611,7 +613,7 @@ bool cosmosis::DataBlock::deserialize(const std::vector<uint8_t>& blob)
     for (uint32_t i = 0; i < nsections; ++i) {
         std::string sec_name;
         if (!r.read_string(sec_name)) return false;
-        Section& sec = sections_[sec_name];
+        Section& sec = tmp_sections[sec_name];
 
         uint32_t nvals;
         if (!r.read(nvals)) return false;
@@ -628,18 +630,22 @@ bool cosmosis::DataBlock::deserialize(const std::vector<uint8_t>& blob)
     // --- access log ---
     uint32_t nlog;
     if (!r.read(nlog)) return false;
-    access_log_.reserve(nlog);
+    tmp_log.reserve(nlog);
     for (uint32_t i = 0; i < nlog; ++i) {
         std::string log_type, section, name, type_name;
         if (!r.read_string(log_type)) return false;
         if (!r.read_string(section))  return false;
         if (!r.read_string(name))     return false;
         if (!r.read_string(type_name)) return false;
-        access_log_.push_back(log_entry(log_type, section, name,
-                                        type_index_for_name(type_name)));
+        tmp_log.push_back(log_entry(log_type, section, name,
+                                    type_index_for_name(type_name)));
     }
 
-    return r.ok();
+    if (!r.ok()) return false;
+
+    sections_ = std::move(tmp_sections);
+    access_log_ = std::move(tmp_log);
+    return true;
 }
 
 bool cosmosis::DataBlock::serialize(const std::string& path) const
