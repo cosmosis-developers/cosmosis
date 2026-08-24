@@ -704,6 +704,21 @@ extern "C" {
        const char* key,
        const char* val);
 
+  /*
+    Serialize the datablock to a binary file at the given path.
+    Returns DBS_SUCCESS on success, or DBS_LOGIC_ERROR on failure.
+  */
+  DATABLOCK_STATUS
+  c_datablock_serialize(c_datablock const* s, const char* path);
+
+  /*
+    Deserialize a file previously written by c_datablock_serialize,
+    replacing all current contents of the datablock.
+    Returns DBS_SUCCESS on success, or DBS_LOGIC_ERROR on failure.
+  */
+  DATABLOCK_STATUS
+  c_datablock_deserialize(c_datablock* s, const char* path);
+
 
 #ifdef __cplusplus
 }

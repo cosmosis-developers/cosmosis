@@ -34,8 +34,10 @@
 //
 //----------------------------------------------------------------------
 
+#include <cstdint>
 #include <string>
 #include <map>
+#include <vector>
 #include <cctype>
 #include <ostream>
 
@@ -177,6 +179,21 @@ namespace cosmosis
     int get_log_count();
     DATABLOCK_STATUS
     get_log_entry(int i, std::string& log_type, std::string& section, std::string &name, std::string & type);
+
+    // Serialize the DataBlock (sections and access log) to a compact binary blob.
+    // The format is host-endian and optimised for speed, not portability.
+    // Returns an empty vector on failure.
+    std::vector<uint8_t> serialize() const;
+
+    // Serialize to a file at the given path. Returns true on success.
+    bool serialize(const std::string& path) const;
+
+    // Deserialize a blob produced by serialize(), replacing all current contents.
+    // Returns true on success, false if the blob is corrupt or the wrong version.
+    bool deserialize(const std::vector<uint8_t>& blob);
+
+    // Deserialize from a file produced by serialize(path). Returns true on success.
+    bool deserialize(const std::string& path);
   private:
     std::map<std::string, Section> sections_;
     std::vector<log_entry> access_log_;

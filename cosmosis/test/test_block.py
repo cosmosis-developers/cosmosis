@@ -214,3 +214,70 @@ if __name__ == '__main__':
     # test_string_array()
     # test_string_array_save()
     test_wrong_array_type()
+
+
+def test_to_binary_file_round_trip():
+    """to_binary_file / from_binary_file round-trips all supported scalar types."""
+    b = DataBlock()
+    b['params', 'omega_m']  = 0.3
+    b['params', 'neff']     = 3
+    b['params', 'label']    = 'test_run'
+    b['params', 'flag']     = True
+    b['params', 'z']        = complex(1.5, -0.5)
+    b['data',   'x']        = np.array([1.0, 2.0, 3.0])
+    b['data',   'n']        = np.array([10, 20], dtype=np.int32)
+    b['data',   'tags']     = ['alpha', 'beta', 'gamma']
+
+    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
+        path = f.name
+    try:
+        b.to_binary_file(path)
+        assert os.path.getsize(path) > 0
+
+        b2 = DataBlock.from_binary_file(path)
+
+        assert b2['params', 'omega_m'] == 0.3
+        assert b2['params', 'neff'] == 3
+        assert b2['params', 'label'] == 'test_run'
+        assert b2['params', 'flag'] == True
+        assert b2['params', 'z'] == complex(1.5, -0.5)
+        assert (b2['data', 'x'] == np.array([1.0, 2.0, 3.0])).all()
+        assert (b2['data', 'n'] == np.array([10, 20], dtype=np.int32)).all()
+        assert list(b2['data', 'tags']) == ['alpha', 'beta', 'gamma']
+    finally:
+        os.remove(path)
+
+
+def test_to_binary_file_sections_preserved():
+    """All sections and their keys survive a round-trip."""
+    b = DataBlock()
+    b['section_a', 'x'] = 1.0
+    b['section_a', 'y'] = 2.0
+    b['section_b', 'z'] = 42
+
+    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
+        path = f.name
+    try:
+        b.to_binary_file(path)
+        b2 = DataBlock.from_binary_file(path)
+
+        assert set(b2.sections()) == {'section_a', 'section_b'}
+        assert b2['section_a', 'x'] == 1.0
+        assert b2['section_a', 'y'] == 2.0
+        assert b2['section_b', 'z'] == 42
+    finally:
+        os.remove(path)
+
+
+def test_from_binary_file_bad_path():
+    """from_binary_file raises IOError for a non-existent file."""
+    with pytest.raises(IOError):
+        DataBlock.from_binary_file('/tmp/this_file_does_not_exist_cosmosis.bin')
+
+
+def test_to_binary_file_bad_path():
+    """to_binary_file raises IOError when the directory does not exist."""
+    b = DataBlock()
+    b['params', 'x'] = 1.0
+    with pytest.raises(IOError):
+        b.to_binary_file('/tmp/no_such_dir/block.bin')

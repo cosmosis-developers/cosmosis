@@ -1433,6 +1433,52 @@ class DataBlock(object):
 		sio.seek(0)
 		return sio.read()
 
+	def to_binary_file(self, path):
+		u"""Serialize the DataBlock to a binary file.
+
+		Writes all sections, values and the access log to a compact
+		host-endian binary file using the fast C-layer serializer.
+		The file can be reloaded with :meth:`from_binary_file`.
+
+		Parameters
+		----------
+		path : str
+		    Filesystem path to write to (created or overwritten).
+
+		Raises
+		------
+		IOError
+		    If the file could not be written.
+		"""
+		status = lib.c_datablock_serialize(self._ptr, path.encode('utf-8'))
+		if status != 0:
+				raise IOError("Failed to serialize DataBlock to {!r} (status {})".format(path, status))
+
+	@classmethod
+	def from_binary_file(cls, path):
+		u"""Deserialize a DataBlock from a binary file written by :meth:`to_binary_file`.
+
+		Parameters
+		----------
+		path : str
+		    Filesystem path to read from.
+
+		Returns
+		-------
+		DataBlock
+		    A new DataBlock populated with the contents of the file.
+
+		Raises
+		------
+		IOError
+		    If the file could not be read or is corrupt.
+		"""
+		block = cls()
+		status = lib.c_datablock_deserialize(block._ptr, path.encode('utf-8'))
+		if status != 0:
+			raise IOError("Failed to deserialize DataBlock from {!r} (status {})".format(path, status))
+		return block
+
 	def __reduce__(self):
 		return (DataBlock.from_string, (self.to_string(),))
 

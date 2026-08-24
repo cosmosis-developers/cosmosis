@@ -282,3 +282,17 @@ load_library_function(
 	[],
 	None
 )
+
+load_library_function(
+	locals(),
+	"c_datablock_serialize",
+	[c_block, c_str],
+	c_status
+)
+
+load_library_function(
+	locals(),
+	"c_datablock_deserialize",
+	[c_block, c_str],
+	c_status
+)
