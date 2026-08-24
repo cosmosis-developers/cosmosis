@@ -505,11 +505,14 @@ bool read_entry(BinaryReader& r, cosmosis::Section& sec,
     case DBT_INTND: {
         uint32_t ndims; if (!r.read(ndims)) return false;
         std::vector<std::size_t> extents(ndims);
+        std::size_t expected = 1;
         for (uint32_t k = 0; k < ndims; ++k) {
             uint64_t ext; if (!r.read(ext)) return false;
             extents[k] = static_cast<std::size_t>(ext);
+            expected *= extents[k];
         }
         uint32_t n; if (!r.read(n)) return false;
+        if (static_cast<std::size_t>(n) != expected) return false;
         std::vector<int> data(n);
         if (n > 0 && !r.read_bytes(data.data(), static_cast<size_t>(n) * sizeof(int))) return false;
         return sec.put_val(name, cosmosis::nd_int_t(data, extents)) == DBS_SUCCESS;
@@ -517,11 +520,14 @@ bool read_entry(BinaryReader& r, cosmosis::Section& sec,
     case DBT_DOUBLEND: {
         uint32_t ndims; if (!r.read(ndims)) return false;
         std::vector<std::size_t> extents(ndims);
+        std::size_t expected = 1;
         for (uint32_t k = 0; k < ndims; ++k) {
             uint64_t ext; if (!r.read(ext)) return false;
             extents[k] = static_cast<std::size_t>(ext);
+            expected *= extents[k];
         }
         uint32_t n; if (!r.read(n)) return false;
+        if (static_cast<std::size_t>(n) != expected) return false;
         std::vector<double> data(n);
         if (n > 0 && !r.read_bytes(data.data(), static_cast<size_t>(n) * sizeof(double))) return false;
         return sec.put_val(name, cosmosis::nd_double_t(data, extents)) == DBS_SUCCESS;
@@ -529,11 +535,14 @@ bool read_entry(BinaryReader& r, cosmosis::Section& sec,
     case DBT_COMPLEXND: {
         uint32_t ndims; if (!r.read(ndims)) return false;
         std::vector<std::size_t> extents(ndims);
+        std::size_t expected = 1;
         for (uint32_t k = 0; k < ndims; ++k) {
             uint64_t ext; if (!r.read(ext)) return false;
             extents[k] = static_cast<std::size_t>(ext);
+            expected *= extents[k];
         }
         uint32_t n; if (!r.read(n)) return false;
+        if (static_cast<std::size_t>(n) != expected) return false;
         std::vector<cosmosis::complex_t> data(n);
         if (n > 0 && !r.read_bytes(data.data(), static_cast<size_t>(n) * sizeof(cosmosis::complex_t))) return false;
         return sec.put_val(name, cosmosis::nd_complex_t(data, extents)) == DBS_SUCCESS;
