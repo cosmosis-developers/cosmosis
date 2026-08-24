@@ -271,13 +271,18 @@ def test_to_binary_file_sections_preserved():
 
 def test_from_binary_file_bad_path():
     """from_binary_file raises IOError for a non-existent file."""
-    with pytest.raises(IOError):
-        DataBlock.from_binary_file('/tmp/this_file_does_not_exist_cosmosis.bin')
+    with tempfile.TemporaryDirectory() as d:
+        missing = os.path.join(d, 'missing.bin')
+        with pytest.raises(IOError):
+            DataBlock.from_binary_file(missing)
 
 
 def test_to_binary_file_bad_path():
     """to_binary_file raises IOError when the directory does not exist."""
     b = DataBlock()
     b['params', 'x'] = 1.0
-    with pytest.raises(IOError):
-        b.to_binary_file('/tmp/no_such_dir/block.bin')
+    with tempfile.TemporaryDirectory() as d:
+        missing_dir = os.path.join(d, 'no_such_dir')
+        path = os.path.join(missing_dir, 'block.bin')
+        with pytest.raises(IOError):
+            b.to_binary_file(path)
