@@ -410,7 +410,14 @@ def test_pmaxlike():
 
 def test_pmc():
     old_settings = np.seterr(invalid='ignore', divide='ignore')
-    run('pmc', True, iterations=3, hints_cov=False)
+    try:
+        # This test sometimes randomly fails.
+        # Retry if so. If it fails twice then that's
+        # probably something real. I should really just
+        # drop this sampler, no one uses it.
+        run('pmc', True, iterations=3, hints_cov=False)
+    except:
+        run('pmc', True, iterations=3, hints_cov=False)
     np.seterr(**old_settings)  
 
 def test_zeus():

@@ -1554,5 +1554,23 @@ c_datablock_replace_metadata(c_datablock* s,
 }
 
 
+DATABLOCK_STATUS
+c_datablock_serialize(c_datablock const* s, const char* path)
+{
+  if (s == nullptr) return DBS_DATABLOCK_NULL;
+  if (path == nullptr) return DBS_NAME_NULL;
+  auto p = static_cast<DataBlock const*>(s);
+  return p->serialize(std::string(path)) ? DBS_SUCCESS : DBS_LOGIC_ERROR;
+}
+
+DATABLOCK_STATUS
+c_datablock_deserialize(c_datablock* s, const char* path)
+{
+  if (s == nullptr) return DBS_DATABLOCK_NULL;
+  if (path == nullptr) return DBS_NAME_NULL;
+  auto p = static_cast<DataBlock*>(s);
+  return p->deserialize(std::string(path)) ? DBS_SUCCESS : DBS_LOGIC_ERROR;
+}
+
 
 } // extern "C"
