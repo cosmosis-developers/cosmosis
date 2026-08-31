@@ -175,7 +175,9 @@ class GaussianLikelihood:
         Prefer a Cholesky triangular solve when a Cholesky factor is
         available; otherwise preserve the existing inverse-covariance path.
         """
-        if getattr(self, "chol", None) is not None:
+        original_inv_cov = (self.extract_inverse_covariance is GaussianLikelihood.extract_inverse_covariance)
+        have_chol = getattr(self, "chol", None) is not None
+        if have_chol and original_inv_cov:
             w = scipy.linalg.solve_triangular(
                 self.chol,
                 d,
