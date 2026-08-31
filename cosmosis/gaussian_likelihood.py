@@ -1,5 +1,6 @@
 import scipy.interpolate
 import scipy.integrate
+import scipy.linalg
 import numpy as np
 from .datablock import names, SectionOptions
 from .runtime import FunctionModule
@@ -160,6 +161,24 @@ class GaussianLikelihood:
         return log_det
 
 
+    def _compute_chi2(self, d):
+        """
+        Compute covariance-weighted chi-square.
+
+        Prefer a Cholesky triangular solve when a Cholesky factor is
+        available; otherwise preserve the existing inverse-covariance path.
+        """
+        if getattr(self, "chol", None) is not None:
+            w = scipy.linalg.solve_triangular(
+                self.chol,
+                d,
+                lower=True,
+                check_finite=False,
+            )
+            return float(np.dot(w, w))
+
+        return float(np.einsum('i,ij,j', d, self.inv_cov, d))
+
     def do_likelihood(self, block):
         #get data x by interpolation
         x = np.atleast_1d(self.extract_theory_points(block))
@@ -173,8 +192,7 @@ class GaussianLikelihood:
 
         #gaussian likelihood
         d = x-mu
-        chi2 = np.einsum('i,ij,j', d, self.inv_cov, d)
-        chi2 = float(chi2)
+        chi2 = self._compute_chi2(d)
         like = -0.5*chi2
 
         #It can be useful to save the chi^2 as well as the likelihood,
