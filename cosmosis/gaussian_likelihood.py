@@ -8,6 +8,13 @@ from .runtime import FunctionModule
 MISSING = "if_you_see_this_there_was_a_mistake_creating_a_gaussian_likelihood"
 
 
+def _promote_scalar_to_matrix(x):
+    x = np.asarray(x)
+    if x.ndim == 0:
+        return x.reshape(1, 1)
+    return x
+
+
 class GaussianLikelihood:
     """
     Gaussian likelihood with a fixed covariance.  
@@ -31,8 +38,8 @@ class GaussianLikelihood:
         self.likelihood_only = options.get_bool('likelihood_only', False)
 
         if self.constant_covariance:
-            self.cov = self.build_covariance()
-            self.inv_cov = self.build_inverse_covariance()
+            self.cov = _promote_scalar_to_matrix(self.build_covariance())
+            self.inv_cov = _promote_scalar_to_matrix(self.build_inverse_covariance())
 
             if not self.likelihood_only:
                 self.chol = np.linalg.cholesky(self.cov)
@@ -187,8 +194,8 @@ class GaussianLikelihood:
         #If covariance is a function of parameters, compute the 
         #new one now.
         if not self.constant_covariance:
-            self.cov = np.atleast_2d(self.extract_covariance(block))
-            self.inv_cov = np.atleast_2d(self.extract_inverse_covariance(block))
+            self.cov = np.atleast_2d(_promote_scalar_to_matrix(self.extract_covariance(block)))
+            self.inv_cov = np.atleast_2d(_promote_scalar_to_matrix(self.extract_inverse_covariance(block)))
 
         #gaussian likelihood
         d = x-mu
@@ -332,7 +339,7 @@ class SingleValueGaussianLikelihood(GaussianLikelihood):
         self.likelihood_only = options.get_bool('likelihood_only', False)
 
         if not self.likelihood_only:
-            self.chol = sigma
+            self.chol = np.array([[sigma]])
 
 
     def build_data(self):
@@ -375,4 +382,3 @@ class WindowedGaussianLikelihood(GaussianLikelihood):
             values.append(v)
         return np.atleast_1d(values)
         
-
