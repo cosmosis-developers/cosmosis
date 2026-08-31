@@ -1,10 +1,18 @@
 import scipy.interpolate
 import scipy.integrate
+import scipy.linalg
 import numpy as np
 from .datablock import names, SectionOptions
 from .runtime import FunctionModule
 
 MISSING = "if_you_see_this_there_was_a_mistake_creating_a_gaussian_likelihood"
+
+
+def _promote_scalar_to_matrix(x):
+    x = np.asarray(x)
+    if x.ndim == 0:
+        return x.reshape(1, 1)
+    return x
 
 
 class GaussianLikelihood:
@@ -30,8 +38,8 @@ class GaussianLikelihood:
         self.likelihood_only = options.get_bool('likelihood_only', False)
 
         if self.constant_covariance:
-            self.cov = self.build_covariance()
-            self.inv_cov = self.build_inverse_covariance()
+            self.cov = _promote_scalar_to_matrix(self.build_covariance())
+            self.inv_cov = _promote_scalar_to_matrix(self.build_inverse_covariance())
 
             if not self.likelihood_only:
                 self.chol = np.linalg.cholesky(self.cov)
@@ -160,6 +168,26 @@ class GaussianLikelihood:
         return log_det
 
 
+    def _compute_chi2(self, d):
+        """
+        Compute covariance-weighted chi-square.
+
+        Prefer a Cholesky triangular solve when a Cholesky factor is
+        available; otherwise preserve the existing inverse-covariance path.
+        """
+        original_inv_cov = (self.extract_inverse_covariance is GaussianLikelihood.extract_inverse_covariance)
+        have_chol = getattr(self, "chol", None) is not None
+        if have_chol and original_inv_cov:
+            w = scipy.linalg.solve_triangular(
+                self.chol,
+                d,
+                lower=True,
+                check_finite=False,
+            )
+            return float(np.dot(w, w))
+
+        return float(np.einsum('i,ij,j', d, self.inv_cov, d))
+
     def do_likelihood(self, block):
         #get data x by interpolation
         x = np.atleast_1d(self.extract_theory_points(block))
@@ -168,13 +196,12 @@ class GaussianLikelihood:
         #If covariance is a function of parameters, compute the 
         #new one now.
         if not self.constant_covariance:
-            self.cov = np.atleast_2d(self.extract_covariance(block))
-            self.inv_cov = np.atleast_2d(self.extract_inverse_covariance(block))
+            self.cov = np.atleast_2d(_promote_scalar_to_matrix(self.extract_covariance(block)))
+            self.inv_cov = np.atleast_2d(_promote_scalar_to_matrix(self.extract_inverse_covariance(block)))
 
         #gaussian likelihood
         d = x-mu
-        chi2 = np.einsum('i,ij,j', d, self.inv_cov, d)
-        chi2 = float(chi2)
+        chi2 = self._compute_chi2(d)
         like = -0.5*chi2
 
         #It can be useful to save the chi^2 as well as the likelihood,
@@ -314,7 +341,7 @@ class SingleValueGaussianLikelihood(GaussianLikelihood):
         self.likelihood_only = options.get_bool('likelihood_only', False)
 
         if not self.likelihood_only:
-            self.chol = sigma
+            self.chol = np.array([[sigma]])
 
 
     def build_data(self):
@@ -357,4 +384,3 @@ class WindowedGaussianLikelihood(GaussianLikelihood):
             values.append(v)
         return np.atleast_1d(values)
         
-

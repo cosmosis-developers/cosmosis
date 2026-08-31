@@ -38,6 +38,64 @@ def test_gaussian():
 
     assert np.isclose(block["likelihoods", "lll_like"], -3*np.log(0.1)/2)
 
+
+def test_scalar_covariance_cholesky():
+    class MyLikelihood(GaussianLikelihood):
+        x_section = "aaa"
+        x_name = "a"
+        y_section = "bbb"
+        y_name = "b"
+        like_name = "lll"
+
+        def build_data(self):
+            return np.array([1.0]), np.array([2.0])
+
+        def build_covariance(self):
+            return np.asarray(0.25)
+
+    mod = MyLikelihood.as_module("my")
+    mod.setup({"my":{"include_norm":True}})
+
+    block = DataBlock()
+    block["aaa", "a"] = np.arange(5.)
+    block["bbb", "b"] = np.arange(5.) + 2.0
+    status = mod.execute(block)
+
+    assert status == 0
+    assert mod.data.cov.shape == (1, 1)
+    assert mod.data.inv_cov.shape == (1, 1)
+    assert mod.data.chol.shape == (1, 1)
+    assert np.isclose(block["data_vector", "lll_chi2"], 4.0)
+    assert np.isclose(block["data_vector", "lll_log_det"], np.log(0.25))
+    assert block["data_vector", "lll_n"] == 1
+
+
+def test_cholesky_chi2_matches_inverse_covariance():
+    class MyLikelihood(GaussianLikelihood):
+        x_section = "aaa"
+        x_name = "a"
+        y_section = "bbb"
+        y_name = "b"
+        like_name = "lll"
+
+        def build_data(self):
+            x_obs = np.array([1.0, 2.0])
+            y_obs = np.array([1.5, -0.5])
+            return x_obs, y_obs
+
+        def build_covariance(self):
+            return np.array([[2.0, 0.3], [0.3, 1.0]])
+
+    mod = MyLikelihood.as_module("my")
+    mod.setup({"my":{}})
+    d = np.array([0.25, -0.75])
+
+    chi2 = mod.data._compute_chi2(d)
+    expected = np.einsum("i,ij,j", d, mod.data.inv_cov, d)
+
+    assert np.isclose(chi2, expected)
+
+
 def test_single_gaussian():
 
     class MySingleLikelihood(SingleValueGaussianLikelihood):
@@ -77,5 +135,4 @@ def test_single_gaussian():
 
 if __name__ == '__main__':
     test_gaussian()
-
 
