@@ -13,7 +13,8 @@ class TextColumnOutput(OutputBase):
     FILE_EXTENSION = ".txt"
     _aliases = ["text", "txt"]
 
-    def __init__(self, filename, rank=0, nchain=1, delimiter='\t', lock=True, resume=False):
+    def __init__(self, filename, rank=0, nchain=1, delimiter='\t', lock=True, resume=False,
+                 blinding_offset_file=None):
         super(TextColumnOutput, self).__init__()
         self.delimiter = delimiter
 
@@ -49,6 +50,10 @@ class TextColumnOutput(OutputBase):
                 print("* Note: You set resume=T but the file {} does not exist so I will start a new one".format(self._filename))
             self._file = open(self._filename, "w")
             self.resumed = False
+        if blinding_offset_file is not None:
+            self._blinding_offsets = np.load(blinding_offset_file)
+        else:
+            self._blinding_offsets = None
         if lock:
             try:
                 self.lock_file(self._file)
@@ -149,8 +154,10 @@ In the last case you can set lock=F in the [output] section to disable this feat
         delimiter = options.get('delimiter', '\t')
         rank = options.get('rank', 0)
         nchain = options.get('parallel', 1)
+        blinding_offset_file = options.get('blinding_offsets', None)
         lock = utils.boolean_string(options.get('lock', True))
-        return cls(filename, rank, nchain, delimiter=delimiter, lock=lock, resume=resume)
+        return cls(filename, rank, nchain, delimiter=delimiter, lock=lock, resume=resume,
+                   blinding_offset_file=blinding_offset_file)
 
     @classmethod
     def load_from_options(cls, options):
