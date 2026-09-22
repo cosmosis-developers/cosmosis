@@ -23,6 +23,7 @@ from .apriori.apriori_sampler import AprioriSampler
 from .dynesty.dynesty_sampler import DynestySampler
 from .zeus.zeus_sampler import ZeusSampler
 from .poco.poco_sampler import PocoMCSampler
+from .rose.rose_sampler import RoseSampler
 from .nautilus.nautilus_sampler import NautilusSampler
 from .latin_hypercube.latin_hypercube import LatinHypercubeSampler
 from .cosmopower_train.cosmopower_train import CosmoPowerSampler

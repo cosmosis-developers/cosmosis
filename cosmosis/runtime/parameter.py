@@ -165,6 +165,20 @@ class Parameter(object):
         else:
             return (p - self.limits[0]) / (self.limits[1] - self.limits[0])
 
+    def normalize_to_prior(self, x):
+        """
+        Return the cumulative distribution function value of this value in the parameter's
+        prior. That is, return the probability that p < x. Outside the prior support this returns
+        nan.
+        """
+        if self.is_fixed():
+            if math.isclose(x, self.start):
+                return 0.5
+            else:
+                return np.nan
+        else:
+            return self.prior.normalize_to_prior(x)
+
 
 
     def denormalize(self, p, raise_exception=True):

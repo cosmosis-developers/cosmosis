@@ -213,6 +213,11 @@ class TabulatedPDF(Prior):
         u"""Get the value for which the cumulated probability is `y`."""
         return self.inverse_cdf_interp(y)
 
+    def normalize_to_prior(self, x):
+        if x < self.lower or x > self.upper:
+            return np.nan
+        return self.cdf_interp(x)
+
     def __str__(self):
         u"""Tersely describe ourself to a human mathematician."""
         return "Tabulated transform from {0} on range [{1}, {2}]".format(self.function_filename, self.lower, self.upper)
@@ -264,6 +269,14 @@ class UniformPrior(Prior):
         else:
             x = y * (self.b-self.a) + self.a
         return x
+
+    def normalize_to_prior(self, x):
+        if x < self.a:
+            return np.nan
+        elif x > self.b:
+            return np.nan
+        else:
+            return (x - self.a) / (self.b - self.a)
 
 
     def __str__(self):
@@ -318,6 +331,10 @@ class GaussianPrior(Prior):
         x = x_normal*self.sigma + self.mu
         return x
 
+    def normalize_to_prior(self, x):
+        """Return the cumulative density funtion for this value"""
+        return normal_cdf((x - self.mu) / self.sigma)
+
     def __str__(self):
         u"""Tersely describe ourself to a human mathematician."""
         return "N({}, {} ** 2)".format(self.mu, self.sigma)
@@ -364,6 +381,12 @@ class TruncatedGaussianPrior(Prior):
         x = x_normal*self.sigma + self.mu
         return x
 
+    def normalize_to_prior(self, x):
+        """Return the cumulative density function for this value, between 0 and 1"""
+        x_normal = (x - self.mu) / self.sigma
+        return truncated_normal_cdf(x_normal, self.a, self.b)
+
+
     def __str__(self):
         u"""Return a terse description of ourself."""
         return "N({}, {} ** 2)   [{} < x < {}]".format(self.mu, self.sigma, self.lower, self.upper)
@@ -405,6 +428,10 @@ class ExponentialPrior(Prior):
         #-x/beta = log(1-y)
         #x = -beta * log(1-y)
         return -self.beta * np.log(1-y)
+
+    def normalize_to_prior(self, x):
+        """Return the cumulative distribution function for this value"""
+        return 1 - np.exp(- x / self.beta)
         
     def __str__(self):
         u"""Give a terse description of ourself."""
@@ -451,6 +478,10 @@ class TruncatedExponentialPrior(Prior):
         x_normal = truncated_exponential_ppf(y, self.a, self.b)
         x = x_normal * self.beta
         return x
+
+    def normalize_to_prior(self, x):
+        x_normal = x / self.beta
+        return truncated_exponential_cdf(x_normal, self.a, self.b)
 
     def __str__(self):
         u"""Give a terse description of ourself."""
@@ -499,6 +530,11 @@ class TruncatedOneoverxPrior(Prior):
         # ln(x) = y*N + ln(a)
         return np.exp(y*self.norm + self.ln_lower)
 
+    def normalize_to_prior(self, x):
+        if x < self.lower or x > self.upper:
+            return np.nan
+        return (np.log(x) - self.ln_lower) / self.norm
+
     def __str__(self):
         u"""Give a terse description of ourself."""
         return "1/x   [{} < x < {}]".format(self.lower, self.upper)
@@ -540,6 +576,12 @@ class DeltaFunctionPrior(Prior):
     def denormalize_from_prior(self, x):
         u"""Just return `x0`; itʼs the only value with any probability."""
         return self.x0
+
+    def normalize_to_prior(self, x):
+        """Normalize a value to a point in the prior; returns 0.5 if x == x0 and np.nan otherwise"""
+        if x != self.x0:
+            return np.nan
+        return 0.5
         
 
 
