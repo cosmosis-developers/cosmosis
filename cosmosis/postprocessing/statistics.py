@@ -26,6 +26,13 @@ def _fisher_to_covariance(fisher):
     return sp.linalg.cho_solve(factor, np.eye(fisher.shape[0]), check_finite=True)
 
 
+def _finite_standard_deviations(covariance):
+    diagonal = np.asarray(covariance).diagonal()
+    if not np.all(np.isfinite(diagonal)) or np.any(diagonal < 0):
+        raise ValueError("Covariance diagonal must be finite and non-negative")
+    return np.sqrt(diagonal)
+
+
 
 class Statistics(PostProcessorElement):
     def __init__(self, *args, **kwargs):
@@ -918,7 +925,7 @@ class PolychordCovariance(MultinestCovariance):
 
 class CovarianceMatrix1D(Statistics):
     def run(self):
-        Sigma = _fisher_to_covariance(self.source.data[0]).diagonal()**0.5
+        Sigma = _finite_standard_deviations(_fisher_to_covariance(self.source.data[0]))
         Mu = [float(self.source.metadata[0]['mu_{0}'.format(i)]) for i in range(Sigma.size)]        
         cols = ['param', 'mean', 'std-dev', 'data_set']
         t = self.get_table_output("means", cols)
@@ -946,7 +953,10 @@ class CovarianceMatrixEllipseAreas(Statistics):
                 if j>=i: continue
                 #Get the 2x2 sub-matrix
                 C = covmat_estimate[:,[i,j]][[i,j],:]
-                area = 6.17 * np.pi * np.sqrt(np.linalg.det(C))
+                det = np.linalg.det(C)
+                if not np.isfinite(det) or det <= 0:
+                    raise ValueError("Covariance ellipse must have a finite positive determinant")
+                area = 6.17 * np.pi * np.sqrt(det)
                 fom = 1.0/area
                 t.append([p1, p2, area, fom, self.source.label])
 
@@ -959,6 +969,8 @@ class FisherFigureOfMerit(Statistics):
         t = self.get_table_output("fisher_fom", cols)
         F = self.source.data[0]
         n = self.source.metadata[0]['n_varied']
+        if not np.isscalar(n) or n <= 0:
+            raise ValueError("Number of varied parameters must be positive")
         sign, logdet = np.linalg.slogdet(F)
         if sign <= 0 or not np.isfinite(logdet):
             raise ValueError("Fisher matrix must have a positive finite determinant")
