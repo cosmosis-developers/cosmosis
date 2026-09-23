@@ -1,6 +1,7 @@
 from ...runtime import logs
 from numpy import pi, dot, exp, einsum
 import numpy as np
+from scipy.linalg import solve_triangular
 
 
 class PopulationMonteCarlo(object):
@@ -129,9 +130,12 @@ class GaussianComponent(object):
 		self.mu = mu
 		ndim = len(self.mu)
 		self.sigma = sigma
-		self.sigma_inv = np.linalg.inv(self.sigma)
-		self.A = (2*pi)**(-ndim/2.0) * np.linalg.det(self.sigma)**-0.5
-		self.logA = np.log(self.A)
+		self.sigma_cholesky = np.linalg.cholesky(self.sigma)
+		log_det = 2.0 * np.log(np.diag(self.sigma_cholesky)).sum()
+		self.logA = -0.5 * (ndim*np.log(2*pi) + log_det)
+		# Retain the historical normalization attribute for callers that
+		# inspect it; evaluations use logA to avoid unnecessary overflow.
+		self.A = exp(self.logA)
 
 	def update(self, w_norm, x, rho_d):
 		"Update the parameters according to the samples and rho values"
@@ -147,14 +151,16 @@ class GaussianComponent(object):
 	def phi(self, x):
 		"Evaluate the distribution"
 		d = (x-self.mu) #n_sample * n_dim
-		chi2 = einsum('ij,jk,ik->i',d,self.sigma_inv,d)
+		z = solve_triangular(self.sigma_cholesky, d.T, lower=True).T
+		chi2 = einsum('ij,ij->i', z, z)
 		#result size n_sample
-		return self.A * exp(-0.5*chi2)
+		return exp(self.logA - 0.5*chi2)
 
 	def log_phi(self, x):
 		"Evaluate the log distribution"
 		d = (x-self.mu) #n_sample * n_dim
-		chi2 = einsum('ij,jk,ik->i',d,self.sigma_inv,d)
+		z = solve_triangular(self.sigma_cholesky, d.T, lower=True).T
+		chi2 = einsum('ij,ij->i', z, z)
 		return self.logA - 0.5*chi2
 
 
@@ -187,8 +193,11 @@ class StudentsTComponent(object):
 		p = self.ndim
 		nu=self.nu
 		self.sigma = sigma
-		self.sigma_inv = np.linalg.inv(self.sigma)
-		self.A = gamma((nu+p)/2.)/gamma(nu/2.) / (pi*nu)**(p/2.) * np.linalg.det(self.sigma)**-0.5
+		self.sigma_cholesky = np.linalg.cholesky(self.sigma)
+		log_det = 2.0 * np.log(np.diag(self.sigma_cholesky)).sum()
+		self.logA = (np.log(gamma((nu+p)/2.)) - np.log(gamma(nu/2.))
+			- (p/2.)*np.log(pi*nu) - 0.5*log_det)
+		self.A = exp(self.logA)
 
 	def update(self, w_norm, x, rho_d):
 		"Update the parameters according to the samples and rho values"
@@ -208,14 +217,15 @@ class StudentsTComponent(object):
 	def phi(self, x):
 		"Evaluate the distribution.  This is called tau in the paper"
 		d = (x-self.mu) #n_sample * n_dim
-		chi2 = einsum('ij,jk,ik->i',d,self.sigma_inv,d) #size n_sample
+		z = solve_triangular(self.sigma_cholesky, d.T, lower=True).T
+		chi2 = einsum('ij,ij->i', z, z) #size n_sample
 		#record this chi2 as we will need it later.
 		#valid until x,mu,or sigma_d changes
 		self.chi2=chi2
 		#result size n_sample
 		nu=self.nu
 		p=self.ndim
-		return self.A * (1.0+chi2/nu)**(-(nu+p)/2.0)
+		return exp(self.logA) * (1.0+chi2/nu)**(-(nu+p)/2.0)
 
 	def sample(self):
 		"Draw a sample from the distribution"
