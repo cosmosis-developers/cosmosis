@@ -14,6 +14,17 @@ def test_symmetric_positive_definite_inverse_validates_and_solves():
 def test_symmetric_positive_definite_inverse_rejects_invalid_matrix(matrix):
     with pytest.raises(ValueError):
         cosmosis.utils.symmetric_positive_definite_inverse(matrix)
+
+
+def test_normalized_log_weights_handles_zero_weight_samples():
+    weights = cosmosis.utils.normalized_log_weights(np.array([-np.inf, 0.0, -2.0]))
+    np.testing.assert_allclose(weights, [0.0, 1.0, np.exp(-2.0)])
+
+
+@pytest.mark.parametrize("log_weights", [np.array([]), np.array([np.nan, 0.0]), np.array([-np.inf, -np.inf])])
+def test_normalized_log_weights_rejects_invalid_inputs(log_weights):
+    with pytest.raises(ValueError):
+        cosmosis.utils.normalized_log_weights(log_weights)
 import tempfile
 import os
 import contextlib
