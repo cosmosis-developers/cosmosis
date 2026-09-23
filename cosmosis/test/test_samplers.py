@@ -408,6 +408,16 @@ def test_multinest():
 def test_pmaxlike():
     run('pmaxlike', True, can_postprocess=False, hints_cov=False)
 
+
+def test_pmaxlike_hessian_result_uses_hessian_matrix():
+    from types import SimpleNamespace
+    from cosmosis.samplers.pmaxlike.pmaxlike_sampler import covariance_from_optimizer_result
+
+    hessian = np.array([[2.0, 0.2], [0.2, 3.0]])
+    result = SimpleNamespace(hess=hessian)
+    covariance = covariance_from_optimizer_result(result, lambda matrix: matrix)
+    np.testing.assert_allclose(covariance, np.linalg.inv(hessian))
+
 def test_pmc():
     old_settings = np.seterr(invalid='ignore', divide='ignore')
     try:
