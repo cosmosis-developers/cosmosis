@@ -3,6 +3,7 @@ from ...runtime import logs
 from ...runtime.pipeline import PipelineResults
 import numpy as np
 import scipy.optimize
+import scipy.linalg
 import warnings
 
 # The likelihood function we wish to optimize.
@@ -22,6 +23,27 @@ def likefn(p_in):
 def run_optimizer(start_vector):
     global sampler
     return sampler.run_optimizer(start_vector)
+
+
+def _covariance_from_hessian(hessian):
+    """Return the covariance implied by a finite, symmetric SPD Hessian.
+
+    Solving ``H C = I`` avoids forming an explicit inverse while retaining
+    the historical covariance matrix API used by the sampler.
+    """
+    hessian = np.asarray(hessian, dtype=float)
+    if hessian.ndim != 2 or hessian.shape[0] != hessian.shape[1]:
+        raise ValueError("optimizer Hessian must be a square matrix")
+    if not np.all(np.isfinite(hessian)):
+        raise ValueError("optimizer Hessian must contain only finite values")
+    if not np.allclose(hessian, hessian.T, rtol=1e-10, atol=1e-12):
+        raise ValueError("optimizer Hessian must be symmetric")
+    try:
+        factor = scipy.linalg.cho_factor(hessian, lower=True, check_finite=True)
+        covariance = scipy.linalg.cho_solve(factor, np.eye(hessian.shape[0]), check_finite=True)
+    except scipy.linalg.LinAlgError as exc:
+        raise ValueError("optimizer Hessian must be positive definite") from exc
+    return (covariance + covariance.T) / 2.0
 
 class MaxlikeSampler(ParallelSampler):
     parallel_output = False
@@ -212,7 +234,7 @@ class MaxlikeSampler(ParallelSampler):
             else:
                 results.covmat = self.pipeline.denormalize_matrix(optimizer_result.hess_inv)
         elif hasattr(optimizer_result, 'hess'):
-            results.covmat = self.pipeline.denormalize_matrix(np.linalg.inv(optimizer_result.hess))
+            results.covmat = self.pipeline.denormalize_matrix(_covariance_from_hessian(optimizer_result.hess))
         else:
             results.covmat = None
 
