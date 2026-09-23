@@ -19,6 +19,8 @@ import warnings
 
 def _stable_logsumexp(values):
 	"""Stable log(sum(exp(values))) for posterior marginalization."""
+	if np.size(values) == 0:
+		return -np.inf
 	return logsumexp(values)
 
 
@@ -242,6 +244,9 @@ class GridPlots1D(GridPlots):
         cols1 = self.source.get_col(name1)
         try: like = self.source.get_col("post")
         except: like = self.source.get_col("like")
+        if np.size(like) == 0:
+            warnings.warn("Skipping plot with no likelihood samples")
+            return None
         vals1 = np.unique(cols1)
         n1 = len(vals1)
         like_sum = np.zeros(n1)
