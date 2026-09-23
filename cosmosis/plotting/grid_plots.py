@@ -34,6 +34,8 @@ class GridPlotter(Plotter):
 	@staticmethod
 	def _logsumexp(values):
 		"""Stable log(sum(exp(values))) for grid marginalization."""
+		if np.size(values) == 0:
+			return -np.inf
 		return logsumexp(values)
 
 	#def __init__(self, *args, **kwargs):
