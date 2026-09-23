@@ -1,4 +1,19 @@
 import cosmosis.utils
+import numpy as np
+import pytest
+
+
+def test_symmetric_positive_definite_inverse_validates_and_solves():
+    matrix = np.array([[4.0, 1.0], [1.0, 3.0]])
+    inverse = cosmosis.utils.symmetric_positive_definite_inverse(matrix)
+    np.testing.assert_allclose(inverse @ matrix, np.eye(2), atol=1e-12)
+    np.testing.assert_allclose(inverse, inverse.T)
+
+
+@pytest.mark.parametrize("matrix", [np.array([[1.0, 2.0], [0.0, 1.0]]), np.array([[1.0, 2.0], [2.0, -1.0]])])
+def test_symmetric_positive_definite_inverse_rejects_invalid_matrix(matrix):
+    with pytest.raises(ValueError):
+        cosmosis.utils.symmetric_positive_definite_inverse(matrix)
 import tempfile
 import os
 import contextlib
