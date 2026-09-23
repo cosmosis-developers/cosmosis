@@ -45,6 +45,15 @@ def posterior_and_gradient(p_in):
     return post, grad
 
 
+def covariance_from_optimizer_result(result, denormalize_matrix):
+    """Extract the optimizer covariance in normalized coordinates."""
+    if hasattr(result, 'hess_inv'):
+        return denormalize_matrix(result.hess_inv)
+    if hasattr(result, 'hess'):
+        return denormalize_matrix(np.linalg.inv(result.hess))
+    return None
+
+
 
 
 class PmaxlikeSampler(ParallelSampler):
@@ -99,11 +108,9 @@ class PmaxlikeSampler(ParallelSampler):
         #Also if requested, approximate the covariance matrix with the 
         #inverse of the Hessian matrix.
         #For a gaussian likelihood this is exact.
-        covmat = None
-        if hasattr(result, 'hess_inv'):
-            covmat = self.pipeline.denormalize_matrix(result.hess_inv)
-        elif hasattr(result, 'hess'):
-            covmat = self.pipeline.denormalize_matrix(np.linalg.inv(result.hess_inv))
+        covmat = covariance_from_optimizer_result(
+            result, self.pipeline.denormalize_matrix
+        )
 
         if covmat is None:
             if self.output_cov:
