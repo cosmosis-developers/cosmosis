@@ -255,7 +255,8 @@ class Sampler(metaclass=RegisteredSampler):
                 weight = data[:, weight_index]
             elif 'log_weight' in maybe_colnames:
                 log_weight_index = maybe_colnames.index('log_weight')
-                weight = np.exp(data[:, log_weight_index] - data[:, log_weight_index].max())
+                from .. import utils
+                weight = utils.normalized_log_weights(data[:, log_weight_index])
             else:
                 weight = np.ones(len(data))
             weight /= weight.sum()
