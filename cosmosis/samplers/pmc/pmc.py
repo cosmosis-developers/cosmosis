@@ -1,6 +1,7 @@
 from ...runtime import logs
 from numpy import pi, dot, exp, einsum
 import numpy as np
+from scipy.special import logsumexp
 
 
 class PopulationMonteCarlo(object):
@@ -75,29 +76,26 @@ class PopulationMonteCarlo(object):
 
 		#x #n_sample*n_dim
 		log_Aphi = np.array([np.log(m.alpha) + m.log_phi(x) for m in self.components]) #n-component * n_sample
-		Aphi = np.array([m.alpha*m.phi(x) for m in self.components]) #n-component * n_sample
-		post = np.exp(log_post)
-		w = post/Aphi.sum(0) #n_sample
-		logw = log_post - np.log(Aphi.sum(0))
+		log_mixture = logsumexp(log_Aphi, axis=0)
+		logw = log_post - log_mixture
 
 
 		if not update:
 			return logw
 
-		w_norm = w/w.sum()  #n_sample
-
-		logw_norm = np.log(w_norm)
-		entropy =  -(w_norm*logw_norm).sum()
+		logw_norm = logw - logsumexp(logw)
+		w_norm = np.exp(logw_norm)  #n_sample
+		valid_weights = np.isfinite(logw_norm) & (w_norm > 0.0)
+		entropy = -(w_norm[valid_weights]*logw_norm[valid_weights]).sum()
 		perplexity = np.exp(entropy) / len(x)
 		logs.debug(f"Perplexity = {perplexity}")
 
 
-		Aphi[np.isnan(Aphi)] = 0.0
-		w_norm[np.isnan(w_norm)] = 0.0
-		A = [m.alpha for m in self.components]
-		#rho_top = einsum('i,ij->ij', A, phi)  #n_component * n_sample
-		rho_bottom = Aphi.sum(0) #n_sample
-		rho = [rho_t/rho_bottom for rho_t in Aphi]
+		# Responsibilities are normalized in log space, avoiding underflow
+		# when all component densities are far below machine precision.
+		log_rho = log_Aphi - log_mixture
+		rho = np.exp(log_rho)
+		rho[~np.isfinite(rho)] = 0.0
 
 
 

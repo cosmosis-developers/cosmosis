@@ -420,6 +420,31 @@ def test_pmc():
         run('pmc', True, iterations=3, hints_cov=False)
     np.seterr(**old_settings)  
 
+
+def test_pmc_log_domain_weights_survive_extreme_posteriors():
+    from cosmosis.samplers.pmc.pmc import PopulationMonteCarlo
+
+    class Component:
+        def __init__(self, alpha, values):
+            self.alpha = alpha
+            self.values = np.asarray(values)
+            self.updated = None
+        def log_phi(self, x):
+            return self.values
+        def update(self, weights, x, rho):
+            self.updated = (weights, rho)
+
+    sampler = PopulationMonteCarlo.__new__(PopulationMonteCarlo)
+    sampler.components = [Component(0.5, [-1000.0, -1001.0]),
+                          Component(0.5, [-1002.0, -1003.0])]
+    sampler.kill = [False, False]
+    x = np.zeros((2, 1))
+    logw = sampler.update_components(x, np.array([-1000.0, -1001.0]), True, False)
+    assert np.all(np.isfinite(logw))
+    weights = sampler.components[0].updated[0]
+    assert np.all(np.isfinite(weights))
+    np.testing.assert_allclose(weights.sum(), 1.0)
+
 def test_zeus():
     run('zeus', True, maxiter=100_000, walkers=10, samples=100, nsteps=50, verbose=True)
     run('zeus', True, maxiter=100_000, walkers=10, samples=100, nsteps=50, moves="differential:2.0  global", tolerance=0.1, patience=5000)
