@@ -10,10 +10,16 @@ from . import cosmology_theory_plots
 import configparser
 import numpy as np
 import scipy.optimize
+from scipy.special import logsumexp
 from . import lazy_pylab as pylab
 import itertools
 import os
 import warnings
+
+
+def _stable_logsumexp(values):
+	"""Stable log(sum(exp(values))) for posterior marginalization."""
+	return logsumexp(values)
 
 
 default_latex_file = os.path.join(os.path.split(__file__)[0], "latex.ini")
@@ -247,7 +253,7 @@ class GridPlots1D(GridPlots):
         #marginalize
         for k,v1 in enumerate(vals1):
             w = np.where(cols1==v1)
-            like_sum[k] = np.log(np.exp(like[w]).sum())
+            like_sum[k] = _stable_logsumexp(like[w])
         like = like_sum.flatten()
         like -= like.max()
 
@@ -365,7 +371,7 @@ class GridPlots2D(GridPlots):
         for k,(v1, v2) in enumerate(itertools.product(vals1, vals2)):
             w = np.where((cols1==v1)&(cols2==v2))
             i,j = np.unravel_index(k, like_sum.shape)
-            like_sum[i,j] = np.log(np.exp(like[w]).sum())
+            like_sum[i,j] = _stable_logsumexp(like[w])
         like = like_sum.flatten()
 
         #Normalize the log-likelihood to peak=0
@@ -459,7 +465,7 @@ class SnakePlots2D(GridPlots2D):
             w = np.where((cols1==v1)&(cols2==v2))
             i = int(np.round((v1-left1)/dx1))
             j = int(np.round((v2-left2)/dx2))
-            like_sum[i,j] = np.log(np.exp(like[w]).sum())
+            like_sum[i,j] = _stable_logsumexp(like[w])
         like = like_sum.flatten()
 
         #Normalize the log-likelihood to peak=0
