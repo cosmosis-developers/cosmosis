@@ -13,6 +13,26 @@ from .utils import std_weight, mean_weight, median_weight, percentile_weight, fi
 from .outputs import PostprocessText, PostprocessTable, MiniTable
 
 
+def _fisher_to_covariance(fisher):
+    """Convert a Fisher matrix to covariance with SPD validation."""
+    fisher = np.asarray(fisher, dtype=float)
+    if fisher.ndim != 2 or fisher.shape[0] != fisher.shape[1]:
+        raise ValueError("Fisher matrix must be square")
+    if not np.all(np.isfinite(fisher)):
+        raise ValueError("Fisher matrix must be finite")
+    if not np.allclose(fisher, fisher.T):
+        raise ValueError("Fisher matrix must be symmetric")
+    factor = sp.linalg.cho_factor(fisher, lower=True, check_finite=True)
+    return sp.linalg.cho_solve(factor, np.eye(fisher.shape[0]), check_finite=True)
+
+
+def _finite_standard_deviations(covariance):
+    diagonal = np.asarray(covariance).diagonal()
+    if not np.all(np.isfinite(diagonal)) or np.any(diagonal < 0):
+        raise ValueError("Covariance diagonal must be finite and non-negative")
+    return np.sqrt(diagonal)
+
+
 
 class Statistics(PostProcessorElement):
     def __init__(self, *args, **kwargs):
@@ -905,7 +925,7 @@ class PolychordCovariance(MultinestCovariance):
 
 class CovarianceMatrix1D(Statistics):
     def run(self):
-        Sigma = np.linalg.inv(self.source.data[0]).diagonal()**0.5
+        Sigma = _finite_standard_deviations(_fisher_to_covariance(self.source.data[0]))
         Mu = [float(self.source.metadata[0]['mu_{0}'.format(i)]) for i in range(Sigma.size)]        
         cols = ['param', 'mean', 'std-dev', 'data_set']
         t = self.get_table_output("means", cols)
@@ -927,13 +947,16 @@ class CovarianceMatrixEllipseAreas(Statistics):
         cols = ["param1", "param2", "area", "figure_of_merit", "data_set"]
         t = self.get_table_output("ellipse_areas", cols)
 
-        covmat_estimate = np.linalg.inv(self.source.data[0])
+        covmat_estimate = _fisher_to_covariance(self.source.data[0])
         for i,p1 in enumerate(params[:]):
             for j,p2 in enumerate(params[:]):
                 if j>=i: continue
                 #Get the 2x2 sub-matrix
                 C = covmat_estimate[:,[i,j]][[i,j],:]
-                area = 6.17 * np.pi * np.sqrt(np.linalg.det(C))
+                det = np.linalg.det(C)
+                if not np.isfinite(det) or det <= 0:
+                    raise ValueError("Covariance ellipse must have a finite positive determinant")
+                area = 6.17 * np.pi * np.sqrt(det)
                 fom = 1.0/area
                 t.append([p1, p2, area, fom, self.source.label])
 
@@ -946,7 +969,12 @@ class FisherFigureOfMerit(Statistics):
         t = self.get_table_output("fisher_fom", cols)
         F = self.source.data[0]
         n = self.source.metadata[0]['n_varied']
-        fom = (np.linalg.det(F))**(-0.5 / n)
+        if not np.isscalar(n) or n <= 0:
+            raise ValueError("Number of varied parameters must be positive")
+        sign, logdet = np.linalg.slogdet(F)
+        if sign <= 0 or not np.isfinite(logdet):
+            raise ValueError("Fisher matrix must have a positive finite determinant")
+        fom = np.exp(-0.5 * logdet / n)
         t.append([fom, self.source.label])
         return [t]
 
