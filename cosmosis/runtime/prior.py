@@ -422,6 +422,10 @@ class TruncatedExponentialPrior(Prior):
 
     def __init__(self, beta, lower, upper):
         u"""Create a distribution with ‘half-life’ `beta`, `lower` bound of non-zero probability, and `upper` bound."""
+        if not np.isfinite(beta) or beta <= 0:
+            raise ValueError("Exponential prior beta must be finite and positive")
+        if not np.isfinite(lower) or not np.isfinite(upper) or upper < 0 or upper < lower:
+            raise ValueError("Exponential prior bounds must be finite and ordered")
         self.beta = beta
         self.log_beta = np.log(beta)
         if lower<0:
@@ -468,6 +472,10 @@ class TruncatedOneoverxPrior(Prior):
 
     def __init__(self, lower, upper):
         u"""Create a distribution with 1/x, `lower` bound of non-zero probability, and `upper` bound."""
+        if not np.isfinite(upper) or upper <= 0:
+            raise ValueError("1/x prior upper bound must be finite and positive")
+        if not np.isfinite(lower) or lower >= upper:
+            raise ValueError("1/x prior bounds must be finite and ordered")
         if lower<=0:
             lower = np.nextafter(0, 1)
         self.lower = lower
