@@ -18,6 +18,17 @@ def test_tabulated_prior_rejects_negative_density(tmp_path, density):
         TabulatedPDF(table)
 
 
+def test_tabulated_prior_rejects_negative_integral(tmp_path):
+    table = tmp_path / "prior.txt"
+    # Positive densities still produce a negative integration interval
+    # when the table's coordinates are not ordered.
+    np.savetxt(table, [[0.0, 1.0], [2.0, 1.0], [1.0, 1.0]])
+
+    with pytest.raises(ValueError, match="Negative probability") as error:
+        TabulatedPDF(table)
+    assert error.value.args[1] == table
+
+
 def test_tabulated_prior_accepts_zero_density(tmp_path):
     table = tmp_path / "prior.txt"
     np.savetxt(table, [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])
