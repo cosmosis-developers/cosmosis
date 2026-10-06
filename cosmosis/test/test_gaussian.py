@@ -1,5 +1,5 @@
 from cosmosis.runtime import FunctionModule
-from cosmosis.datablock import DataBlock
+from cosmosis.datablock import DataBlock, SectionOptions
 from cosmosis.gaussian_likelihood import GaussianLikelihood, SingleValueGaussianLikelihood, WindowedGaussianLikelihood
 import numpy as np
 import os
@@ -146,7 +146,9 @@ def test_windowed_gaussian_uses_current_scipy_apis():
         def build_windows(self):
             return [(np.array([0.0, 1.0]), np.array([1.0, 1.0]))]
 
-    likelihood = MyWindowedLikelihood({"kind": "linear"})
+    options_block = DataBlock()
+    options_block["module_options", "kind"] = "linear"
+    likelihood = MyWindowedLikelihood(SectionOptions(options_block))
     theory_x = np.array([0.0, 0.5, 1.0])
     theory_y = theory_x**2
 
