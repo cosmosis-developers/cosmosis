@@ -1,6 +1,6 @@
 from cosmosis.runtime import FunctionModule
 from cosmosis.datablock import DataBlock
-from cosmosis.gaussian_likelihood import GaussianLikelihood, SingleValueGaussianLikelihood
+from cosmosis.gaussian_likelihood import GaussianLikelihood, SingleValueGaussianLikelihood, WindowedGaussianLikelihood
 import numpy as np
 import os
 
@@ -133,6 +133,29 @@ def test_single_gaussian():
     assert np.isclose(block["likelihoods", "xxx_like"], -50.0 - np.log(0.1))
 
 
+def test_windowed_gaussian_uses_current_scipy_apis():
+    class MyWindowedLikelihood(WindowedGaussianLikelihood):
+        like_name = "windowed"
+
+        def build_data(self):
+            return np.array([0.0]), np.array([0.0])
+
+        def build_covariance(self):
+            return np.array([[1.0]])
+
+        def build_windows(self):
+            return [(np.array([0.0, 1.0]), np.array([1.0, 1.0]))]
+
+    likelihood = MyWindowedLikelihood({"kind": "linear"})
+    theory_x = np.array([0.0, 0.5, 1.0])
+    theory_y = theory_x**2
+
+    # Exact integral of the piecewise-linear interpolant over the window.
+    expected = 0.375
+    result = likelihood.generate_theory_points(theory_x, theory_y)
+
+    assert np.allclose(result, [expected])
+
+
 if __name__ == '__main__':
     test_gaussian()
-
