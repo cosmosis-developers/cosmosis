@@ -23,6 +23,7 @@ import collections
 from .plotter import Plotter
 import itertools
 import scipy.optimize
+from scipy.special import logsumexp
 try:
 	from cosmosis import output as output_module
 except ImportError:
@@ -30,6 +31,13 @@ except ImportError:
 
 
 class GridPlotter(Plotter):
+	@staticmethod
+	def _logsumexp(values):
+		"""Stable log(sum(exp(values))) for grid marginalization."""
+		if np.size(values) == 0:
+			return -np.inf
+		return logsumexp(values)
+
 	#def __init__(self, *args, **kwargs):
 		# super(GridPlotter, self).__init__(*args, **kwargs)
 		# convert the loaded chain data sets into grids
@@ -69,7 +77,7 @@ class GridPlotter(Plotter):
 		#marginalize
 		for k,v1 in enumerate(vals1):
 			w = np.where(cols1==v1)
-			like_sum[k] = np.log(np.exp(like[w]).sum())
+			like_sum[k] = self._logsumexp(like[w])
 		like = like_sum.flatten()
 
 		#linearly interpolate
@@ -149,7 +157,7 @@ class GridPlotter(Plotter):
 		for k,(v1, v2) in enumerate(itertools.product(vals1, vals2)):
 			w = np.where((cols1==v1)&(cols2==v2))
 			i,j = np.unravel_index(k, like_sum.shape)
-			like_sum[i,j] = np.log(np.exp(like[w]).sum())
+			like_sum[i,j] = self._logsumexp(like[w])
 		like = like_sum.flatten()
 
 		#Normalize the log-likelihood to peak=0
@@ -210,4 +218,3 @@ class GridPlotter(Plotter):
 		sm = pylab.cm.ScalarMappable(cmap=colormap, norm=norm)
 		sm._A = [] #hack from StackOverflow to make this work
 		pylab.colorbar(sm, label='Likelihood')
-
