@@ -420,6 +420,24 @@ def test_pmc():
         run('pmc', True, iterations=3, hints_cov=False)
     np.seterr(**old_settings)  
 
+def test_pmc_component_cholesky_matches_quadratic_form():
+    from cosmosis.samplers.pmc.pmc import GaussianComponent, StudentsTComponent
+
+    sigma = np.array([[2.0, 0.3], [0.3, 1.2]])
+    mu = np.array([0.2, -0.1])
+    x = np.array([[0.2, -0.1], [1.0, 0.4], [-0.3, 1.2]])
+    inverse = np.linalg.inv(sigma)
+    delta = x - mu
+    chi2 = np.einsum('ij,jk,ik->i', delta, inverse, delta)
+
+    gaussian = GaussianComponent(1.0, mu, sigma)
+    expected_log_phi = -0.5 * (2*np.log(2*np.pi) + np.linalg.slogdet(sigma)[1]) - 0.5*chi2
+    np.testing.assert_allclose(gaussian.log_phi(x), expected_log_phi)
+
+    student = StudentsTComponent(1.0, mu, sigma, 2.0)
+    expected_phi = np.exp(student.logA) * (1.0 + chi2/2.0)**(-2.0)
+    np.testing.assert_allclose(student.phi(x), expected_phi)
+
 def test_zeus():
     run('zeus', True, maxiter=100_000, walkers=10, samples=100, nsteps=50, verbose=True)
     run('zeus', True, maxiter=100_000, walkers=10, samples=100, nsteps=50, moves="differential:2.0  global", tolerance=0.1, patience=5000)
