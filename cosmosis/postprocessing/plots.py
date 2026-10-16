@@ -10,10 +10,22 @@ from . import cosmology_theory_plots
 import configparser
 import numpy as np
 import scipy.optimize
+from scipy.linalg import cho_factor, cho_solve
 from . import lazy_pylab as pylab
 import itertools
 import os
 import warnings
+
+
+def _fisher_to_plot_covariance(fisher):
+    """Convert a Fisher matrix to covariance with SPD validation."""
+    fisher = np.asarray(fisher, dtype=float)
+    if fisher.ndim != 2 or fisher.shape[0] != fisher.shape[1]:
+        raise ValueError("Fisher matrix must be square")
+    if not np.all(np.isfinite(fisher)) or not np.allclose(fisher, fisher.T):
+        raise ValueError("Fisher matrix must be finite and symmetric")
+    factor = cho_factor(fisher, lower=True, check_finite=True)
+    return cho_solve(factor, np.eye(fisher.shape[0]), check_finite=True)
 
 
 default_latex_file = os.path.join(os.path.split(__file__)[0], "latex.ini")
@@ -1066,7 +1078,7 @@ class PolychordColorScatterPlot(MultinestColorScatterPlot):
 class CovarianceMatrixGaussians(Plots):
     def run(self):
         filenames = []
-        Sigma = np.linalg.inv(self.source.data[0]).diagonal()**0.5
+        Sigma = _fisher_to_plot_covariance(self.source.data[0]).diagonal()**0.5
         Mu = [float(self.source.metadata[0]['mu_{0}'.format(i)]) for i in range(Sigma.size)]
 
         for name, mu, sigma in zip(self.source.colnames, Mu, Sigma):
@@ -1096,7 +1108,7 @@ class CovarianceMatrixEllipse(Plots):
 
     def run(self):
         filenames = []
-        self.covmat_estimate = np.linalg.inv(self.source.data[0])
+        self.covmat_estimate = _fisher_to_plot_covariance(self.source.data[0])
         for name1, name2 in self.parameter_pairs():
             i = self.source.colnames.index(name1)
             j = self.source.colnames.index(name2)
