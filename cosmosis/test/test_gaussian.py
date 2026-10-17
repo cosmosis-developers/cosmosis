@@ -1,6 +1,6 @@
 from cosmosis.runtime import FunctionModule
 from cosmosis.datablock import DataBlock
-from cosmosis.gaussian_likelihood import GaussianLikelihood, SingleValueGaussianLikelihood
+from cosmosis.gaussian_likelihood import GaussianLikelihood, SingleValueGaussianLikelihood, WindowedGaussianLikelihood
 import numpy as np
 import os
 
@@ -136,3 +136,14 @@ def test_single_gaussian():
 if __name__ == '__main__':
     test_gaussian()
 
+
+
+def test_windowed_gaussian_uses_current_scipy_apis():
+    likelihood = WindowedGaussianLikelihood.__new__(WindowedGaussianLikelihood)
+    likelihood.kind = "linear"
+    likelihood.data_x = np.array([1.0, 2.0])
+    likelihood.windows = [(np.array([1.0, 2.0, 3.0]), np.ones(3))]
+    theory_x = np.array([0.0, 1.0, 2.0, 3.0])
+    theory_y = theory_x.copy()
+    actual = likelihood.generate_theory_points(theory_x, theory_y)
+    assert np.allclose(actual, [4.0])
