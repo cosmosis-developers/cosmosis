@@ -184,8 +184,8 @@ class WeightedMetropolisProcessor(MetropolisHastingsProcessor):
 			old_logw = MetropolisHastingsProcessor.reduced_col(self, "old_log_weight").copy()
 			logw += old_logw
 			print("Including old_log_weight in weight")
-		logw-=np.nanmax(logw)
-		self._weight_col = np.exp(logw)
+		from .. import utils
+		self._weight_col = utils.normalized_log_weights(logw)
 		return self._weight_col    
 
 	def posterior_sample(self):

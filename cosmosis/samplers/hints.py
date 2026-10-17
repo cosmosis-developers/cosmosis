@@ -1,4 +1,5 @@
 import numpy as np
+from .. import utils
 
 class Hints(object):
     def __init__(self):
@@ -12,7 +13,7 @@ class Hints(object):
         if log_weights is not None:
             if weights is not  None:
                 raise ValueError("You must provide either weights or log_weights, not both")
-            weights = np.exp(log_weights - log_weights.max())
+            weights = utils.normalized_log_weights(log_weights)
         self.set_cov(np.cov(samples.T, aweights=weights))
 
     def has_peak(self):
