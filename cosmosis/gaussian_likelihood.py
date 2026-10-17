@@ -269,7 +269,19 @@ class GaussianLikelihood:
         return self.generate_theory_points(theory_x, theory_y)
 
     def generate_theory_points(self, theory_x, theory_y):
-        "Generate theory predicted data points by interpolation into the theory"
+        """Generate theory predicted data points by interpolation into the theory.
+
+        Linear interpolation uses ``numpy.interp`` directly.  This avoids
+        constructing a SciPy interpolator on every pipeline evaluation while
+        preserving SciPy's default bounds-error behavior.
+        """
+        if self.kind == "linear":
+            theory_x = np.asarray(theory_x)
+            theory_y = np.asarray(theory_y)
+            data_x = np.asarray(self.data_x)
+            if np.any(data_x < theory_x[0]) or np.any(data_x > theory_x[-1]):
+                raise ValueError("A value in x_new is outside the interpolation range.")
+            return np.atleast_1d(np.interp(data_x, theory_x, theory_y))
         f = scipy.interpolate.interp1d(theory_x, theory_y, kind=self.kind)
         return np.atleast_1d(f(self.data_x))
 
