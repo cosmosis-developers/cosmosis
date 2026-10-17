@@ -170,14 +170,21 @@ def symmetric_positive_definite_inverse(M):
 
     """
     import scipy.linalg
-    U,status = scipy.linalg.lapack.dpotrf(M)
-    if status != 0:
-        raise ValueError("Non-symmetric positive definite matrix")
-    M,status = scipy.linalg.lapack.dpotri(U)
-    if status != 0:
-        raise ValueError("Error in Cholesky factorization")
-    M = symmetrized_matrix(M)
-    return M
+    M = np.asarray(M, dtype=float)
+    if M.ndim != 2 or M.shape[0] != M.shape[1]:
+        raise ValueError("Matrix must be square")
+    if not np.all(np.isfinite(M)):
+        raise ValueError("Matrix must contain only finite values")
+    if not np.allclose(M, M.T, rtol=1e-10, atol=1e-12):
+        raise ValueError("Matrix must be symmetric")
+    try:
+        factor = scipy.linalg.cho_factor(M, lower=True, check_finite=True)
+        inverse = scipy.linalg.cho_solve(
+            factor, np.eye(M.shape[0]), check_finite=True
+        )
+    except scipy.linalg.LinAlgError as exc:
+        raise ValueError("Non-symmetric positive definite matrix") from exc
+    return (inverse + inverse.T) / 2.0
 
 # These parts from:
 # https://stackoverflow.com/questions/4675728/redirect-stdout-to-a-file-in-python
