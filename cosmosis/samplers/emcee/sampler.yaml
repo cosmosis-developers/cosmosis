@@ -40,6 +40,7 @@ params:
     samples: (integer) number of jumps to attempt per walker
     nsteps: (integer) number of sample steps taken in between writing output
     a: (float; default=2.0) The stretch scale parameter for the affine invariant move
+    stream_output: (bool; default=N) Emit each sampling chunk immediately to reduce peak memory; experimental
     random_start: (bool; default=N) whether to start the walkers at random points in the prior instead of near the start.  Usually a bad idea
     start_points: (string; default='') a file containing starting points for the walkers. If not specified walkers are initialized randomly from the prior distribution.
     covmat: (string; default='') a file containing a covariance matrix for initializing the walkers.

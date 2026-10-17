@@ -30,6 +30,9 @@ class EmceeSampler(ParallelSampler):
             self.samples = self.read_ini("samples", int, 1000)
             self.nsteps = self.read_ini("nsteps", int, 100)
             self.a = self.read_ini("a", float, 2.0)
+            # Opt-in NOVA-style memory guard: emit each walker state as it is
+            # produced instead of retaining a complete chunk in memory.
+            self.stream_output = self.read_ini("stream_output", bool, False)
 
             assert self.nsteps>0, "You specified nsteps<=0 in the ini file - please set a positive integer"
             assert self.samples>0, "You specified samples<=0 in the ini file - please set a positive integer"
@@ -152,10 +155,14 @@ class EmceeSampler(ParallelSampler):
                           iterations=self.nsteps, store=True)
 
         for (pos, prob, rstate, extra_info) in self.ensemble.sample(self.p0, **kwargs):
-            outputs.append((pos.copy(), prob.copy(), np.copy(extra_info)))
-    
-        for (pos, prob, extra_info) in outputs:
-            self.output_samples(pos, prob, extra_info)
+            if self.stream_output:
+                self.output_samples(pos, prob, extra_info)
+            else:
+                outputs.append((pos.copy(), prob.copy(), np.copy(extra_info)))
+
+        if not self.stream_output:
+            for (pos, prob, extra_info) in outputs:
+                self.output_samples(pos, prob, extra_info)
 
         #Set the starting positions for the next chunk of samples
         #to the last ones for this chunk
