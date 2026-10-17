@@ -184,6 +184,7 @@ requirements = [
     "emcee",
     "numpy",
     "scipy",
+    "packaging",
     "matplotlib",
     "pybind11",
     "pyyaml",

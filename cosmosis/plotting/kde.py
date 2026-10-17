@@ -1,6 +1,6 @@
 import scipy.stats
 import numpy as np
-from distutils.version import LooseVersion
+from packaging.version import Version
 
 try:
     parent_class = scipy.stats.gaussian_kde
@@ -12,7 +12,7 @@ except AttributeError:
 class KDE(parent_class):
     def __init__(self, points, factor=1.0, weights=None):
 
-        if LooseVersion(scipy.__version__) <= LooseVersion('1.1.0'):
+        if Version(scipy.__version__) <= Version('1.1.0'):
             raise ValueError("The KDE class for 2D plotting is not available for this version of scipy.  Please upgrade to scipy 1.1 or later.")
 
         points = np.array(np.atleast_2d(points))
