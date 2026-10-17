@@ -554,8 +554,11 @@ class GelmanRubinStatistic(MetropolisHastingsStatistics):
         B_over_n = np.var(means, ddof=1)
         B = B_over_n * steps
         W = np.mean(variances)
+        if W == 0.0:
+            # Constant chains are converged only when their means agree;
+            # otherwise R-hat is unbounded rather than NaN.
+            return 0.0 if B_over_n == 0.0 else np.inf
         V = W + (1. + 1./number_chains) * B_over_n
-        # TODO: check for 0-values in W
         Rhat = np.sqrt(V/W)
         return Rhat - 1.0
 
