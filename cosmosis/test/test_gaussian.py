@@ -136,3 +136,25 @@ def test_single_gaussian():
 if __name__ == '__main__':
     test_gaussian()
 
+
+
+def test_linear_interpolation_matches_scipy():
+    class LinearLikelihood(GaussianLikelihood):
+        x_section = "aaa"
+        x_name = "a"
+        y_section = "bbb"
+        y_name = "b"
+        like_name = "lll"
+        def build_data(self):
+            return np.array([1.5, 2.5]), np.array([0.0, 0.0])
+        def build_covariance(self):
+            return np.eye(2)
+
+    mod = LinearLikelihood.as_module("my")
+    mod.setup({"my": {"kind": "linear"}})
+    likelihood = mod.data
+    theory_x = np.array([1.0, 2.0, 3.0])
+    theory_y = np.array([2.0, 4.0, 1.0])
+    expected = __import__("scipy").interpolate.interp1d(theory_x, theory_y, kind="linear")(likelihood.data_x)
+    actual = likelihood.generate_theory_points(theory_x, theory_y)
+    assert np.allclose(actual, expected)
