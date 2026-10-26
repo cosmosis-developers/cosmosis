@@ -30,7 +30,6 @@ CFLAGS=$(COMMON_C_FLAGS) -std=c99 $(USER_CFLAGS)
 FFLAGS=$(COMMON_FLAGS) -I${COSMOSIS_SRC_DIR}/datablock -std=gnu -ffree-line-length-none $(USER_FFLAGS)
 #LDFLAGS=$(USER_LDFLAGS) -L${COSMOSIS_SRC_DIR}/datablock -Wl,-rpath,$(COSMOSIS_SRC_DIR)/datablock
 LDFLAGS+=$(USER_LDFLAGS) -L${COSMOSIS_SRC_DIR}/datablock
-LDFLAGS+= -Wl,-z,noexecstack
 PYTHON=python
 MAKEFLAGS += --print-directory
 
@@ -40,4 +39,6 @@ endif
 
 ifeq (Darwin, $(OS))
   LDFLAGS+=-headerpad_max_install_names
+else
+  LDFLAGS+= -Wl,-z,noexecstack
 endif
