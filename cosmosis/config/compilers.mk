@@ -39,4 +39,6 @@ endif
 
 ifeq (Darwin, $(OS))
   LDFLAGS+=-headerpad_max_install_names
+else
+  LDFLAGS+= -Wl,-z,noexecstack
 endif
