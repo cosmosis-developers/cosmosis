@@ -444,7 +444,7 @@ def test_pmc_log_domain_weights_survive_extreme_posteriors():
     weights = sampler.components[0].updated[0]
     assert np.all(np.isfinite(weights))
     np.testing.assert_allclose(weights.sum(), 1.0)
-    rho = sampler.components[0].updated[1]
+    rho = np.array([component.updated[1] for component in sampler.components])
     np.testing.assert_allclose(rho.sum(axis=0), np.ones(x.shape[0]))
 def test_pmc_component_cholesky_matches_quadratic_form():
     from cosmosis.samplers.pmc.pmc import GaussianComponent, StudentsTComponent
