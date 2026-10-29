@@ -3,6 +3,9 @@ from cosmosis.datablock import DataBlock
 from cosmosis.gaussian_likelihood import GaussianLikelihood, SingleValueGaussianLikelihood
 import numpy as np
 import os
+import pytest
+from unittest.mock import Mock
+import scipy.linalg
 
 def test_gaussian():
     class MyLikelihood(GaussianLikelihood):
@@ -70,7 +73,7 @@ def test_scalar_covariance_cholesky():
     assert block["data_vector", "lll_n"] == 1
 
 
-def test_cholesky_chi2_matches_inverse_covariance():
+def test_cholesky_chi2_matches_inverse_covariance(monkeypatch):
     class MyLikelihood(GaussianLikelihood):
         x_section = "aaa"
         x_name = "a"
@@ -90,10 +93,71 @@ def test_cholesky_chi2_matches_inverse_covariance():
     mod.setup({"my":{}})
     d = np.array([0.25, -0.75])
 
+    solve = Mock(wraps=scipy.linalg.solve_triangular)
+    monkeypatch.setattr(scipy.linalg, "solve_triangular", solve)
     chi2 = mod.data._compute_chi2(d)
     expected = np.einsum("i,ij,j", d, mod.data.inv_cov, d)
 
     assert np.isclose(chi2, expected)
+    solve.assert_called_once()
+
+
+@pytest.mark.parametrize("method_name", [
+    "build_inverse_covariance", "extract_inverse_covariance",
+])
+def test_cholesky_preserves_custom_inverse_covariance(monkeypatch, method_name):
+    def custom_inverse(self, *args):
+        return 0.5 * np.linalg.inv(self.cov)
+
+    likelihood_type = type("CustomInverseLikelihood", (GaussianLikelihood,),
+                           {method_name: custom_inverse})
+    likelihood = likelihood_type.__new__(likelihood_type)
+    likelihood.cov = np.array([[2.0, 0.3], [0.3, 1.0]])
+    likelihood.chol = np.linalg.cholesky(likelihood.cov)
+    likelihood.inv_cov = custom_inverse(likelihood)
+    d = np.array([0.25, -0.75])
+
+    solve = Mock(side_effect=AssertionError("Custom precision must be used"))
+    monkeypatch.setattr(scipy.linalg, "solve_triangular", solve)
+    expected = d @ likelihood.inv_cov @ d
+    assert likelihood._compute_chi2(d) == pytest.approx(expected)
+    solve.assert_not_called()
+
+
+def test_chi2_without_cholesky_uses_inverse_covariance():
+    likelihood = GaussianLikelihood.__new__(GaussianLikelihood)
+    likelihood.inv_cov = np.array([[2.0, 0.3], [0.3, 1.0]])
+    d = np.array([0.25, -0.75])
+    assert likelihood._compute_chi2(d) == pytest.approx(d @ likelihood.inv_cov @ d)
+
+
+def test_varying_covariance_does_not_use_previous_cholesky():
+    class VaryingLikelihood(GaussianLikelihood):
+        constant_covariance = False
+        like_name = "varying"
+
+        def build_data(self):
+            return np.array([0.0, 1.0]), np.zeros(2)
+
+        def extract_covariance(self, block):
+            return block["test", "covariance"]
+
+        def extract_theory_points(self, block):
+            return block["test", "theory"]
+
+    mod = VaryingLikelihood.as_module("varying")
+    mod.setup({"varying": {}})
+    block = DataBlock()
+    d = np.array([0.25, -0.75])
+    block["test", "theory"] = d
+
+    # The first call caches a factor for simulations. The next call must
+    # evaluate chi-square with its new covariance, not that cached factor.
+    for covariance in [np.eye(2), np.array([[2.0, 0.3], [0.3, 1.0]])]:
+        block["test", "covariance"] = covariance
+        mod.execute(block)
+        expected = d @ np.linalg.solve(covariance, d)
+        assert block["data_vector", "varying_chi2"] == pytest.approx(expected)
 
 
 def test_single_gaussian():
@@ -135,4 +199,3 @@ def test_single_gaussian():
 
 if __name__ == '__main__':
     test_gaussian()
-
