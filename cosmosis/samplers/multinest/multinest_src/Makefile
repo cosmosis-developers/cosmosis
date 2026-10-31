@@ -44,6 +44,7 @@ LAPACKLIB = $(LAPACK_LINK)
 endif
 
 NESTLIBDIR = ./
+NOEXECSTACK_LDFLAG = -Wl,-z,noexecstack
 
 NSOBJECTS = utils.o utils1.o priors.o kmeans_clstr.o xmeans_clstr.o posterior.o nested.o cwrapper.o
 NSOBJECTS_MPI = $(patsubst %.o,mpi/%.o,$(NSOBJECTS))
@@ -66,11 +67,11 @@ test:
 
 libnest3_mpi.so: $(NSOBJECTS_MPI)
 	echo LAPACKLIB is $(LAPACKLIB)
-	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS) $(LDFLAGS)
+	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS) $(LDFLAGS) $(NOEXECSTACK_LDFLAG)
 	
 libnest3.so: $(NSOBJECTS) 
 	echo LAPACKLIB is $(LAPACKLIB)
-	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS)  $(LDFLAGS)
+	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS)  $(LDFLAGS) $(NOEXECSTACK_LDFLAG)
 
 obj_detect:
 	make -C example_obj_detect
