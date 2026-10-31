@@ -36,6 +36,12 @@ endif
 FFLAGS += -fno-stack-arrays
 
 CHORDLIBDIR = ./
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+NOEXECSTACK_LDFLAG = -Wl,-z,noexecstack
+else
+NOEXECSTACK_LDFLAG =
+endif
 
 PCOBJECTS = utils.o abort.o array_utils.o settings.o calculate.o mpi_utils.o random_utils.o chordal_sampling.o run_time_info.o clustering.o params.o priors.o read_write.o feedback.o generate.o ini.o nested_sampling.o interfaces.o 
 PCOBJECTS_MPI = $(patsubst %.o,mpi/%.o,$(PCOBJECTS))
@@ -61,10 +67,10 @@ test:
 	@echo "Alas, PolyChord has no tests"
 
 libchord_mpi.so: $(PCOBJECTS_MPI)
-	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS)
+	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS) $(NOEXECSTACK_LDFLAG)
 	
 libchord.so: $(PCOBJECTS) 
-	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS)
+	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS) $(NOEXECSTACK_LDFLAG)
 
 clean: 
 	-rm -f $(CHORDLIBDIR)/libchord_mpi.*
