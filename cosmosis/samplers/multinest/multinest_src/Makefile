@@ -44,7 +44,12 @@ LAPACKLIB = $(LAPACK_LINK)
 endif
 
 NESTLIBDIR = ./
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
 NOEXECSTACK_LDFLAG = -Wl,-z,noexecstack
+else
+NOEXECSTACK_LDFLAG =
+endif
 
 NSOBJECTS = utils.o utils1.o priors.o kmeans_clstr.o xmeans_clstr.o posterior.o nested.o cwrapper.o
 NSOBJECTS_MPI = $(patsubst %.o,mpi/%.o,$(NSOBJECTS))
