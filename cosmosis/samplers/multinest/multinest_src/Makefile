@@ -3,7 +3,11 @@ include ${COSMOSIS_SRC_DIR}/config/compilers.mk
 endif
 
 $(info $$MPIFC is ${MPIFC})
-MPI = $(shell which $(MPIFC) 2> /dev/null)
+ifeq ($(strip $(MPIFC)),)
+MPI =
+else
+MPI = $(shell command -v $(MPIFC) 2> /dev/null)
+endif
 
 TARGETS=libnest3.so
 ifeq ($(MPI),)
@@ -37,6 +41,15 @@ else
 FFLAGS += -O3 -fPIC -ffree-line-length-none
 endif
 
+# Linux loaders reject shared objects that request an executable stack.
+# Keep this flag platform-specific because Darwin's linker does not accept
+# the GNU ELF option.
+ifeq ($(shell uname -s),Linux)
+STACK_FLAGS = -Wl,-z,noexecstack
+else
+STACK_FLAGS =
+endif
+
 ifeq ($(LAPACK_LINK),)
 LAPACKLIB = -llapack
 else
@@ -66,11 +79,11 @@ test:
 
 libnest3_mpi.so: $(NSOBJECTS_MPI)
 	echo LAPACKLIB is $(LAPACKLIB)
-	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS) $(LDFLAGS)
+	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS) $(LDFLAGS) $(STACK_FLAGS)
 	
 libnest3.so: $(NSOBJECTS) 
 	echo LAPACKLIB is $(LAPACKLIB)
-	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS)  $(LDFLAGS)
+	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(LAPACKLIB) $(FFLAGS)  $(LDFLAGS) $(STACK_FLAGS)
 
 obj_detect:
 	make -C example_obj_detect
