@@ -171,6 +171,11 @@ class TabulatedPDF(Prior):
         pdf = pdf[(xarray >= self.lower)*(xarray <= self.upper)]
         xarray = xarray[(xarray >= self.lower)*(xarray <= self.upper)]
 
+        # Check densities before adjacent values are added for integration:
+        # a positive neighbor can otherwise hide a negative table entry.
+        if not np.all(pdf >= 0.):
+            raise ValueError('Negative probability found in TabulatedPDF.', function_filename)
+
         # Set up pdf, so cumsum basically does a cumulative trapz integral
         # On Python 3.4, doing pdf[1:] += pdf[:-1] the last value gets messed up.
         # Writing it this way works.  (Maybe slightly slower though, so if we stop
@@ -182,7 +187,7 @@ class TabulatedPDF(Prior):
 
         # Check that the probability is nonnegative
         if not np.all(pdf >= 0.):
-            raise ValueError('Negative probability found in TabulatedPDF.',function)
+            raise ValueError('Negative probability found in TabulatedPDF.', function_filename)
 
         # Compute the cumulative distribution function = int(pdf(x),x)
         cdf = np.cumsum(pdf)
