@@ -2,8 +2,15 @@ ifneq ($(COSMOSIS_SRC_DIR),)
 include ${COSMOSIS_SRC_DIR}/config/compilers.mk
 endif
 
-MPI = $(shell which $(MPIFC) 2> /dev/null)
-	TARGETS=libchord.so
+TARGETS=libchord.so
+
+$(info $$MPIFC is ${MPIFC})
+ifeq ($(strip $(MPIFC)),)
+MPI =
+else
+MPI = $(shell command -v $(MPIFC) 2> /dev/null)
+endif
+
 ifneq ($(MPI),)
     $(info MPI Compiler found so compiling MPI polychord)
 	TARGETS+=libchord_mpi.so
@@ -24,6 +31,16 @@ ifneq ($(MPI),)
 
     endif
 endif
+
+# Linux loaders reject shared objects that request an executable stack.
+# Keep this flag platform-specific because Darwin's linker does not accept
+# the GNU ELF option.
+ifeq ($(shell uname -s),Linux)
+STACK_FLAGS = -Wl,-z,noexecstack
+else
+STACK_FLAGS =
+endif
+
 
 all: $(TARGETS)
 
@@ -61,10 +78,10 @@ test:
 	@echo "Alas, PolyChord has no tests"
 
 libchord_mpi.so: $(PCOBJECTS_MPI)
-	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS)
+	$(MPIFC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS) $(STACK_FLAGS)
 	
 libchord.so: $(PCOBJECTS) 
-	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS)
+	$(FC) -shared -o  $(CURDIR)/$@ $^ $(LIBS) $(FFLAGS) $(LDFLAGS) $(STACK_FLAGS)
 
 clean: 
 	-rm -f $(CHORDLIBDIR)/libchord_mpi.*
