@@ -11,6 +11,9 @@ import collections
 import warnings
 import traceback
 import io
+import hashlib
+import json
+import re
 from . import config
 from . import parameter
 from . import prior
@@ -97,11 +100,12 @@ class SlowSubspaceCache(object):
     of slow parameters so that if only fast parameters have changed the 
     pipeline can be much faster.
     """
-    def __init__(self, first_fast_module=None, cache_size_limit=3,):
+    def __init__(self, first_fast_module=None, cache_size_limit=3, cache_context=None,):
         self.current_hash = np.nan
         self.analyzed = False
         self.cache = LimitedSizeDict(size_limit=cache_size_limit)
         self.first_fast_module = first_fast_module
+        self.cache_context = cache_context
 
     def clear_cache(self):
         self.cache.clear()
@@ -114,16 +118,23 @@ class SlowSubspaceCache(object):
         pairs = block.keys()
         pairs.sort()
         values = []
+        named_values = []
         for section,name in pairs:
             if (section,name) not in self.slow_params:
                 continue
             value = block[section, name]
             if not np.isscalar(value):
-                #non-scalar in the block - this must
-                #reflect some feature not coded yet
-                warnings.warn("Vector parameter(s) in the input means that fast-slow split will not work - this can be fixed - please open an issue if it affects you.  Or set fast_slow=F")
-                return np.nan # 
+                if self.cache_context is None:
+                    warnings.warn("Vector parameter(s) in the input means that fast-slow split will not work - this can be fixed - please open an issue if it affects you.  Or set fast_slow=F")
+                    return np.nan
+                value = {"dtype": str(np.asarray(value).dtype), "shape": np.asarray(value).shape,
+                         "data": np.asarray(value).tolist()}
             values.append(value)
+            named_values.append((section, name, value))
+        if self.cache_context is not None:
+            payload = {"schema": 2, "slow": named_values, "context": self.cache_context}
+            encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+            return hashlib.sha256(encoded).hexdigest()
         values = tuple(values)
         return hash(values)
 
@@ -505,8 +516,41 @@ class Pipeline(object):
             else:
                 first_fast_index = None
 
-            self.slow_subspace_cache = SlowSubspaceCache(first_fast_module=first_fast_index)
+            self.slow_subspace_cache = SlowSubspaceCache(
+                first_fast_module=first_fast_index,
+            )
             self.slow_subspace_cache.analyze_pipeline(self, all_params=all_params, grid=grid)
+
+            secret_key = re.compile(r"(pass(word)?|token|secret|api[_-]?key|private[_-]?key|credential)", re.I)
+            # Build the context only after analysis, because automatic splitting
+            # determines the real boundary during analyze_pipeline.
+            boundary = self.slow_subspace_cache.split_index
+            slow_sections = {module.name for module in self.modules[:boundary]}
+            slow_sections.add("pipeline")
+            cache_context = {
+                "schema": 2,
+                "first_fast_index": boundary,
+                "module_order": [module.name for module in self.modules],
+            }
+            for section in self.options.sections():
+                if section not in slow_sections:
+                    continue
+                values = []
+                for key, value in self.options.items(section):
+                    safe_value = "<redacted>" if secret_key.search(key) else value
+                    values.append((key, safe_value))
+                    if key.lower() in ("values", "priors") and not secret_key.search(key):
+                        for filename in str(value).split():
+                            path = filename if os.path.isabs(filename) else os.path.join(self.root_directory, filename)
+                            if not os.path.isfile(path):
+                                continue
+                            digest = hashlib.sha256()
+                            with open(path, "rb") as source:
+                                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                    digest.update(chunk)
+                            values.append((key + "_sha256", digest.hexdigest()))
+                cache_context[section] = sorted(values)
+            self.slow_subspace_cache.cache_context = cache_context
 
             if not self.slow_subspace_cache.worth_splitting:
                 self.slow_subspace_cache = None
