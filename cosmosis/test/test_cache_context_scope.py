@@ -1,23 +1,28 @@
 import io
+from pathlib import Path
 
 from cosmosis.runtime.config import Inifile
 from cosmosis.runtime.pipeline import LikelihoodPipeline
 
 
 def make_pipeline(alpha, beta):
+    repo_root = Path(__file__).resolve().parents[2]
+    values = repo_root / 'cosmosis' / 'test' / 'example-values.ini'
+    priors = repo_root / 'cosmosis' / 'test' / 'example-priors.ini'
+    module = repo_root / 'cosmosis' / 'test' / 'example_module.py'
     ini = Inifile(io.StringIO(f'''
 [pipeline]
 modules = test1 test2
-values = cosmosis/test/example-values.ini
-priors = cosmosis/test/example-priors.ini
+values = {values}
+priors = {priors}
 quiet = T
 fast_slow = T
 first_fast_module = test2
 [test1]
-file = cosmosis/test/example_module.py
+file = {module}
 alpha = {alpha}
 [test2]
-file = cosmosis/test/example_module.py
+file = {module}
 beta = {beta}
 '''))
     pipeline = LikelihoodPipeline(ini)

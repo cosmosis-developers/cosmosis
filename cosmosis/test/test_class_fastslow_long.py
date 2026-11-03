@@ -3,12 +3,16 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from cosmosis.runtime.config import Inifile
 from cosmosis.runtime.pipeline import LikelihoodPipeline
 
 
 def test_real_class_fastslow_revisit_sequence():
     root = Path('/work/standard-library')
+    if not (root / 'boltzmann/class/class_v3.2.5').is_dir():
+        pytest.skip('external standard-library CLASS tree is not available in this CI job')
     class_root = root / 'boltzmann/class/class_v3.2.5'
     values = root / 'examples/planck_values.ini'
     generated = Path('/tmp/class_fastslow_values.ini')

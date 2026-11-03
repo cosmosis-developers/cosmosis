@@ -6,6 +6,9 @@ from cosmosis.runtime.pipeline import LikelihoodPipeline
 
 
 def test_automatic_boundary_limits_cache_context():
+    repo_root = Path(__file__).resolve().parents[2]
+    values = repo_root / 'cosmosis' / 'test' / 'example-values.ini'
+    priors = repo_root / 'cosmosis' / 'test' / 'example-priors.ini'
     slow = Path('/tmp/cache_scope_slow.py')
     fast = Path('/tmp/cache_scope_fast.py')
     slow.write_text(
@@ -23,8 +26,8 @@ def test_automatic_boundary_limits_cache_context():
     ini = Inifile(io.StringIO(f'''
 [pipeline]
 modules = slow fast
-values = cosmosis/test/example-values.ini
-priors = cosmosis/test/example-priors.ini
+values = {values}
+priors = {priors}
 quiet = T
 fast_slow = T
 [slow]

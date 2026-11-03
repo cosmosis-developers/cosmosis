@@ -6,6 +6,8 @@ from cosmosis.runtime.pipeline import LikelihoodPipeline
 
 
 def build(values):
+    repo_root = Path(__file__).resolve().parents[2]
+    priors = repo_root / 'cosmosis' / 'test' / 'example-priors.ini'
     Path('/tmp/cache_scope_slow.py').write_text(
         "def setup(options): return {}\n"
         "def execute(block, config):\n"
@@ -22,7 +24,7 @@ def build(values):
 [pipeline]
 modules = slow fast
 values = {values}
-priors = cosmosis/test/example-priors.ini
+priors = {priors}
 quiet = T
 fast_slow = T
 first_fast_module = fast

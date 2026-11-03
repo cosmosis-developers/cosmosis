@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from cosmosis.datablock import DataBlock, names
 
@@ -16,8 +17,13 @@ def load_class_interface():
 
 
 def test_real_class_outputs_match_classy():
-    import classy
+    try:
+        import classy
+    except ImportError:
+        pytest.skip('classy is not installed in this CI job')
 
+    if not Path('/work/standard-library/boltzmann/class/class_interface.py').is_file():
+        pytest.skip('external standard-library CLASS interface is not available in this CI job')
     interface = load_class_interface()
     solver = classy.Class()
     solver.set({
