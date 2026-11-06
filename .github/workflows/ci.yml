@@ -17,6 +17,10 @@ on:
 jobs:
   build-and-test:
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      code-quality: write   # for actions/upload-code-coverage
+      pull-requests: read   # lets the action find the PR for push events
     strategy:
       fail-fast: false
       matrix:
@@ -92,3 +96,12 @@ jobs:
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+    - name: Upload coverage to GitHub code coverage
+      uses: actions/upload-code-coverage@v1
+      if: matrix.python-version == '3.14' && matrix.os == 'ubuntu-latest'
+      with:
+        file: tmp/coverage.xml
+        language: Python
+        label: code-coverage/pytest
+        # PRs from forks get a read-only token, so don't fail CI on those
+        fail-on-error: false
