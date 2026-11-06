@@ -16,3 +16,4 @@ scikit-learn
 nautilus-sampler >= 1.0.1
 h5py
 Py-BOBYQA
+iminuit
