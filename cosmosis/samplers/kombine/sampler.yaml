@@ -9,6 +9,10 @@ cite:
     - "http://arxiv.org/abs/1309.7709"
 
 explanation: >
+    DEPRECATED: The kombine sampler is deprecated and will probably be removed in a
+    future version of CosmoSIS. If you really want this sampler kept, please get in
+    touch with Joe Zuntz.
+
     kombine is an ensemble sampler that uses a clustered kernel-density-estimate proposal density, which allows it to efficiently sample multimodal or non-gaussian posteriors. In between updates to the proposal density estimate, each member of the ensemble is sampled independently, allowing for massive parallelization.
 
     The total number of samples generated will be walkers * samples.

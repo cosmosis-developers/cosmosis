@@ -10,6 +10,8 @@ PARAM_NAME = '.paramnames'
 
 class CosmoMCOutput(TextColumnOutput):
     def __init__(self, filename, rank=0, nchain=1, delimiter='    ', lock=True, resume=False):
+        from ..runtime.deprecation import warn_deprecated
+        warn_deprecated("The cosmomc output format is deprecated and")
         super(CosmoMCOutput, self).__init__(filename, rank, nchain, '', lock=lock, resume=resume)
         if filename.endswith(self.FILE_EXTENSION):
             filename = filename[:-len(self.FILE_EXTENSION)]

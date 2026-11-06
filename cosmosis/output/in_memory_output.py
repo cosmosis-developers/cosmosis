@@ -4,6 +4,8 @@ import numpy as np
 class InMemoryOutput(OutputBase):
     _aliases = ["memory"]
     def __init__(self):
+        from ..runtime.deprecation import warn_deprecated
+        warn_deprecated("The in_memory output format is deprecated and")
         super(InMemoryOutput,self).__init__()
         self.rows = []
         self.meta = {}

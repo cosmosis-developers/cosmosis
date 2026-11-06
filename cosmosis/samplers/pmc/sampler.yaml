@@ -8,6 +8,10 @@ cite:
     - "MNRAS 405.4 2381-2390 (2010)"
 
 explanation: >
+    DEPRECATED: The pmc sampler is deprecated and will probably be removed in a
+    future version of CosmoSIS. If you really want this sampler kept, please get in
+    touch with Joe Zuntz.
+
     Population Monte-Carlo uses importance sampling with an initial 
     distribution that is gradually adapted as more samples are taken and their
     likelihood found.

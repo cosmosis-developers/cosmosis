@@ -18,6 +18,8 @@ class PmcSampler(ParallelSampler):
     sampler_outputs = [("component", int), ("prior", float), ("post",float), ("log_weight",float)]
 
     def config(self):
+        from ...runtime.deprecation import warn_deprecated
+        warn_deprecated("The pmc sampler is deprecated and")
         global pipeline
         pipeline = self.pipeline
         self.n_iterations = self.read_ini("iterations", int, default=30)
