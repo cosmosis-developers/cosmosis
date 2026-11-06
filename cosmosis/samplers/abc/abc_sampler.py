@@ -91,7 +91,8 @@ class AbcSampler(ParallelSampler):
         elif self.set_prior.lower() == 'gaussian':
             sigma2 = np.loadtxt(self.param_cov)
             if len(np.atleast_2d(sigma2)[0][:]) != self.ndim:
-                raise ValueError("Cov matrix for Gaussian prior has %d columns for %d params" % len(np.atleast_2d(sigma2)[0][:]), self.ndim)
+                n_columns = len(np.atleast_2d(sigma2)[0][:])
+                raise ValueError("Cov matrix for Gaussian prior has %d columns for %d params" % (n_columns, self.ndim))
             else:
                 self.prior = abcpmc.GaussianPrior(self.p0, np.atleast_2d(sigma2)) 
         else:
