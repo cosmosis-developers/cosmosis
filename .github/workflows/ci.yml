@@ -23,6 +23,16 @@ jobs:
         python-version: ["3.10", 3.11, 3.12, 3.13, 3.14]
         # macos13 runs on until and macos14 now runs on arm64
         os: [ubuntu-latest, macos-latest]
+        # GitHub limits concurrent macOS runners, so only test the newest python there
+        exclude:
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: 3.11
+          - os: macos-latest
+            python-version: 3.12
+          - os: macos-latest
+            python-version: 3.13
         include:
           - os: ubuntu-latest
             INSTALL_DEPS: sudo apt-get update && sudo apt-get -y install gfortran-11 swig libopenmpi-dev openmpi-bin libopenblas-dev && sudo ln -s `which gfortran-11` /usr/local/bin/gfortran
@@ -78,7 +88,7 @@ jobs:
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v3
-      if: matrix.python-version == '3.9' && matrix.os == 'ubuntu-latest'
+      if: matrix.python-version == '3.14' && matrix.os == 'ubuntu-latest'
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
