@@ -2,13 +2,13 @@ name: "minuit"
 version: "1.0"
 parallel: serial
 purpose: "Find the maximum posterior using the MINUIT library"
-url: "https://seal.web.cern.ch/seal/MathLibs/Minuit2/html/"
-attribution: ["SciPy developers"]
+url: "https://iminuit.readthedocs.io/"
+attribution: ["Hans Dembinski and iminuit developers", "F. James and M. Roos (MINUIT)"]
 cite: []
 explanation: >
     This sampler attempts to find the single point in parameter space with the highest
     posterior probability.  It is a wrapper around the powerful MINUIT2 library that is
-    widely used in particle physics.
+    widely used in particle physics, via the iminuit python interface.
 
     Minuit is one of the more robust optimizers, but you should still try starting
     the sampler from a few different points to make sure they converge to the same place.
@@ -19,26 +19,18 @@ explanation: >
 
     At the end of the sampling a covariance estimate is also returned.
 
-    Note on parallelism: The minuit2 sampler can be used in parallel, but the version that
-    is packaged with the CosmoSIS auto-installer does not support that yet, so at the moment
-    we are only supporting serial sampling (no MPI).
-    
+    Note on parallelism: The minuit sampler is serial only (no MPI).
 
 installation: >
-    Requires the Minuit2 library. the auto-installer includes Minuit2, but if you are installing manually
-    you may need to download and install from your package manager or the URL above. You will also need
-    to set the MINUIT2_INC and MINUIT2_LIB environment variables in your setup script to point to the directories
-    of the minuit2 headers and libraries respectively. (The minuit2 headers directory has two subdirectories,
-    called Minuit2 and Math. The MINUIT2_INC should point to the parent directory, not the subdir).
+    Requires the iminuit python package: pip install iminuit (or conda install iminuit).
 
 
 params:
     maxiter: (integer; default=1000) Maximum number of likelihood calculations to do
     width_estimate: (float; default=0.05) A guess of the parameter posterior widths as a fraction of their range. Can speed convergence the more accurate it is but does not need to be very exact.
-    tolerance: (real; default=0.05) The tolerance parameter in milliSigmas - the default setting will try to get within 0.05 sigma of the best-fit.
+    tolerance: (real; default=50.0) The Minuit tolerance. Minuit stops when the estimated distance to the minimum (EDM) is below 0.002 * tolerance * 0.5 (iminuit's own default tolerance is 0.1).
     save_dir: "(string; default='') If set, save the data block containing the cosmology at the best-fit point to this directory name"
     output_ini: "(string; default='') if present, save the resulting parameters to a new ini file with this name"
     save_cov: "(string; default='') if present and the sampler supports it, save the estimated covariance to this file"
-    verbose: "(bool; default=F) Print more information to the command line."
     strategy: "(string; default=medium) Choose from fast, medium, and safe. Safe mode means slower convergence but less chance of failure. Fast means the opposite."
     algorithm: "(string; default=migrad) Choose from migrad, simplex, and fallback. Migrad is better unless there are strange parameter space cliffs. Fallback tries migrad first and if it fails tries simplex."

@@ -1,6 +1,5 @@
 from cosmosis.runtime.config import Inifile
 from cosmosis.samplers.sampler import Sampler
-import cosmosis.samplers.minuit.minuit_sampler
 from cosmosis.runtime.pipeline import LikelihoodPipeline
 from cosmosis.output import InMemoryOutput, TextColumnOutput
 from cosmosis.runtime.handler import activate_segfault_handling
@@ -13,7 +12,6 @@ import numpy as np
 
 activate_segfault_handling()
 
-minuit_compiled = os.path.exists(cosmosis.samplers.minuit.minuit_sampler.libname)
 
 def run(sampler, check_prior, inmem_output=True, check_extra=True, fast_slow=False, **options):
 

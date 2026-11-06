@@ -1,3 +1,4 @@
+import importlib.util
 from cosmosis import Inifile, Sampler, LikelihoodPipeline, InMemoryOutput, TextColumnOutput
 from cosmosis.postprocessing import postprocessor_for_sampler
 from cosmosis.runtime import logs
@@ -9,7 +10,6 @@ import numpy as np
 from astropy.table import Table
 
 
-minuit_compiled = os.path.exists(Sampler.get_sampler("minuit").libminuit_name)
 
 # our test priors are uniform on [-3, 3] for two
 # parameters, so our expected prior is 1/6 for each of them.
@@ -398,7 +398,7 @@ def test_metropolis():
     run('metropolis', True, samples=20)
     run('metropolis', True, samples=20, covmat_sample_start=True)
 
-@pytest.mark.skipif(not minuit_compiled,reason="requires Minuit2")
+@pytest.mark.skipif(importlib.util.find_spec("iminuit") is None, reason="requires iminuit")
 def test_minuit():
     run('minuit', True, can_postprocess=False, hints_cov=False)
 

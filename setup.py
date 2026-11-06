@@ -49,8 +49,7 @@ datablock_libs = ["datablock/libcosmosis.so"]
 sampler_libs = ["samplers/multinest/multinest_src/libnest3.so",
                 "samplers/multinest/multinest_src/libnest3_mpi.so",
                 "samplers/polychord/polychord_src/libchord.so",
-                "samplers/polychord/polychord_src/libchord_mpi.so",
-                "samplers/minuit/minuit_wrapper.so"]
+                "samplers/polychord/polychord_src/libchord_mpi.so"]
 
 
 testing_files = [
@@ -112,9 +111,6 @@ def make_cosmosis():
 
         # We also need Lapack to build some of the samplers
         env["LAPACK_LINK"] = f"-L{conda}/lib -llapack"
-        # and minuit for that sampler
-        env['MINUIT2_LIB'] = f"{conda}/lib"
-        env['MINUIT2_INC'] = f"{conda}/include/Minuit2"
 
         if conda_build:
             env["COSMOSIS_ALT_COMPILERS"] = "1"
