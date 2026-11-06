@@ -2,6 +2,13 @@ from .utils import std_weight
 import numpy as np
 
 
+def _kernel_quadratic_form(window_xy, covariance):
+    """Evaluate x.T @ covariance^-1 @ x without forming an inverse."""
+    flat_window = window_xy.reshape(window_xy.shape[0], -1)
+    solved = np.linalg.solve(covariance, flat_window)
+    return np.einsum('ki,ki->i', flat_window, solved).reshape(window_xy.shape[1:])
+
+
 
 
 
@@ -190,14 +197,12 @@ def smooth_density_estimate_2d(x, y, xmin, xmax, ymin, ymax, weights=None, N=256
     
     # get the smoothing kernel
     kernel_C = np.array([[width_x**2, width_x * width_y * rho], [width_x * width_y * rho, width_y**2]])
-    kernel_Cinv = np.linalg.inv(kernel_C)
-
     # Make the Gaussian kernel with which we are convolving.
     # We go out to 3 sigma
     window_width = int(3 * max(width_x, width_y))
     
     window_xy = np.mgrid[-window_width:window_width + 1, -window_width:window_width + 1]
-    r2 = np.einsum('kij,kl,lij->ij', window_xy, kernel_Cinv, window_xy)
+    r2 = _kernel_quadratic_form(window_xy, kernel_C)
     kernel = np.exp(-0.5*r2)
     kernel /= kernel.sum()
     
