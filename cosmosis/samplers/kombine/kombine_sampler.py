@@ -16,6 +16,8 @@ class KombineSampler(ParallelSampler):
     sampler_outputs = [("prior", float), ("post", float)]
 
     def config(self):
+        from ...runtime.deprecation import warn_deprecated
+        warn_deprecated("The kombine sampler is deprecated and")
         global pipeline
         pipeline = self.pipeline
 

@@ -32,6 +32,8 @@ class AbcSampler(ParallelSampler):
     sampler_outputs = [("weight", float),("distance",float)]
 
     def config(self):
+        from ...runtime.deprecation import warn_deprecated
+        warn_deprecated("The abc sampler is deprecated and")
         try:
             import abcpmc
         except ImportError:

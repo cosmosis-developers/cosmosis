@@ -34,6 +34,8 @@ class FitsOutput(OutputBase):
     _aliases = ["fits"]
 
     def __init__(self, filename, rank=0, nchain=1, clobber=True):
+        from ..runtime.deprecation import warn_deprecated
+        warn_deprecated("The fits output format is deprecated and")
         super(FitsOutput, self).__init__()
 
         #If filename already ends in .txt then remove it for a moment

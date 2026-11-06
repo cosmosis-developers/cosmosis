@@ -327,6 +327,8 @@ def register_new_parameter(options,
     prior_name (optional) is a string - see prior.py
     prior_args (optional) is any additional arguments to create the prior
     """
+    from .deprecation import warn_deprecated
+    warn_deprecated("The register_new_parameter function is deprecated and")
     from .pipeline import LikelihoodPipeline
 
     n = len(LikelihoodPipeline.pipeline_being_set_up)

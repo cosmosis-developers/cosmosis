@@ -52,6 +52,8 @@ class PmaxlikeSampler(ParallelSampler):
     sampler_outputs = [("prior", float), ("like", float), ("post", float)]
 
     def config(self):
+        from ...runtime.deprecation import warn_deprecated
+        warn_deprecated("The pmaxlike sampler is deprecated and")
         self.method = self.read_ini("method", str, "CG")
         self.tolerance = self.read_ini("tolerance", float, 1e-3)
         self.maxiter = self.read_ini("maxiter", int, 1000)

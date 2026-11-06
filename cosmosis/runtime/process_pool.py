@@ -4,6 +4,8 @@ import os
 
 class Pool(object):
     def __init__(self, processes):
+        from .deprecation import warn_deprecated
+        warn_deprecated("SMP process pools (the --smp option) are deprecated and")
         self.size = processes
         self.rank = 0
         self.master_pid = os.getpid()

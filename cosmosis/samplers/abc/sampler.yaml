@@ -10,6 +10,10 @@ cite:
     - "Fillippi et al 2012 arXiv:1106.6280"
 
 explanation: >
+    DEPRECATED: The abc sampler is deprecated and will probably be removed in a
+    future version of CosmoSIS. If you really want this sampler kept, please get in
+    touch with Joe Zuntz.
+
     abcpmc is a Python Approximate Bayesian Computing (ABC) Population Monte Carlo (PMC) implementation based 
     on Sequential Monte Carlo (SMC) with Particle Filtering techniques. 
     This likelihood free implementation estimates the posterior distribution using a model to simulate a 

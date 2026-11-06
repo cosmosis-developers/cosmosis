@@ -9,6 +9,10 @@ cite: []
 
 
 explanation: >
+    DEPRECATED: The gridmax sampler is deprecated and will probably be removed in a
+    future version of CosmoSIS. If you really want this sampler kept, please get in
+    touch with Joe Zuntz.
+
     This sampler is a naive and experimental attempt to try a parallel ML/MAP sampler.
 
     It samples through the dimensions of the space one-by-one, and draws a line of evenly

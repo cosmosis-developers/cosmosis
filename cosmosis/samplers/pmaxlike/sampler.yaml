@@ -7,6 +7,10 @@ attribution: ["CosmoSIS Team", "SciPy developers"]
 cite: []
 
 explanation: >
+    DEPRECATED: The pmaxlike sampler is deprecated and will probably be removed in a
+    future version of CosmoSIS. If you really want this sampler kept, please get in
+    touch with Joe Zuntz.
+
     This sampler finds the maximum likelihood point in parameter space using 
     gradient-based optimization methods from scipy.optimize. Unlike the serial 
     maxlike sampler, this version can run in parallel and automatically computes 

@@ -17,6 +17,8 @@ class SnakeSampler(ParallelSampler):
     parallel_output = False
 
     def config(self):
+        from ...runtime.deprecation import warn_deprecated
+        warn_deprecated("The snake sampler is deprecated and")
         global snake_pipeline
         snake_pipeline=self.pipeline
         if self.is_master():

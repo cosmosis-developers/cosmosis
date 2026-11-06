@@ -9,6 +9,10 @@ cite: ["ApJ 777 172 (2013)"]
 
 
 explanation: >
+    DEPRECATED: The snake sampler is deprecated and will probably be removed in a
+    future version of CosmoSIS. If you really want this sampler kept, please get in
+    touch with Joe Zuntz.
+
     Snake is a more intelligent version of the grid sampler that avoids
     taking large number of samples with a low likelihood, which the naive
     grid sampler nearly always does.

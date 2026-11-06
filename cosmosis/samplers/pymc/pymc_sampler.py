@@ -10,6 +10,8 @@ class PymcSampler(ParallelSampler):
     sampler_outputs = [("like", float)]
 
     def config(self):
+        from ...runtime.deprecation import warn_deprecated
+        warn_deprecated("The pymc sampler is deprecated and")
         # lazy pymc import to avoid dependency when using other samplers
         import pymc
         self.pymc = pymc
