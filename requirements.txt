@@ -3,6 +3,7 @@ future
 emcee
 numpy
 scipy
+packaging
 matplotlib
 pybind11
 threadpoolctl
