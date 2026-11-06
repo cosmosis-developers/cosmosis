@@ -172,12 +172,21 @@ class GaussianLikelihood:
         """
         Compute covariance-weighted chi-square.
 
-        Prefer a Cholesky triangular solve when a Cholesky factor is
-        available; otherwise preserve the existing inverse-covariance path.
+        Use a cached Cholesky factor for a constant covariance with the
+        default inverse-covariance methods. Preserve custom precision
+        matrices and the varying-covariance path.
         """
-        original_inv_cov = (self.extract_inverse_covariance is GaussianLikelihood.extract_inverse_covariance)
+        # Instance methods are bound methods, not the class function itself.
+        original_inv_cov = (
+            getattr(self.build_inverse_covariance, "__func__", None)
+            is GaussianLikelihood.build_inverse_covariance
+            and getattr(self.extract_inverse_covariance, "__func__", None)
+            is GaussianLikelihood.extract_inverse_covariance
+        )
         have_chol = getattr(self, "chol", None) is not None
-        if have_chol and original_inv_cov:
+        # A varying covariance's cached factor is updated for simulations
+        # only after chi-square is evaluated, so it may belong to the last call.
+        if self.constant_covariance and have_chol and original_inv_cov:
             w = scipy.linalg.solve_triangular(
                 self.chol,
                 d,
