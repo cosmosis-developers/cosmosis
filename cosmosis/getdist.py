@@ -7,6 +7,7 @@ from astropy.table import Table
 from . import table as cosmosis_table
 from . import postprocessing
 from .runtime import Inifile
+from . import utils
 
 
 def cosmosis_to_getdist(filename, name, burn=0, nchain=0):
@@ -90,7 +91,7 @@ def _extract_getdist_inputs(table, latex_names):
     if "weight" in table.colnames:
         weights = table["weight"]
     elif "log_weight" in table.colnames:
-        weights = np.exp(table["log_weight"] - np.max(table["log_weight"]))
+        weights = utils.normalized_log_weights(table["log_weight"])
     else:
         weights = None
 
