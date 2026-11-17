@@ -1043,6 +1043,15 @@ class LikelihoodPipeline(Pipeline):
         return np.array([param.normalize(x) for param, x
                          in zip(self.varied_params, p)])
 
+    def normalize_vector_to_prior(self, p):
+        u"""Convert an array of parameter values, one for each varied parameter,
+         into a normalized form all in the range [0.0,1.0] according the prior value,
+         essentially computing the cumulative distriution function of each parameter
+         value under its prior.
+         """
+        return np.array([param.normalize_to_prior(x) for param, x
+                         in zip(self.varied_params, p)])
+
 
 
     def normalize_matrix(self, c):
