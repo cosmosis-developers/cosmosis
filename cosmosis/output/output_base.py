@@ -118,6 +118,13 @@ class OutputBase(metaclass=OutputMetaclass):
         if not self.begun_sampling:
             self._begun_sampling(params)
             self.begun_sampling=True
+
+        #Blind output by applying offsets
+        if self._blinding_offsets is not None:
+            if len(self._blinding_offsets)!=len(params):
+                raise ValueError("Length of blinding offsets %d does not match number of output parameters %d"%(len(self._blinding_offsets), len(params)))
+            params+= self._blinding_offsets
+
         #Pass to the subclasses to write output
         self._write_parameters(params)
 

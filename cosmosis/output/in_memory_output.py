@@ -3,12 +3,17 @@ import numpy as np
 
 class InMemoryOutput(OutputBase):
     _aliases = ["memory"]
-    def __init__(self):
+    def __init__(self, blinding_offset_file=None):
         super(InMemoryOutput,self).__init__()
         self.rows = []
         self.meta = {}
         self.final_meta = {}
         self.comments = []
+
+        if blinding_offset_file is not None:
+            self._blinding_offsets = np.load(blinding_offset_file)
+        else:
+            self._blinding_offsets = None
 
     def _write_parameters(self, params):
         self.rows.append(params)
@@ -33,7 +38,8 @@ class InMemoryOutput(OutputBase):
     def from_options(cls, options, resume=False):
         if resume:
             raise ValueError("Cannot resume from in-memory output")
-        return cls()
+        blinding_offset_file = options.get('blinding_offsets', None)
+        return cls(blinding_offset_file=blinding_offset_file)
 
     @classmethod
     def load_from_options(cls, options):

@@ -33,7 +33,7 @@ class FitsOutput(OutputBase):
     FILE_EXTENSION = ".fits"
     _aliases = ["fits"]
 
-    def __init__(self, filename, rank=0, nchain=1, clobber=True):
+    def __init__(self, filename, rank=0, nchain=1, clobber=True, blinding_offset_file=None):
         super(FitsOutput, self).__init__()
 
         #If filename already ends in .txt then remove it for a moment
@@ -55,6 +55,11 @@ class FitsOutput(OutputBase):
         #also used to store comments:
         self._metadata = OrderedDict()
         self._final_metadata = OrderedDict()
+
+        if blinding_offset_file is not None:
+            self._blinding_offsets = np.load(blinding_offset_file)
+        else:
+            self._blinding_offsets = None
 
     def _close(self):
         self._flush_metadata(self._final_metadata)
@@ -126,8 +131,9 @@ class FitsOutput(OutputBase):
         delimiter = options.get('delimiter', '\t')
         rank = options.get('rank', 0)
         nchain = options.get('parallel', 1)
+        blinding_offset_file = options.get('blinding_offsets', None)
         clobber = utils.boolean_string(options.get('clobber', True))
-        return cls(filename, rank, nchain, clobber=clobber)
+        return cls(filename, rank, nchain, clobber=clobber, blinding_offset_file=blinding_offset_file)
 
     @classmethod
     def load_from_options(cls, options):
