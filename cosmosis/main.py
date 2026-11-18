@@ -358,6 +358,8 @@ def run_cosmosis(ini, pool=None, pipeline=None, values=None, priors=None, overri
         if not any(issubclass(sampler_class,ParallelSampler) for sampler_class in sampler_classes):
             if len(sampler_classes)>1:
                 raise ValueError("None of the samplers you chose support parallel execution!")
+            elif sampler_class.__name__ == "MinuitSampler":
+                raise ValueError("The Minuit sampler no longer supports parallel execution, sorry.")
             else:
                 raise ValueError("The sampler you chose does not support parallel execution!")
         for sampler_class in sampler_classes:

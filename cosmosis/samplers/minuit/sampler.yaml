@@ -26,7 +26,7 @@ installation: >
 
 
 params:
-    maxiter: (integer; default=1000) Maximum number of likelihood calculations to do
+    maxiter: (integer; default=1000) Maximum number of likelihood calculations to do. Zero means no limit.
     width_estimate: (float; default=0.05) A guess of the parameter posterior widths as a fraction of their range. Can speed convergence the more accurate it is but does not need to be very exact.
     tolerance: (real; default=50.0) The Minuit tolerance. Minuit stops when the estimated distance to the minimum (EDM) is below 0.002 * tolerance * 0.5 (iminuit's own default tolerance is 0.1).
     save_dir: "(string; default='') If set, save the data block containing the cosmology at the best-fit point to this directory name"

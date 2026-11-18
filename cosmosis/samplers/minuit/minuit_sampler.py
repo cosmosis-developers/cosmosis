@@ -1,4 +1,4 @@
-from .. import ParallelSampler
+from .. import Sampler
 from ...runtime import logs
 import numpy as np
 import sys
@@ -9,9 +9,8 @@ STRATEGIES = {"fast": 0, "medium": 1, "safe": 2, "0": 0, "1": 1, "2": 2}
 ALGORITHMS = ("migrad", "fallback", "combined", "simplex")
 
 
-class MinuitSampler(ParallelSampler):
+class MinuitSampler(Sampler):
     needs_output = True
-    needs_parallel_output = False
     sampler_outputs = [("prior", float), ("post", float)]
 
     def config(self):
@@ -151,9 +150,6 @@ class MinuitSampler(ParallelSampler):
         # converged is used to tell the driver to stop, whether or not
         # the minimization really succeeded
         self.converged = True
-
-    def worker(self):
-        pass
 
     def is_converged(self):
         return self.converged
