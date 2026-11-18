@@ -555,6 +555,7 @@ def test_minuit_no_parallel():
 
     override = {
         ('runtime', 'root'): os.path.split(os.path.abspath(__file__))[0],
+        ('runtime', 'sampler'): 'minuit',
         ('runtime', 'verbosity'): "noisy",
         ("pipeline", 'debug'): "F",
         ("pipeline", "modules"): "test1",
