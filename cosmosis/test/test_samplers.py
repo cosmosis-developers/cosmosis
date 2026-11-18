@@ -1,3 +1,4 @@
+import importlib.util
 from cosmosis import Inifile, Sampler, LikelihoodPipeline, InMemoryOutput, TextColumnOutput
 from cosmosis.postprocessing import postprocessor_for_sampler
 from cosmosis.runtime import logs
@@ -9,7 +10,6 @@ import numpy as np
 from astropy.table import Table
 
 
-minuit_compiled = os.path.exists(Sampler.get_sampler("minuit").libminuit_name)
 
 # our test priors are uniform on [-3, 3] for two
 # parameters, so our expected prior is 1/6 for each of them.
@@ -398,7 +398,7 @@ def test_metropolis():
     run('metropolis', True, samples=20)
     run('metropolis', True, samples=20, covmat_sample_start=True)
 
-@pytest.mark.skipif(not minuit_compiled,reason="requires Minuit2")
+@pytest.mark.skipif(importlib.util.find_spec("iminuit") is None, reason="requires iminuit")
 def test_minuit():
     run('minuit', True, can_postprocess=False, hints_cov=False)
 
@@ -539,6 +539,39 @@ def test_poco():
     except ImportError:
         pytest.skip("pocomc not installed")
     run('pocomc', True, check_extra=False, n_effective=32, n_active=16,  n_total=32, n_evidence=32)
+
+
+def test_minuit_no_parallel():
+    """Test that Minuit sampler raises an error when used with parallel execution."""
+    from cosmosis.runtime.process_pool import Pool
+    from cosmosis.main import run_cosmosis
+    
+    values = tempfile.NamedTemporaryFile('w')
+    values.write(
+        "[parameters]\n"
+        "p1=-3.0  0.0  3.0\n"
+        "p2=-3.0  0.0  3.0\n")
+    values.flush()
+
+    override = {
+        ('runtime', 'root'): os.path.split(os.path.abspath(__file__))[0],
+        ('runtime', 'sampler'): 'minuit',
+        ('runtime', 'verbosity'): "noisy",
+        ("pipeline", 'debug'): "F",
+        ("pipeline", "modules"): "test1",
+        ("pipeline", "values"): values.name,
+        ("test1", "file"): "example_module.py",
+        ('minuit', 'maxiter'): '100',
+    }
+
+    ini = Inifile(None, override=override)
+    
+    # Create a pool to simulate parallel execution
+    pool = Pool(processes=2)
+    
+    # Should raise ValueError about Minuit not supporting parallel execution
+    with pytest.raises(ValueError, match="The Minuit sampler no longer supports parallel execution"):
+        run_cosmosis(ini, pool=pool)
 
 if __name__ == '__main__':
     import sys

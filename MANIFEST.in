@@ -28,8 +28,6 @@ include cosmosis/datablock/section_names.h
 include cosmosis/datablock/section_names.txt
 include cosmosis/datablock/cosmosis_constants.fh
 include cosmosis/samplers/Makefile
-include cosmosis/samplers/minuit/Makefile
-include cosmosis/samplers/minuit/minuit_wrapper.cpp
 include cosmosis/samplers/multinest/Makefile
 include cosmosis/samplers/multinest/multinest_src/LICENCE
 include cosmosis/samplers/multinest/multinest_src/Makefile

@@ -131,7 +131,7 @@ After running `source bin/cosmosis-configure`:
 - Test failures: Some tests require optional dependencies (skip with `-k "not testname"`)
 
 ### Known Limitations
-- Minuit sampler requires additional Minuit2 library (optional)
+- Minuit sampler requires the optional `iminuit` python package
 - MPI functionality requires properly configured mpi4py (optional)
 - Some tests may be skipped on systems without specific dependencies
 
