@@ -373,14 +373,14 @@ class WindowedGaussianLikelihood(GaussianLikelihood):
 
     def generate_theory_points(self, theory_x, theory_y):
         "Generate theory predicted data points using window function"
-        f = scipy.interpolate.interp(theory_x, theory_y, kind=self.kind)
+        f = scipy.interpolate.interp1d(theory_x, theory_y, kind=self.kind)
         values = []
         for window_x, window_y in self.windows:
             xmin = max(window_x.min(), theory_x.min())
             xmax = min(window_x.max(), theory_x.max())
-            w = scipy.interpolate.interp(window_x, window_y, kind=self.kind)
+            w = scipy.interpolate.interp1d(window_x, window_y, kind=self.kind)
             g = lambda x: w(x)*f(x)
-            v = scipy.integrate.romberg(g, xmin, xmax)
+            v, _ = scipy.integrate.quad(g, xmin, xmax)
             values.append(v)
         return np.atleast_1d(values)
         

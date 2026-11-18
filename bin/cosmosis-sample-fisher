@@ -24,7 +24,7 @@ column_names, data, metadata, comments, final_metadata = output_info
 metadata = metadata[0]
 data = data[0]
 if metadata['sampler']!='fisher':
-	raise ValueError("File {} is not output from cosmosis fisher sampler".format(filename))
+	raise ValueError("File {} is not output from cosmosis fisher sampler".format(args.fisher_file))
 nparam = metadata['n_varied']
 means = [metadata['mu_{}'.format(i)] for i in range(nparam)]
 covmat = np.linalg.inv(data)
